@@ -1,0 +1,8 @@
+data_root: /path/to/ictpolarreal
+out_dir: outputs/inverse_albedo
+input: static
+target: albedo
+batch_size: 2
+max_steps: 1000
+lr: 0.0001
+
