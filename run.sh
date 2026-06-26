@@ -60,7 +60,7 @@ Options:
   --eval-task TASK          decomposition or relighting. Default: ${EVAL_TASK}
   --eval-manifest PATH      Optional Objaverse/ICTPolarReal evaluation manifest.
   --torch-variant VARIANT   auto, cpu, cu121, cu124, cu126, cu128, or pypi. Default: ${TORCH_VARIANT}
-  --download-sample         Try to download the Google Drive sample with gdown.
+  --download-sample         Try to download the Google Drive sample with gdown. The all command does this automatically.
   --skip-setup              For all: use the current environment.
   --skip-process            For all: skip material preprocessing.
   --skip-train              For all: skip training.
@@ -227,20 +227,21 @@ download_sample_if_requested() {
   mkdir -p "${DATA_ROOT}"
   echo "[data] Downloading sample folder with gdown:"
   echo "       ${SAMPLE_URL}"
+  echo "[data] This can take several minutes for the full sample."
   if ! python - "${SAMPLE_URL}" "${DATA_ROOT}" <<'PY'; then
 import inspect
 import sys
 
-import gdown
-
 url, output = sys.argv[1:3]
 kwargs = {"url": url, "output": output, "quiet": True}
-signature = inspect.signature(gdown.download_folder)
-if "remaining_ok" in signature.parameters:
-    kwargs["remaining_ok"] = True
-if "resume" in signature.parameters:
-    kwargs["resume"] = True
 try:
+    import gdown
+
+    signature = inspect.signature(gdown.download_folder)
+    if "remaining_ok" in signature.parameters:
+        kwargs["remaining_ok"] = True
+    if "resume" in signature.parameters:
+        kwargs["resume"] = True
     downloaded = gdown.download_folder(**kwargs)
 except Exception as exc:
     message = str(exc).strip().splitlines()[0] if str(exc).strip() else exc.__class__.__name__
@@ -276,6 +277,19 @@ check_data() {
     return 0
   fi
   return 2
+}
+
+ensure_data_for_all() {
+  if check_data; then
+    return 0
+  fi
+  echo "[data] Data is not ready. Trying to download the sample dataset automatically."
+  DOWNLOAD_SAMPLE=1
+  if ! download_sample_if_requested; then
+    python -m ictpolarreal.data.check --data-root "${DATA_ROOT}" --min-lights 1 || true
+    return 3
+  fi
+  python -m ictpolarreal.data.check --data-root "${DATA_ROOT}" --min-lights 1
 }
 
 process_materials() {
@@ -344,7 +358,7 @@ main() {
     all)
       if [[ "${SKIP_SETUP}" != "1" ]]; then setup_env; fi
       check_env
-      check_data
+      ensure_data_for_all
       if [[ "${SKIP_PROCESS}" != "1" ]]; then process_materials; fi
       if [[ "${SKIP_TRAIN}" != "1" ]]; then
         train_baseline

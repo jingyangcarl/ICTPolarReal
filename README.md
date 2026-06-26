@@ -21,25 +21,27 @@ git clone https://github.com/jingyangcarl/ICTPolarReal.git
 cd ICTPolarReal
 ```
 
-Download the sample data from Google Drive and place it here:
-
-```text
-ICTPolarReal/
-  data/
-    sample/
-      dragondruit/
-        cam00/
-```
-
-Then run:
+Run the full sample workflow:
 
 ```bash
 bash run.sh all
 ```
 
-The script creates the environment, checks the data, prepares material previews,
-runs a tiny training job, and evaluates the output. No manual Python setup is
-needed for the default path.
+No manual Python setup is needed for the default path. If `data/sample` is
+missing or incomplete, the script first tries to download the sample from Google
+Drive. If Google Drive blocks command-line download, open the sample link in a
+browser and place the folder under `data/sample`, then rerun the same command.
+
+## What `run.sh all` Does
+
+| Step | Action | Result |
+| --- | --- | --- |
+| 1 | Set up the environment | Creates or reuses the `ictpolarreal` environment and installs the package. |
+| 2 | Check Python packages | Verifies imports and reports PyTorch/CUDA availability. |
+| 3 | Prepare sample data | Validates `data/sample`; if it is missing, tries to download the Google Drive sample. |
+| 4 | Process polarization data | Converts OLAT cross/parallel pairs into diffuse/specular material previews. |
+| 5 | Run a tiny training job | Trains the baseline briefly and writes predictions. |
+| 6 | Evaluate predictions | Writes CSV metrics and a JSON summary under `outputs/`. |
 
 ## Expected Data Layout
 
@@ -58,9 +60,7 @@ data/sample/
       parallel/000000.exr
 ```
 
-The sample Drive folder already follows this layout. If Drive download fails
-from the command line, download it in a browser and keep the same folder
-structure under `data/sample/`.
+The sample Drive folder already follows this layout.
 
 ## Outputs
 
