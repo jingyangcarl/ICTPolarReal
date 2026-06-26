@@ -6,6 +6,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 from ictpolarreal.data.dataset import ICTPolarRealDataset
+from ictpolarreal.utils.io import write_image
 
 
 def main() -> None:
@@ -18,6 +19,7 @@ def main() -> None:
     parser.add_argument("--max-steps", type=int, default=1000)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument("--pred-dir", default=None, help="Optional directory for predicted target PNGs after training.")
     args = parser.parse_args()
 
     import torch
@@ -58,6 +60,17 @@ def main() -> None:
                 break
     pbar.close()
     torch.save({"model": model.state_dict(), "args": vars(args)}, out_dir / "baseline_inverse.pt")
+
+    if args.pred_dir:
+        pred_root = Path(args.pred_dir)
+        model.eval()
+        with torch.no_grad():
+            for idx, sample in enumerate(dataset.samples):
+                item = dataset[idx]
+                image = item["image"].unsqueeze(0).to(device)
+                pred = model(image).squeeze(0).cpu().numpy().transpose(1, 2, 0)
+                write_image(pred_root / sample.object_name / sample.camera / f"{args.target}.png", pred)
+        print(f"[train] wrote predictions to {pred_root}")
 
 
 if __name__ == "__main__":

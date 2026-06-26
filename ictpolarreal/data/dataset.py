@@ -80,6 +80,7 @@ class ICTPolarRealDataset(Dataset):
         target = read_image(target_path)
         mask_path = sample.image_path("mask")
         mask = read_image(mask_path, channels=1) if mask_path else np.ones(target.shape[:2] + (1,), dtype=np.float32)
+        mask = np.clip(mask, 0.0, 1.0)
 
         return {
             "image": torch.from_numpy(image.transpose(2, 0, 1)),

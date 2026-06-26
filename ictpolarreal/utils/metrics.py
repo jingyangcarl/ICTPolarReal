@@ -3,11 +3,18 @@ from __future__ import annotations
 import numpy as np
 
 
+def _mask_weights(mask: np.ndarray) -> np.ndarray:
+    if mask.ndim == 2:
+        mask = mask[..., None]
+    return np.clip(mask.astype(np.float32), 0.0, 1.0)
+
+
 def mse(pred: np.ndarray, target: np.ndarray, mask: np.ndarray | None = None) -> float:
     err = (pred.astype(np.float32) - target.astype(np.float32)) ** 2
     if mask is not None:
-        err = err * mask.astype(np.float32)
-        denom = float(mask.sum() * pred.shape[-1])
+        weights = _mask_weights(mask)
+        err = err * weights
+        denom = float(weights.sum() * pred.shape[-1])
         return float(err.sum() / max(denom, 1.0))
     return float(err.mean())
 
@@ -22,8 +29,9 @@ def psnr(pred: np.ndarray, target: np.ndarray, mask: np.ndarray | None = None) -
 def mae(pred: np.ndarray, target: np.ndarray, mask: np.ndarray | None = None) -> float:
     err = np.abs(pred.astype(np.float32) - target.astype(np.float32))
     if mask is not None:
-        err = err * mask.astype(np.float32)
-        denom = float(mask.sum() * pred.shape[-1])
+        weights = _mask_weights(mask)
+        err = err * weights
+        denom = float(weights.sum() * pred.shape[-1])
         return float(err.sum() / max(denom, 1.0))
     return float(err.mean())
 
@@ -33,9 +41,7 @@ def ssim_global(pred: np.ndarray, target: np.ndarray, mask: np.ndarray | None = 
     pred = pred.astype(np.float32)
     target = target.astype(np.float32)
     if mask is not None:
-        if mask.ndim == 2:
-            mask = mask[..., None]
-        valid = mask.astype(bool)
+        valid = _mask_weights(mask) > 0
         if valid.sum() == 0:
             return 0.0
         pred = pred[valid.repeat(pred.shape[-1], axis=-1)].reshape(-1, pred.shape[-1])

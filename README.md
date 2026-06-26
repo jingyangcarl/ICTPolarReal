@@ -25,9 +25,11 @@ bash scripts/ictpolarreal.sh all \
 
 This creates an environment when needed, checks imports, validates the data
 layout, processes OLAT cross/parallel captures into diffuse/specular material
-previews, and runs a tiny training smoke test. If the data root is missing, the
-script prints the sample Google Drive folder and can try `gdown` with
-`--download-sample`.
+previews, runs a tiny training smoke test, and evaluates the produced
+predictions. If the data root is missing, the script prints the sample Google
+Drive folder and can try `gdown` with `--download-sample`. If Google Drive
+rate-limits or blocks a file, open the folder in a browser, copy the sample
+locally, and rerun the same command without changing the layout.
 
 For manual installation:
 
@@ -36,7 +38,13 @@ git clone https://github.com/jingyangcarl/ICTPolarReal.git
 cd ICTPolarReal
 conda create -n ictpolarreal python=3.10 -y
 conda activate ictpolarreal
-pip install -e ".[dev]"
+pip install -e ".[dev,train]"
+```
+
+For CPU-only machines or broken CUDA drivers, force the CPU PyTorch wheel:
+
+```bash
+bash scripts/ictpolarreal.sh setup --torch-variant cpu
 ```
 
 ## Dataset Layout
@@ -52,8 +60,8 @@ DATA_ROOT/
       albedo.exr
       normal.exr
       specular.exr
-      cross/000001.exr
-      parallel/000001.exr
+      cross/000000.exr
+      parallel/000000.exr
 ```
 
 PNG inputs are also supported for quick checks. Full-resolution EXR data should

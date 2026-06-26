@@ -19,12 +19,12 @@ dependencies = [
   "opencv-python>=4.8",
   "pillow>=9.5",
   "pyyaml>=6.0",
-  "torch>=2.0",
   "tqdm>=4.65",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "ruff>=0.5"]
+train = ["torch>=2.0"]
 
 [tool.setuptools.packages.find]
 include = ["ictpolarreal*"]

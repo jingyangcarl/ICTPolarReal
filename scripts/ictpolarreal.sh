@@ -17,10 +17,15 @@ BACKEND="${BACKEND:-auto}"
 DEVICE="${DEVICE:-cuda}"
 TRAIN_STEPS="${TRAIN_STEPS:-20}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
-PRED_ROOT="${PRED_ROOT:-${OUTPUT_ROOT}/predictions}"
+PRED_ROOT_EXPLICIT=0
+if [[ -n "${PRED_ROOT:-}" ]]; then
+  PRED_ROOT_EXPLICIT=1
+fi
+PRED_ROOT="${PRED_ROOT:-${OUTPUT_ROOT}/train_${TARGET_NAME}/predictions}"
 EVAL_MODE="${EVAL_MODE:-ictpolarreal}"
 EVAL_TASK="${EVAL_TASK:-decomposition}"
 EVAL_MANIFEST="${EVAL_MANIFEST:-}"
+TORCH_VARIANT="${TORCH_VARIANT:-auto}"
 DOWNLOAD_SAMPLE=0
 SKIP_SETUP=0
 SKIP_PROCESS=0
@@ -38,7 +43,7 @@ Commands:
   process      Process OLAT cross/parallel images into diffuse/specular material previews.
   train        Run a tiny inverse-decomposition training job.
   evaluate     Evaluate predictions against ICTPolarReal or Objaverse-style samples.
-  all          setup -> check-env -> check-data -> process -> train.
+  all          setup -> check-env -> check-data -> process -> train -> evaluate.
 
 Options:
   --data-root PATH          Dataset root. Default: ${DATA_ROOT}
@@ -51,10 +56,11 @@ Options:
   --device DEVICE           Torch device for processing/training. Default: ${DEVICE}
   --train-steps N           Training smoke-test steps. Default: ${TRAIN_STEPS}
   --batch-size N            Training batch size. Default: ${BATCH_SIZE}
-  --pred-root PATH          Prediction root for evaluation. Default: ${PRED_ROOT}
+  --pred-root PATH          Prediction root for training/evaluation. Default: ${PRED_ROOT}
   --eval-mode MODE          ictpolarreal or objaverse. Default: ${EVAL_MODE}
   --eval-task TASK          decomposition or relighting. Default: ${EVAL_TASK}
   --eval-manifest PATH      Optional Objaverse/ICTPolarReal evaluation manifest.
+  --torch-variant VARIANT   auto, cpu, cu121, cu124, cu126, cu128, or pypi. Default: ${TORCH_VARIANT}
   --download-sample         Try to download the Google Drive sample with gdown.
   --skip-setup              For all: use the current environment.
   --skip-process            For all: skip material preprocessing.
@@ -80,10 +86,11 @@ parse_args() {
       --device) DEVICE="$2"; shift 2 ;;
       --train-steps) TRAIN_STEPS="$2"; shift 2 ;;
       --batch-size) BATCH_SIZE="$2"; shift 2 ;;
-      --pred-root) PRED_ROOT="$2"; shift 2 ;;
+      --pred-root) PRED_ROOT="$2"; PRED_ROOT_EXPLICIT=1; shift 2 ;;
       --eval-mode) EVAL_MODE="$2"; shift 2 ;;
       --eval-task) EVAL_TASK="$2"; shift 2 ;;
       --eval-manifest) EVAL_MANIFEST="$2"; shift 2 ;;
+      --torch-variant) TORCH_VARIANT="$2"; shift 2 ;;
       --download-sample) DOWNLOAD_SAMPLE=1; shift ;;
       --skip-setup) SKIP_SETUP=1; shift ;;
       --skip-process) SKIP_PROCESS=1; shift ;;
@@ -92,6 +99,9 @@ parse_args() {
       *) echo "Unknown option: $1"; usage; exit 2 ;;
     esac
   done
+  if [[ "${PRED_ROOT_EXPLICIT}" != "1" ]]; then
+    PRED_ROOT="${OUTPUT_ROOT}/train_${TARGET_NAME}/predictions"
+  fi
 }
 
 activate_env() {
@@ -132,6 +142,61 @@ setup_env() {
   fi
   python -m pip install --upgrade pip
   python -m pip install -e ".[dev]" gdown
+  install_torch
+}
+
+install_torch() {
+  local variant="${TORCH_VARIANT}"
+  if [[ "${variant}" == "auto" ]]; then
+    if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+      variant="cu126"
+    else
+      variant="cpu"
+    fi
+  fi
+  if torch_matches_variant "${variant}"; then
+    echo "[setup] Existing torch installation matches ${variant}."
+    return 0
+  fi
+  case "${variant}" in
+    cpu)
+      python -m pip install --force-reinstall torch --index-url https://download.pytorch.org/whl/cpu
+      ;;
+    cu121|cu124|cu126|cu128)
+      python -m pip install --force-reinstall torch --index-url "https://download.pytorch.org/whl/${variant}"
+      ;;
+    pypi)
+      python -m pip install --upgrade torch
+      ;;
+    none)
+      echo "[setup] Skipping torch installation because --torch-variant none was set."
+      ;;
+    *)
+      echo "Unknown --torch-variant: ${variant}"
+      exit 2
+      ;;
+  esac
+}
+
+torch_matches_variant() {
+  local variant="$1"
+  python - "$variant" <<'PY'
+import sys
+variant = sys.argv[1]
+try:
+    import torch
+except ModuleNotFoundError:
+    raise SystemExit(1)
+cuda = torch.version.cuda
+if variant == "cpu":
+    raise SystemExit(0 if cuda is None else 1)
+if variant.startswith("cu"):
+    expected = {"cu121": "12.1", "cu124": "12.4", "cu126": "12.6", "cu128": "12.8"}[variant]
+    raise SystemExit(0 if cuda and cuda.startswith(expected) else 1)
+if variant == "pypi":
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
 }
 
 check_env() {
@@ -163,7 +228,38 @@ download_sample_if_requested() {
   mkdir -p "${DATA_ROOT}"
   echo "[data] Downloading sample folder with gdown:"
   echo "       ${SAMPLE_URL}"
-  python -m gdown --folder "${SAMPLE_URL}" -O "${DATA_ROOT}" --remaining-ok
+  if ! python - "${SAMPLE_URL}" "${DATA_ROOT}" <<'PY'; then
+import inspect
+import sys
+
+import gdown
+
+url, output = sys.argv[1:3]
+kwargs = {"url": url, "output": output, "quiet": True}
+signature = inspect.signature(gdown.download_folder)
+if "remaining_ok" in signature.parameters:
+    kwargs["remaining_ok"] = True
+if "resume" in signature.parameters:
+    kwargs["resume"] = True
+try:
+    downloaded = gdown.download_folder(**kwargs)
+except Exception as exc:
+    message = str(exc).strip().splitlines()[0] if str(exc).strip() else exc.__class__.__name__
+    print(f"[data] gdown failed: {message}")
+    raise SystemExit(1)
+if downloaded is None:
+    raise SystemExit(1)
+print(f"[data] gdown returned {len(downloaded)} file(s).")
+PY
+    cat <<EOF
+[data] Google Drive download did not complete.
+[data] This usually means a file permission, quota, or rate-limit issue in the Drive folder.
+[data] Open the folder in a browser, make sure files are shared with anyone who has the link,
+[data] then rerun:
+[data]   bash scripts/ictpolarreal.sh check-data --data-root "${DATA_ROOT}" --download-sample
+EOF
+    return 3
+  fi
 }
 
 check_data() {
@@ -173,7 +269,10 @@ check_data() {
     return 0
   fi
   if [[ "${DOWNLOAD_SAMPLE}" == "1" ]]; then
-    download_sample_if_requested
+    if ! download_sample_if_requested; then
+      python -m ictpolarreal.data.check --data-root "${DATA_ROOT}" --min-lights 1 || true
+      return 3
+    fi
     python -m ictpolarreal.data.check --data-root "${DATA_ROOT}" --min-lights 1
     return 0
   fi
@@ -206,7 +305,8 @@ train_baseline() {
     --input "${INPUT_NAME}" \
     --target "${TARGET_NAME}" \
     --max-steps "${TRAIN_STEPS}" \
-    --batch-size "${BATCH_SIZE}"
+    --batch-size "${BATCH_SIZE}" \
+    --pred-dir "${PRED_ROOT}"
 }
 
 evaluate_predictions() {
@@ -247,7 +347,10 @@ main() {
       check_env
       check_data
       if [[ "${SKIP_PROCESS}" != "1" ]]; then process_materials; fi
-      if [[ "${SKIP_TRAIN}" != "1" ]]; then train_baseline; fi
+      if [[ "${SKIP_TRAIN}" != "1" ]]; then
+        train_baseline
+        evaluate_predictions
+      fi
       ;;
     -h|--help) usage ;;
     *) echo "Unknown command: ${command}"; usage; exit 2 ;;
