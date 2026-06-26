@@ -10,9 +10,17 @@ IMAGE_EXTS = (".exr", ".png", ".jpg", ".jpeg", ".tif", ".tiff")
 
 
 def read_image(path: str | Path, *, channels: int | None = 3) -> np.ndarray:
-    import imageio.v3 as iio
+    path = Path(path)
+    try:
+        import imageio.v3 as iio
 
-    arr = iio.imread(path)
+        arr = iio.imread(path)
+    except ModuleNotFoundError:
+        if path.suffix.lower() == ".exr":
+            raise ModuleNotFoundError("Reading EXR files requires imageio. Run `bash scripts/ictpolarreal.sh setup`.")
+        from PIL import Image
+
+        arr = np.asarray(Image.open(path))
     arr = np.asarray(arr)
     if arr.ndim == 2:
         arr = arr[..., None]
@@ -28,15 +36,22 @@ def read_image(path: str | Path, *, channels: int | None = 3) -> np.ndarray:
 
 
 def write_image(path: str | Path, image: np.ndarray) -> None:
-    import imageio.v3 as iio
-
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     arr = np.asarray(image)
     if path.suffix.lower() in {".png", ".jpg", ".jpeg"}:
         arr = np.clip(arr, 0.0, 1.0)
         arr = (arr * 255.0 + 0.5).astype(np.uint8)
-    iio.imwrite(path, arr)
+    try:
+        import imageio.v3 as iio
+
+        iio.imwrite(path, arr)
+    except ModuleNotFoundError:
+        if path.suffix.lower() == ".exr":
+            raise ModuleNotFoundError("Writing EXR files requires imageio. Run `bash scripts/ictpolarreal.sh setup`.")
+        from PIL import Image
+
+        Image.fromarray(arr).save(path)
 
 
 def find_first_existing(root: Path, stem: str, exts: Iterable[str] = IMAGE_EXTS) -> Path | None:
