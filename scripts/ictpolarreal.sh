@@ -17,6 +17,10 @@ BACKEND="${BACKEND:-auto}"
 DEVICE="${DEVICE:-cuda}"
 TRAIN_STEPS="${TRAIN_STEPS:-20}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
+PRED_ROOT="${PRED_ROOT:-${OUTPUT_ROOT}/predictions}"
+EVAL_MODE="${EVAL_MODE:-ictpolarreal}"
+EVAL_TASK="${EVAL_TASK:-decomposition}"
+EVAL_MANIFEST="${EVAL_MANIFEST:-}"
 DOWNLOAD_SAMPLE=0
 SKIP_SETUP=0
 SKIP_PROCESS=0
@@ -33,6 +37,7 @@ Commands:
   check-data   Validate DATA_ROOT and print Google Drive sample instructions if missing.
   process      Process OLAT cross/parallel images into diffuse/specular material previews.
   train        Run a tiny inverse-decomposition training job.
+  evaluate     Evaluate predictions against ICTPolarReal or Objaverse-style samples.
   all          setup -> check-env -> check-data -> process -> train.
 
 Options:
@@ -46,6 +51,10 @@ Options:
   --device DEVICE           Torch device for processing/training. Default: ${DEVICE}
   --train-steps N           Training smoke-test steps. Default: ${TRAIN_STEPS}
   --batch-size N            Training batch size. Default: ${BATCH_SIZE}
+  --pred-root PATH          Prediction root for evaluation. Default: ${PRED_ROOT}
+  --eval-mode MODE          ictpolarreal or objaverse. Default: ${EVAL_MODE}
+  --eval-task TASK          decomposition or relighting. Default: ${EVAL_TASK}
+  --eval-manifest PATH      Optional Objaverse/ICTPolarReal evaluation manifest.
   --download-sample         Try to download the Google Drive sample with gdown.
   --skip-setup              For all: use the current environment.
   --skip-process            For all: skip material preprocessing.
@@ -54,6 +63,7 @@ Options:
 Examples:
   bash scripts/ictpolarreal.sh all --data-root /path/to/sample --download-sample
   DATA_ROOT=/path/to/data bash scripts/ictpolarreal.sh process --backend torch --device cuda
+  bash scripts/ictpolarreal.sh evaluate --eval-mode objaverse --eval-manifest configs/eval_objaverse_samples.json
 EOF
 }
 
@@ -70,6 +80,10 @@ parse_args() {
       --device) DEVICE="$2"; shift 2 ;;
       --train-steps) TRAIN_STEPS="$2"; shift 2 ;;
       --batch-size) BATCH_SIZE="$2"; shift 2 ;;
+      --pred-root) PRED_ROOT="$2"; shift 2 ;;
+      --eval-mode) EVAL_MODE="$2"; shift 2 ;;
+      --eval-task) EVAL_TASK="$2"; shift 2 ;;
+      --eval-manifest) EVAL_MANIFEST="$2"; shift 2 ;;
       --download-sample) DOWNLOAD_SAMPLE=1; shift ;;
       --skip-setup) SKIP_SETUP=1; shift ;;
       --skip-process) SKIP_PROCESS=1; shift ;;
@@ -195,6 +209,23 @@ train_baseline() {
     --batch-size "${BATCH_SIZE}"
 }
 
+evaluate_predictions() {
+  cd "${REPO_ROOT}"
+  activate_env || true
+  local manifest_args=()
+  if [[ -n "${EVAL_MANIFEST}" ]]; then
+    manifest_args=(--manifest "${EVAL_MANIFEST}")
+  fi
+  python -m ictpolarreal.eval.run \
+    --dataset-mode "${EVAL_MODE}" \
+    --task "${EVAL_TASK}" \
+    --gt-root "${DATA_ROOT}" \
+    --pred-root "${PRED_ROOT}" \
+    --out-dir "${OUTPUT_ROOT}/eval_${EVAL_MODE}_${EVAL_TASK}" \
+    --target "${TARGET_NAME}" \
+    "${manifest_args[@]}"
+}
+
 main() {
   if [[ $# -lt 1 ]]; then
     usage
@@ -210,6 +241,7 @@ main() {
     check-data) check_data ;;
     process) check_data; process_materials ;;
     train) train_baseline ;;
+    evaluate) evaluate_predictions ;;
     all)
       if [[ "${SKIP_SETUP}" != "1" ]]; then setup_env; fi
       check_env

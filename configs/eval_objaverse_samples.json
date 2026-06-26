@@ -1,0 +1,20 @@
+{
+  "description": "Objaverse-style rendered sample list. Place rendered objects under DATA_ROOT/renderings/<object>/...",
+  "samples": [
+    {
+      "object": "table_vase",
+      "frames": [1],
+      "lights": ["all_white", "city", "olat_0"]
+    },
+    {
+      "object": "autumn_house",
+      "frames": [1],
+      "lights": ["all_white", "city", "olat_0"]
+    },
+    {
+      "object": "brass_switch",
+      "frames": [1],
+      "lights": ["all_white", "olat_0"]
+    }
+  ]
+}

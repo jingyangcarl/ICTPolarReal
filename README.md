@@ -98,10 +98,24 @@ bash scripts/ictpolarreal.sh train \
 Evaluate predicted outputs:
 
 ```bash
-python -m ictpolarreal.eval.decomposition \
+bash scripts/evaluate.sh \
+  --eval-mode ictpolarreal \
+  --eval-task decomposition \
+  --data-root /path/to/data \
   --pred-root outputs/inverse_debug/predictions \
-  --gt-root /path/to/data \
   --target albedo
+```
+
+Objaverse-style sample evaluation is documented in
+`samples/objaverse/README.md` and uses `configs/eval_objaverse_samples.json`.
+
+```bash
+bash scripts/evaluate.sh \
+  --eval-mode objaverse \
+  --eval-task relighting \
+  --data-root /path/to/objaverse_sample \
+  --pred-root outputs/predictions \
+  --eval-manifest configs/eval_objaverse_samples.json
 ```
 
 ## Citation
