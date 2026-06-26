@@ -33,7 +33,7 @@ SKIP_TRAIN=0
 usage() {
   cat <<EOF
 Usage:
-  bash ictpolarreal.sh <command> [options]
+  bash run.sh <command> [options]
 
 Commands:
   setup        Create/activate an environment and install ICTPolarReal.
@@ -66,9 +66,9 @@ Options:
   --skip-train              For all: skip training.
 
 Examples:
-  bash ictpolarreal.sh all
-  bash ictpolarreal.sh check-data
-  bash ictpolarreal.sh process --backend torch --device cuda
+  bash run.sh all
+  bash run.sh check-data
+  bash run.sh process --backend torch --device cuda
 EOF
 }
 
@@ -255,7 +255,7 @@ PY
 [data] This usually means a file permission, quota, or rate-limit issue in the Drive folder.
 [data] Open the folder in a browser, make sure files are shared with anyone who has the link,
 [data] then rerun:
-[data]   bash ictpolarreal.sh check-data --data-root "${DATA_ROOT}" --download-sample
+[data]   bash run.sh check-data --data-root "${DATA_ROOT}" --download-sample
 EOF
     return 3
   fi

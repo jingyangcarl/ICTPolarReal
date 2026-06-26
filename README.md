@@ -34,7 +34,7 @@ ICTPolarReal/
 Then run:
 
 ```bash
-bash ictpolarreal.sh all
+bash run.sh all
 ```
 
 The script creates the environment, checks the data, prepares material previews,
@@ -76,10 +76,10 @@ The default command is enough for the sample release. Use options only when
 running on a different machine or dataset:
 
 ```bash
-bash ictpolarreal.sh check-data
-bash ictpolarreal.sh process --data-root /path/to/data --output-root /path/to/out
-bash ictpolarreal.sh train --data-root /path/to/data --target albedo
-bash ictpolarreal.sh evaluate --data-root /path/to/data --pred-root /path/to/predictions
+bash run.sh check-data
+bash run.sh process --data-root /path/to/data --output-root /path/to/out
+bash run.sh train --data-root /path/to/data --target albedo
+bash run.sh evaluate --data-root /path/to/data --pred-root /path/to/predictions
 ```
 
 Useful options:

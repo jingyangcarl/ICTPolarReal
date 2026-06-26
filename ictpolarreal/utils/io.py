@@ -17,7 +17,7 @@ def read_image(path: str | Path, *, channels: int | None = 3) -> np.ndarray:
         arr = iio.imread(path)
     except ModuleNotFoundError:
         if path.suffix.lower() == ".exr":
-            raise ModuleNotFoundError("Reading EXR files requires imageio. Run `bash ictpolarreal.sh setup`.")
+            raise ModuleNotFoundError("Reading EXR files requires imageio. Run `bash run.sh setup`.")
         from PIL import Image
 
         arr = np.asarray(Image.open(path))
@@ -48,7 +48,7 @@ def write_image(path: str | Path, image: np.ndarray) -> None:
         iio.imwrite(path, arr)
     except ModuleNotFoundError:
         if path.suffix.lower() == ".exr":
-            raise ModuleNotFoundError("Writing EXR files requires imageio. Run `bash ictpolarreal.sh setup`.")
+            raise ModuleNotFoundError("Writing EXR files requires imageio. Run `bash run.sh setup`.")
         from PIL import Image
 
         Image.fromarray(arr).save(path)
