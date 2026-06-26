@@ -1,58 +1,52 @@
 # ICTPolarReal
 
-Official code release scaffold for **ICTPolarReal: A Polarized Reflection and
-Material Dataset of Real World Objects**.
+Official code release for **ICTPolarReal: A Polarized Reflection and Material
+Dataset of Real World Objects**.
 
 ICTPolarReal is a CVPR 2026 dataset and benchmark for real-world polarized
-reflectance. The capture system records 218 everyday objects with 8 viewpoints,
-346 OLAT lights, and cross/parallel polarization, enabling diffuse/specular
-separation, material decomposition, relighting, and sparse-view reconstruction
-experiments.
+reflectance. It contains multi-view cross/parallel polarization captures and
+material annotations for material decomposition, relighting, and reconstruction
+research.
 
 - Project page: https://jingyangcarl.github.io/ICTPolarReal/
 - Paper: https://arxiv.org/abs/2603.24912
-- Sample data: linked from the project page
+- Sample data: https://drive.google.com/drive/u/1/folders/1J2lfWe8rO1ZXpbeVW68u2RSqOocCs-S6
 
-## Installation
+## Quick Start
 
-The easiest path is the all-in-one script:
-
-```bash
-bash scripts/ictpolarreal.sh all \
-  --data-root /path/to/ICTPolarReal_sample \
-  --download-sample
-```
-
-This creates an environment when needed, checks imports, validates the data
-layout, processes OLAT cross/parallel captures into diffuse/specular material
-previews, runs a tiny training smoke test, and evaluates the produced
-predictions. If the data root is missing, the script prints the sample Google
-Drive folder and can try `gdown` with `--download-sample`. If Google Drive
-rate-limits or blocks a file, open the folder in a browser, copy the sample
-locally, and rerun the same command without changing the layout.
-
-For manual installation:
+Clone the repo:
 
 ```bash
 git clone https://github.com/jingyangcarl/ICTPolarReal.git
 cd ICTPolarReal
-conda create -n ictpolarreal python=3.10 -y
-conda activate ictpolarreal
-pip install -e ".[dev,train]"
 ```
 
-For CPU-only machines or broken CUDA drivers, force the CPU PyTorch wheel:
-
-```bash
-bash scripts/ictpolarreal.sh setup --torch-variant cpu
-```
-
-## Dataset Layout
-
-Commands expect a configurable `--data-root` with object folders:
+Download the sample data from Google Drive and place it here:
 
 ```text
-DATA_ROOT/
+ICTPolarReal/
+  data/
+    sample/
+      dragondruit/
+        cam00/
+```
+
+Then run:
+
+```bash
+bash ictpolarreal.sh all
+```
+
+The script creates the environment, checks the data, prepares material previews,
+runs a tiny training job, and evaluates the output. No manual Python setup is
+needed for the default path.
+
+## Expected Data Layout
+
+Each object should contain camera folders like this:
+
+```text
+data/sample/
   object_name/
     cam00/
       static.exr
@@ -64,66 +58,49 @@ DATA_ROOT/
       parallel/000000.exr
 ```
 
-PNG inputs are also supported for quick checks. Full-resolution EXR data should
-stay outside Git history.
+The sample Drive folder already follows this layout. If Drive download fails
+from the command line, download it in a browser and keep the same folder
+structure under `data/sample/`.
 
-## Quickstart
+## Outputs
 
-One command:
+Default outputs are written to `outputs/`:
+
+- `outputs/materials/`: diffuse/specular previews from OLAT polarization pairs.
+- `outputs/train_albedo/`: checkpoint and prediction images from the baseline.
+- `outputs/eval_ictpolarreal_decomposition/`: CSV metrics and JSON summary.
+
+## Flexible Usage
+
+The default command is enough for the sample release. Use options only when
+running on a different machine or dataset:
 
 ```bash
-DATA_ROOT=/path/to/data bash scripts/ictpolarreal.sh all
+bash ictpolarreal.sh check-data
+bash ictpolarreal.sh process --data-root /path/to/data --output-root /path/to/out
+bash ictpolarreal.sh train --data-root /path/to/data --target albedo
+bash ictpolarreal.sh evaluate --data-root /path/to/data --pred-root /path/to/predictions
 ```
 
-Individual stages:
+Useful options:
 
-Inspect a local or sample dataset:
+- `--data-root PATH`: dataset location. Default: `data/sample`.
+- `--output-root PATH`: output location. Default: `outputs`.
+- `--torch-variant cpu`: force CPU PyTorch on machines without working CUDA.
+- `--max-lights N`: limit OLAT lights for a quick check.
+- `--skip-setup`: reuse the current environment.
 
-```bash
-bash scripts/ictpolarreal.sh check-data --data-root /path/to/ICTPolarReal/sample
-```
+Objaverse-style evaluation uses `configs/eval_objaverse_samples.json`; see
+`samples/objaverse/README.md` for the expected sample layout.
 
-Prepare diffuse/specular images from cross/parallel OLAT captures:
+## Manual Install
 
-```bash
-bash scripts/ictpolarreal.sh process \
-  --data-root /path/to/data \
-  --output-root outputs \
-  --backend torch \
-  --device cuda
-```
-
-Run a tiny inverse decomposition training smoke test:
+Use this only if you do not want the shell script to manage the environment:
 
 ```bash
-bash scripts/ictpolarreal.sh train \
-  --data-root /path/to/data \
-  --target albedo \
-  --train-steps 20 \
-  --batch-size 1
-```
-
-Evaluate predicted outputs:
-
-```bash
-bash scripts/evaluate.sh \
-  --eval-mode ictpolarreal \
-  --eval-task decomposition \
-  --data-root /path/to/data \
-  --pred-root outputs/inverse_debug/predictions \
-  --target albedo
-```
-
-Objaverse-style sample evaluation is documented in
-`samples/objaverse/README.md` and uses `configs/eval_objaverse_samples.json`.
-
-```bash
-bash scripts/evaluate.sh \
-  --eval-mode objaverse \
-  --eval-task relighting \
-  --data-root /path/to/objaverse_sample \
-  --pred-root outputs/predictions \
-  --eval-manifest configs/eval_objaverse_samples.json
+conda create -n ictpolarreal python=3.10 -y
+conda activate ictpolarreal
+pip install -e ".[dev,train]"
 ```
 
 ## Citation

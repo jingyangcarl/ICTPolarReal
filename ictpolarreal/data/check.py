@@ -31,7 +31,7 @@ def main() -> None:
     if not root.exists():
         print(f"[data-check] Missing data root: {root}")
         print("[data-check] Download or copy the sample dataset, then rerun with:")
-        print(f"  DATA_ROOT={root} bash scripts/ictpolarreal.sh all")
+        print(f"  bash ictpolarreal.sh all --data-root {root}")
         print(f"[data-check] Sample Google Drive folder: {args.sample_url}")
         raise SystemExit(2)
 
