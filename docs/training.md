@@ -7,11 +7,11 @@ be ported only after their configs are made path-independent.
 Inverse decomposition example:
 
 ```bash
-python -m ictpolarreal.train.inverse \
+bash scripts/ictpolarreal.sh train \
   --data-root /path/to/data \
-  --out-dir outputs/inverse_albedo \
   --input static \
-  --target albedo
+  --target albedo \
+  --train-steps 1000
 ```
 
 Forward relighting example:
@@ -26,4 +26,3 @@ python -m ictpolarreal.train.forward \
 
 For CVPR reproduction runs, record the data split, camera set, target, checkpoint
 path, GPU count, command, and output directory.
-

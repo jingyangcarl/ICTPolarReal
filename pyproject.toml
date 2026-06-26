@@ -14,7 +14,9 @@ authors = [
 ]
 dependencies = [
   "imageio>=2.31",
+  "gdown>=5.0",
   "numpy>=1.23",
+  "opencv-python>=4.8",
   "pillow>=9.5",
   "pyyaml>=6.0",
   "torch>=2.0",
@@ -26,4 +28,3 @@ dev = ["pytest>=7.0", "ruff>=0.5"]
 
 [tool.setuptools.packages.find]
 include = ["ictpolarreal*"]
-

@@ -15,6 +15,22 @@ experiments.
 
 ## Installation
 
+The easiest path is the all-in-one script:
+
+```bash
+bash scripts/ictpolarreal.sh all \
+  --data-root /path/to/ICTPolarReal_sample \
+  --download-sample
+```
+
+This creates an environment when needed, checks imports, validates the data
+layout, processes OLAT cross/parallel captures into diffuse/specular material
+previews, and runs a tiny training smoke test. If the data root is missing, the
+script prints the sample Google Drive folder and can try `gdown` with
+`--download-sample`.
+
+For manual installation:
+
 ```bash
 git clone https://github.com/jingyangcarl/ICTPolarReal.git
 cd ICTPolarReal
@@ -45,29 +61,37 @@ stay outside Git history.
 
 ## Quickstart
 
+One command:
+
+```bash
+DATA_ROOT=/path/to/data bash scripts/ictpolarreal.sh all
+```
+
+Individual stages:
+
 Inspect a local or sample dataset:
 
 ```bash
-python -m ictpolarreal.data.inspect --data-root /path/to/ICTPolarReal/sample
+bash scripts/ictpolarreal.sh check-data --data-root /path/to/ICTPolarReal/sample
 ```
 
 Prepare diffuse/specular images from cross/parallel OLAT captures:
 
 ```bash
-python -m ictpolarreal.processing.prepare_materials \
+bash scripts/ictpolarreal.sh process \
   --data-root /path/to/data \
-  --out-root outputs/materials \
-  --max-lights 8
+  --output-root outputs \
+  --backend torch \
+  --device cuda
 ```
 
 Run a tiny inverse decomposition training smoke test:
 
 ```bash
-python -m ictpolarreal.train.inverse \
+bash scripts/ictpolarreal.sh train \
   --data-root /path/to/data \
-  --out-dir outputs/inverse_debug \
   --target albedo \
-  --max-steps 20 \
+  --train-steps 20 \
   --batch-size 1
 ```
 
@@ -90,4 +114,3 @@ python -m ictpolarreal.eval.decomposition \
   year      = {2026},
 }
 ```
-

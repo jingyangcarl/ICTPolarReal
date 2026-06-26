@@ -1,14 +1,16 @@
 # Preprocessing
 
-Use `ictpolarreal.processing.prepare_materials` to convert cross/parallel OLAT
-captures into diffuse and specular components.
+Use the release script to convert cross/parallel OLAT captures into diffuse and
+specular components. The default `auto` backend uses PyTorch on GPU when
+available and falls back to NumPy on CPU.
 
 ```bash
-python -m ictpolarreal.processing.prepare_materials \
+bash scripts/ictpolarreal.sh process \
   --data-root /path/to/data \
-  --out-root outputs/materials \
+  --output-root outputs \
   --max-lights 16 \
-  --preview
+  --backend torch \
+  --device cuda
 ```
 
 The processing convention is:
@@ -17,4 +19,5 @@ The processing convention is:
 - `specular = 2 * max(parallel - cross, 0)`
 
 Use `--preview` for tone-mapped PNGs. Omit it to write EXR outputs.
-
+The bash script writes PNG previews and mean diffuse/specular material-property
+summaries under `outputs/materials` by default.
