@@ -9,19 +9,33 @@ ENV_NAME="${ENV_NAME:-ictpolarreal}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.10}"
 DATA_ROOT="${DATA_ROOT:-${REPO_ROOT}/data/sample}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_ROOT}/outputs}"
-INPUT_NAME="${INPUT_NAME:-static}"
+MATERIAL_ROOT_EXPLICIT=0
+if [[ -n "${MATERIAL_ROOT:-}" ]]; then
+  MATERIAL_ROOT_EXPLICIT=1
+fi
+MATERIAL_ROOT="${MATERIAL_ROOT:-${OUTPUT_ROOT}/materials}"
+INPUT_NAME="${INPUT_NAME:-polarization}"
 TARGET_NAME="${TARGET_NAME:-albedo}"
+INPUT_MODE="${INPUT_MODE:-polarization}"
+TARGET_MODE="${TARGET_MODE:-image}"
+TRAIN_STAGE="${TRAIN_STAGE:-both}"
+FORWARD_INPUT="${FORWARD_INPUT:-gbuffer}"
+FORWARD_INPUT_MODE="${FORWARD_INPUT_MODE:-gbuffer}"
+FORWARD_TARGET="${FORWARD_TARGET:-static}"
+FORWARD_TARGET_MODE="${FORWARD_TARGET_MODE:-image}"
 MAX_LIGHTS="${MAX_LIGHTS:-8}"
 LIGHT_START="${LIGHT_START:-0}"
+LIGHT_ROOT="${LIGHT_ROOT:-}"
 BACKEND="${BACKEND:-auto}"
 DEVICE="${DEVICE:-cuda}"
+DECOMP_NOISE="${DECOMP_NOISE:-1.5e-3}"
 TRAIN_STEPS="${TRAIN_STEPS:-20}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 PRED_ROOT_EXPLICIT=0
 if [[ -n "${PRED_ROOT:-}" ]]; then
   PRED_ROOT_EXPLICIT=1
 fi
-PRED_ROOT="${PRED_ROOT:-${OUTPUT_ROOT}/train_${TARGET_NAME}/predictions}"
+PRED_ROOT="${PRED_ROOT:-${OUTPUT_ROOT}/train_inverse_${TARGET_NAME}/predictions}"
 EVAL_MODE="${EVAL_MODE:-ictpolarreal}"
 EVAL_TASK="${EVAL_TASK:-decomposition}"
 EVAL_MANIFEST="${EVAL_MANIFEST:-}"
@@ -40,21 +54,31 @@ Commands:
   setup        Create/activate an environment and install ICTPolarReal.
   check-env    Verify Python package imports and CUDA availability.
   check-data   Validate DATA_ROOT and print Google Drive sample instructions if missing.
-  process      Process OLAT cross/parallel images into diffuse/specular material previews.
-  train        Run a tiny inverse-decomposition training job.
+  process      Decompose OLAT cross/parallel images into material maps and previews.
+  train        Run inverse and/or forward training smoke jobs.
   evaluate     Evaluate predictions against ICTPolarReal or Objaverse-style samples.
   all          setup -> check-env -> check-data -> process -> train -> evaluate.
 
 Options:
   --data-root PATH          Dataset root. Default: ${DATA_ROOT}
   --output-root PATH        Output root. Default: ${OUTPUT_ROOT}
+  --material-root PATH      Processed material map root. Default: ${MATERIAL_ROOT}
   --env-name NAME           Conda/micromamba env name. Default: ${ENV_NAME}
-  --input NAME              Training input image stem. Default: ${INPUT_NAME}
+  --train-stage STAGE       inverse, forward, or both. Default: ${TRAIN_STAGE}
+  --input NAME              Inverse input name. Default: ${INPUT_NAME}
   --target NAME             Training target image stem. Default: ${TARGET_NAME}
+  --input-mode MODE         image, polarization, or gbuffer. Default: ${INPUT_MODE}
+  --target-mode MODE        image, polarization, or gbuffer. Default: ${TARGET_MODE}
+  --forward-input NAME      Forward input name. Default: ${FORWARD_INPUT}
+  --forward-input-mode MODE image, polarization, or gbuffer. Default: ${FORWARD_INPUT_MODE}
+  --forward-target NAME     Forward training target. Default: ${FORWARD_TARGET}
+  --forward-target-mode MODE image, polarization, or gbuffer. Default: ${FORWARD_TARGET_MODE}
   --max-lights N            Number of OLAT lights to process. Default: ${MAX_LIGHTS}
   --light-start N           First OLAT light id to process. Default: ${LIGHT_START}
+  --light-root PATH         Optional LSX calibration folder for light positions.
   --backend auto|cpu|torch  Processing backend. Default: ${BACKEND}
   --device DEVICE           Torch device for processing/training. Default: ${DEVICE}
+  --decomp-noise FLOAT      Decomposition radiance threshold. Default: ${DECOMP_NOISE}
   --train-steps N           Training smoke-test steps. Default: ${TRAIN_STEPS}
   --batch-size N            Training batch size. Default: ${BATCH_SIZE}
   --pred-root PATH          Prediction root for training/evaluation. Default: ${PRED_ROOT}
@@ -71,6 +95,8 @@ Examples:
   bash run.sh all
   bash run.sh check-data
   bash run.sh process --backend torch --device cuda
+  bash run.sh train --train-stage inverse --input-mode polarization --target albedo
+  bash run.sh train --train-stage forward --forward-input-mode gbuffer --forward-target static
 EOF
 }
 
@@ -79,13 +105,23 @@ parse_args() {
     case "$1" in
       --data-root) DATA_ROOT="$2"; shift 2 ;;
       --output-root) OUTPUT_ROOT="$2"; shift 2 ;;
+      --material-root) MATERIAL_ROOT="$2"; MATERIAL_ROOT_EXPLICIT=1; shift 2 ;;
       --env-name) ENV_NAME="$2"; shift 2 ;;
+      --train-stage) TRAIN_STAGE="$2"; shift 2 ;;
       --input) INPUT_NAME="$2"; shift 2 ;;
       --target) TARGET_NAME="$2"; shift 2 ;;
+      --input-mode) INPUT_MODE="$2"; shift 2 ;;
+      --target-mode) TARGET_MODE="$2"; shift 2 ;;
+      --forward-input) FORWARD_INPUT="$2"; shift 2 ;;
+      --forward-input-mode) FORWARD_INPUT_MODE="$2"; shift 2 ;;
+      --forward-target) FORWARD_TARGET="$2"; shift 2 ;;
+      --forward-target-mode) FORWARD_TARGET_MODE="$2"; shift 2 ;;
       --max-lights) MAX_LIGHTS="$2"; shift 2 ;;
       --light-start) LIGHT_START="$2"; shift 2 ;;
+      --light-root) LIGHT_ROOT="$2"; shift 2 ;;
       --backend) BACKEND="$2"; shift 2 ;;
       --device) DEVICE="$2"; shift 2 ;;
+      --decomp-noise) DECOMP_NOISE="$2"; shift 2 ;;
       --train-steps) TRAIN_STEPS="$2"; shift 2 ;;
       --batch-size) BATCH_SIZE="$2"; shift 2 ;;
       --pred-root) PRED_ROOT="$2"; PRED_ROOT_EXPLICIT=1; shift 2 ;;
@@ -102,7 +138,10 @@ parse_args() {
     esac
   done
   if [[ "${PRED_ROOT_EXPLICIT}" != "1" ]]; then
-    PRED_ROOT="${OUTPUT_ROOT}/train_${TARGET_NAME}/predictions"
+    PRED_ROOT="${OUTPUT_ROOT}/train_inverse_${TARGET_NAME}/predictions"
+  fi
+  if [[ "${MATERIAL_ROOT_EXPLICIT}" != "1" ]]; then
+    MATERIAL_ROOT="${OUTPUT_ROOT}/materials"
   fi
 }
 
@@ -380,32 +419,74 @@ ensure_data_for_all() {
 process_materials() {
   cd "${REPO_ROOT}"
   activate_env || true
+  local light_root_args=()
+  if [[ -n "${LIGHT_ROOT}" ]]; then
+    light_root_args=(--light-root "${LIGHT_ROOT}")
+  fi
   python -m ictpolarreal.processing.prepare_materials \
     --data-root "${DATA_ROOT}" \
-    --out-root "${OUTPUT_ROOT}/materials" \
+    --out-root "${MATERIAL_ROOT}" \
     --max-lights "${MAX_LIGHTS}" \
     --light-start "${LIGHT_START}" \
+    "${light_root_args[@]}" \
     --backend "${BACKEND}" \
     --device "${DEVICE}" \
+    --noise "${DECOMP_NOISE}" \
     --preview \
     --save-aggregate
 }
 
-train_baseline() {
+train_inverse() {
+  cd "${REPO_ROOT}"
+  activate_env || true
+  if [[ "${TARGET_MODE}" == "image" ]]; then
+    python -m ictpolarreal.data.check \
+      --data-root "${DATA_ROOT}" \
+      --min-lights 1 \
+      --require-target "${TARGET_NAME}"
+  fi
+  python -m ictpolarreal.train.inverse \
+    --data-root "${DATA_ROOT}" \
+    --out-dir "${OUTPUT_ROOT}/train_inverse_${TARGET_NAME}" \
+    --material-root "${MATERIAL_ROOT}" \
+    --input "${INPUT_NAME}" \
+    --target "${TARGET_NAME}" \
+    --input-mode "${INPUT_MODE}" \
+    --target-mode "${TARGET_MODE}" \
+    --max-steps "${TRAIN_STEPS}" \
+    --batch-size "${BATCH_SIZE}" \
+    --device "${DEVICE}" \
+    --pred-dir "${PRED_ROOT}"
+}
+
+train_forward() {
   cd "${REPO_ROOT}"
   activate_env || true
   python -m ictpolarreal.data.check \
     --data-root "${DATA_ROOT}" \
     --min-lights 1 \
-    --require-target "${TARGET_NAME}"
-  python -m ictpolarreal.train.inverse \
+    --require-target "${FORWARD_TARGET}"
+  python -m ictpolarreal.train.forward \
     --data-root "${DATA_ROOT}" \
-    --out-dir "${OUTPUT_ROOT}/train_${TARGET_NAME}" \
-    --input "${INPUT_NAME}" \
-    --target "${TARGET_NAME}" \
+    --out-dir "${OUTPUT_ROOT}/train_forward_${FORWARD_TARGET}" \
+    --material-root "${MATERIAL_ROOT}" \
+    --input "${FORWARD_INPUT}" \
+    --target "${FORWARD_TARGET}" \
+    --input-mode "${FORWARD_INPUT_MODE}" \
+    --target-mode "${FORWARD_TARGET_MODE}" \
     --max-steps "${TRAIN_STEPS}" \
     --batch-size "${BATCH_SIZE}" \
-    --pred-dir "${PRED_ROOT}"
+    --device "${DEVICE}" \
+    --pred-dir "${OUTPUT_ROOT}/train_forward_${FORWARD_TARGET}/predictions"
+}
+
+train_baseline() {
+  case "${TRAIN_STAGE}" in
+    inverse) train_inverse ;;
+    forward) train_forward ;;
+    both) train_inverse; train_forward ;;
+    *) echo "Unknown --train-stage: ${TRAIN_STAGE}"; exit 2 ;;
+  esac
 }
 
 evaluate_predictions() {

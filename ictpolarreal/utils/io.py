@@ -42,6 +42,8 @@ def write_image(path: str | Path, image: np.ndarray) -> None:
     if path.suffix.lower() in {".png", ".jpg", ".jpeg"}:
         arr = np.clip(arr, 0.0, 1.0)
         arr = (arr * 255.0 + 0.5).astype(np.uint8)
+        if arr.ndim == 3 and arr.shape[-1] == 1:
+            arr = arr[..., 0]
     try:
         import imageio.v3 as iio
 

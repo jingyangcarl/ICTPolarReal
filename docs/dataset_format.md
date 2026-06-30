@@ -20,6 +20,17 @@ object_name/camXX/normal.exr
 object_name/camXX/specular.exr
 ```
 
+Processed material maps are written separately so raw data remains unchanged:
+
+```text
+outputs/materials/object_name/camXX/material_properties/albedo.exr
+outputs/materials/object_name/camXX/material_properties/normal.exr
+outputs/materials/object_name/camXX/material_properties/roughness.exr
+outputs/materials/object_name/camXX/material_properties/specular.exr
+```
+
+The training loader can use raw `polarization` mode from `static` plus a paired
+OLAT cross/parallel image, or `gbuffer` mode from the processed material folder.
+
 PNG or JPG versions may be used for smoke tests. Full experiments should use
 linear EXR data and keep all data outside Git.
-

@@ -1,8 +1,10 @@
 data_root: /path/to/ictpolarreal
-out_dir: outputs/forward_static
-input: albedo
+material_root: outputs/materials
+out_dir: outputs/train_forward_static
+input: gbuffer
 target: static
+input_mode: gbuffer
+target_mode: image
 batch_size: 2
 max_steps: 1000
 lr: 0.0001
-

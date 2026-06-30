@@ -1,15 +1,21 @@
 # Training
 
-The first release includes compact baselines for validating the data path and
-experiment protocol. Heavier diffusion models from the research workspace should
-be ported only after their configs are made path-independent.
+The release includes compact baselines for validating the data path and
+experiment protocol. Training has two stages:
+
+- inverse: polarization observations -> material targets.
+- forward: material g-buffers -> relit/static image targets.
+
+The dataset loader supports `polarization`, `gbuffer`, and plain `image` modes.
+Run preprocessing first so forward training can read `outputs/materials`.
 
 Inverse decomposition example:
 
 ```bash
 bash scripts/ictpolarreal.sh train \
   --data-root /path/to/data \
-  --input static \
+  --train-stage inverse \
+  --input-mode polarization \
   --target albedo \
   --train-steps 1000
 ```
@@ -17,11 +23,12 @@ bash scripts/ictpolarreal.sh train \
 Forward relighting example:
 
 ```bash
-python -m ictpolarreal.train.forward \
+bash scripts/ictpolarreal.sh train \
   --data-root /path/to/data \
-  --out-dir outputs/forward_static \
-  --input albedo \
-  --target static
+  --train-stage forward \
+  --forward-input-mode gbuffer \
+  --forward-target static \
+  --train-steps 1000
 ```
 
 For CVPR reproduction runs, record the data split, camera set, target, checkpoint

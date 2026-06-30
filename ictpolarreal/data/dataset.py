@@ -6,6 +6,7 @@ from typing import Iterator
 
 import numpy as np
 
+from ictpolarreal.data.polarization import separate_cross_parallel
 from ictpolarreal.utils.io import find_first_existing, read_image
 
 try:
@@ -41,7 +42,7 @@ def iter_camera_samples(data_root: str | Path) -> Iterator[CameraSample]:
 
 
 class ICTPolarRealDataset(Dataset):
-    """Minimal PyTorch dataset for decomposition and relighting experiments."""
+    """PyTorch dataset for inverse decomposition and forward relighting baselines."""
 
     def __init__(
         self,
@@ -49,9 +50,19 @@ class ICTPolarRealDataset(Dataset):
         *,
         input_name: str = "static",
         target_name: str = "albedo",
+        input_mode: str = "image",
+        target_mode: str = "image",
+        material_root: str | Path | None = None,
+        light_id: int | None = None,
         cameras: list[str] | None = None,
         max_samples: int | None = None,
     ) -> None:
+        if input_mode not in {"image", "polarization", "gbuffer"}:
+            raise ValueError("input_mode must be image, polarization, or gbuffer")
+        if target_mode not in {"image", "polarization", "gbuffer"}:
+            raise ValueError("target_mode must be image, polarization, or gbuffer")
+        self.data_root = Path(data_root)
+        self.material_root = Path(material_root) if material_root else None
         self.samples = [
             sample
             for sample in iter_camera_samples(data_root)
@@ -59,6 +70,9 @@ class ICTPolarRealDataset(Dataset):
         ]
         self.input_name = input_name
         self.target_name = target_name
+        self.input_mode = input_mode
+        self.target_mode = target_mode
+        self.light_id = light_id
         if max_samples is not None:
             self.samples = self.samples[:max_samples]
 
@@ -69,15 +83,8 @@ class ICTPolarRealDataset(Dataset):
         if torch is None:
             raise ModuleNotFoundError("ICTPolarRealDataset requires PyTorch. Install with `pip install -e .`.")
         sample = self.samples[idx]
-        input_path = sample.image_path(self.input_name)
-        target_path = sample.image_path(self.target_name)
-        if input_path is None:
-            raise FileNotFoundError(f"Missing {self.input_name} for {sample.camera_dir}")
-        if target_path is None:
-            raise FileNotFoundError(f"Missing {self.target_name} for {sample.camera_dir}")
-
-        image = read_image(input_path)
-        target = read_image(target_path)
+        image = self._read_mode(sample, self.input_mode, self.input_name)
+        target = self._read_mode(sample, self.target_mode, self.target_name)
         mask_path = sample.image_path("mask")
         mask = read_image(mask_path, channels=1) if mask_path else np.ones(target.shape[:2] + (1,), dtype=np.float32)
         mask = np.clip(mask, 0.0, 1.0)
@@ -89,3 +96,94 @@ class ICTPolarRealDataset(Dataset):
             "object": sample.object_name,
             "camera": sample.camera,
         }
+
+    def target_slices(self) -> list[tuple[str, slice]]:
+        sample = self.samples[0]
+        names = self._mode_names(self.target_mode, self.target_name)
+        start = 0
+        out = []
+        for name in names:
+            channels = self._read_named(sample, name, for_gbuffer=self.target_mode == "gbuffer").shape[-1]
+            out.append((name, slice(start, start + channels)))
+            start += channels
+        return out
+
+    def _read_mode(self, sample: CameraSample, mode: str, name: str) -> np.ndarray:
+        if mode == "polarization":
+            return self._read_polarization(sample)
+        if mode == "gbuffer" and name == "gbuffer":
+            return np.concatenate([self._read_named(sample, item, for_gbuffer=True) for item in self._mode_names(mode, name)], axis=-1)
+        return self._read_named(sample, name, for_gbuffer=mode == "gbuffer")
+
+    def _mode_names(self, mode: str, name: str) -> list[str]:
+        if mode == "gbuffer" and name == "gbuffer":
+            return ["albedo", "normal", "roughness", "specular"]
+        return [name]
+
+    def _read_polarization(self, sample: CameraSample) -> np.ndarray:
+        light_id = self.light_id if self.light_id is not None else self._first_paired_light(sample)
+        static = self._read_named(sample, "static")
+        cross_path = sample.light_path("cross", light_id)
+        parallel_path = sample.light_path("parallel", light_id)
+        if cross_path is None or parallel_path is None:
+            raise FileNotFoundError(f"Missing paired cross/parallel light {light_id:06d} for {sample.camera_dir}")
+        cross = _prepare_image(read_image(cross_path, channels=3))
+        parallel = _prepare_image(read_image(parallel_path, channels=3))
+        diffuse, specular = separate_cross_parallel(cross, parallel)
+        return np.concatenate([static, cross, parallel, _prepare_image(diffuse), _prepare_image(specular)], axis=-1)
+
+    def _first_paired_light(self, sample: CameraSample) -> int:
+        cross_dir = sample.camera_dir / "cross"
+        parallel_dir = sample.camera_dir / "parallel"
+        cross = {int(path.stem) for path in cross_dir.iterdir() if path.stem.isdigit()} if cross_dir.exists() else set()
+        parallel = {int(path.stem) for path in parallel_dir.iterdir() if path.stem.isdigit()} if parallel_dir.exists() else set()
+        paired = sorted(cross & parallel)
+        if not paired:
+            raise FileNotFoundError(f"Missing paired cross/parallel OLAT images for {sample.camera_dir}")
+        return paired[0]
+
+    def _read_named(self, sample: CameraSample, name: str, *, for_gbuffer: bool = False) -> np.ndarray:
+        path = self._resolve_named_path(sample, name)
+        if path is None:
+            raise FileNotFoundError(f"Missing {name} for {sample.camera_dir}")
+        channels = _gbuffer_channels(name) if for_gbuffer else 3
+        image = read_image(path, channels=channels)
+        return _prepare_image(image, encode_normal=name in {"normal", "diffuse_normal", "specular_normal", "tangent", "bitangent"})
+
+    def _resolve_named_path(self, sample: CameraSample, name: str) -> Path | None:
+        names = _ALIASES.get(name, [name])
+        roots = [sample.camera_dir]
+        if self.material_root is not None:
+            roots.extend(
+                [
+                    self.material_root / sample.object_name / sample.camera / "material_properties",
+                    self.material_root / sample.object_name / sample.camera,
+                ]
+            )
+        for root in roots:
+            for stem in names:
+                path = find_first_existing(root, stem)
+                if path is not None:
+                    return path
+        return None
+
+
+_ALIASES = {
+    "albedo": ["albedo", "diffuse_albedo"],
+    "normal": ["normal", "diffuse_normal"],
+    "specular": ["specular", "specular_albedo"],
+    "roughness": ["roughness"],
+}
+
+
+def _gbuffer_channels(name: str) -> int:
+    if name in {"roughness", "specular", "specular_albedo", "anisotropy", "occlusion"}:
+        return 1
+    return 3
+
+
+def _prepare_image(image: np.ndarray, *, encode_normal: bool = False) -> np.ndarray:
+    image = np.nan_to_num(image.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    if encode_normal and image.min(initial=0.0) < 0.0:
+        image = image * 0.5 + 0.5
+    return np.clip(image, 0.0, 1.0)

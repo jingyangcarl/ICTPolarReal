@@ -40,8 +40,8 @@ rerun the same command.
 | 1 | Set up the environment | Creates or reuses the `ictpolarreal` environment and installs the package. |
 | 2 | Check Python packages | Verifies imports and reports PyTorch/CUDA availability. |
 | 3 | Prepare sample data | Validates `data/sample`; if it is missing, downloads a minimal sample subset. |
-| 4 | Process polarization data | Converts OLAT cross/parallel pairs into diffuse/specular material previews. |
-| 5 | Run a tiny training job | Trains the baseline briefly and writes predictions. |
+| 4 | Decompose polarization data | Writes per-light diffuse/specular previews plus material g-buffer maps. |
+| 5 | Run training smoke jobs | Runs inverse polarization-to-material training and forward g-buffer-to-image training. |
 | 6 | Evaluate predictions | Writes CSV metrics and a JSON summary under `outputs/`. |
 
 ## Expected Data Layout
@@ -61,15 +61,16 @@ data/sample/
 
 The automatic sample path requires `static`, `mask`, the training target
 (`albedo` by default), and at least one paired `cross`/`parallel` OLAT image.
-The full dataset may also include `normal.exr`, `specular.exr`, `sigma.exr`,
-and more lights/cameras.
+The full dataset may also include more material annotations, cameras, and OLAT
+lights. `run.sh process` can derive release g-buffers from the raw OLAT pairs.
 
 ## Outputs
 
 Default outputs are written to `outputs/`:
 
-- `outputs/materials/`: diffuse/specular previews from OLAT polarization pairs.
-- `outputs/train_albedo/`: checkpoint and prediction images from the baseline.
+- `outputs/materials/`: decomposed material maps and per-light polarization previews.
+- `outputs/train_inverse_albedo/`: inverse-stage checkpoint and predictions.
+- `outputs/train_forward_static/`: forward-stage checkpoint and predictions.
 - `outputs/eval_ictpolarreal_decomposition/`: CSV metrics and JSON summary.
 
 ## Flexible Usage
@@ -80,7 +81,8 @@ running on a different machine or dataset:
 ```bash
 bash run.sh check-data
 bash run.sh process --data-root /path/to/data --output-root /path/to/out
-bash run.sh train --data-root /path/to/data --target albedo
+bash run.sh train --data-root /path/to/data --train-stage inverse --target albedo
+bash run.sh train --data-root /path/to/data --train-stage forward --forward-input-mode gbuffer --forward-target static
 bash run.sh evaluate --data-root /path/to/data --pred-root /path/to/predictions
 ```
 
@@ -90,6 +92,10 @@ Useful options:
 - `--output-root PATH`: output location. Default: `outputs`.
 - `--torch-variant cpu`: force CPU PyTorch on machines without working CUDA.
 - `--max-lights N`: limit OLAT lights for a quick check.
+- `--train-stage inverse|forward|both`: choose the training stage.
+- `--input-mode polarization|gbuffer|image`: choose the inverse input representation.
+- `--forward-input-mode gbuffer|polarization|image`: choose the forward input representation.
+- `--material-root PATH`: use precomputed material maps from another run.
 - `--skip-setup`: reuse the current environment.
 
 Objaverse-style evaluation uses `configs/eval_objaverse_samples.json`; see
