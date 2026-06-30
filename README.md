@@ -28,9 +28,10 @@ bash run.sh all
 ```
 
 No manual Python setup is needed for the default path. If `data/sample` is
-missing or incomplete, the script first tries to download the sample from Google
-Drive. If Google Drive blocks command-line download, open the sample link in a
-browser and place the folder under `data/sample`, then rerun the same command.
+missing or incomplete, the script downloads a minimal runnable subset from the
+sample Google Drive folder. If Google Drive blocks command-line download, open
+the sample link in a browser and place the folder under `data/sample`, then
+rerun the same command.
 
 ## What `run.sh all` Does
 
@@ -38,7 +39,7 @@ browser and place the folder under `data/sample`, then rerun the same command.
 | --- | --- | --- |
 | 1 | Set up the environment | Creates or reuses the `ictpolarreal` environment and installs the package. |
 | 2 | Check Python packages | Verifies imports and reports PyTorch/CUDA availability. |
-| 3 | Prepare sample data | Validates `data/sample`; if it is missing, tries to download the Google Drive sample. |
+| 3 | Prepare sample data | Validates `data/sample`; if it is missing, downloads a minimal sample subset. |
 | 4 | Process polarization data | Converts OLAT cross/parallel pairs into diffuse/specular material previews. |
 | 5 | Run a tiny training job | Trains the baseline briefly and writes predictions. |
 | 6 | Evaluate predictions | Writes CSV metrics and a JSON summary under `outputs/`. |
@@ -54,13 +55,14 @@ data/sample/
       static.exr
       mask.png
       albedo.exr
-      normal.exr
-      specular.exr
       cross/000000.exr
       parallel/000000.exr
 ```
 
-The sample Drive folder already follows this layout.
+The automatic sample path requires `static`, `mask`, the training target
+(`albedo` by default), and at least one paired `cross`/`parallel` OLAT image.
+The full dataset may also include `normal.exr`, `specular.exr`, `sigma.exr`,
+and more lights/cameras.
 
 ## Outputs
 

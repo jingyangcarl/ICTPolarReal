@@ -12,6 +12,7 @@ OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_ROOT}/outputs}"
 INPUT_NAME="${INPUT_NAME:-static}"
 TARGET_NAME="${TARGET_NAME:-albedo}"
 MAX_LIGHTS="${MAX_LIGHTS:-8}"
+LIGHT_START="${LIGHT_START:-0}"
 BACKEND="${BACKEND:-auto}"
 DEVICE="${DEVICE:-cuda}"
 TRAIN_STEPS="${TRAIN_STEPS:-20}"
@@ -51,6 +52,7 @@ Options:
   --input NAME              Training input image stem. Default: ${INPUT_NAME}
   --target NAME             Training target image stem. Default: ${TARGET_NAME}
   --max-lights N            Number of OLAT lights to process. Default: ${MAX_LIGHTS}
+  --light-start N           First OLAT light id to process. Default: ${LIGHT_START}
   --backend auto|cpu|torch  Processing backend. Default: ${BACKEND}
   --device DEVICE           Torch device for processing/training. Default: ${DEVICE}
   --train-steps N           Training smoke-test steps. Default: ${TRAIN_STEPS}
@@ -60,7 +62,7 @@ Options:
   --eval-task TASK          decomposition or relighting. Default: ${EVAL_TASK}
   --eval-manifest PATH      Optional Objaverse/ICTPolarReal evaluation manifest.
   --torch-variant VARIANT   auto, cpu, cu121, cu124, cu126, cu128, or pypi. Default: ${TORCH_VARIANT}
-  --download-sample         Try to download the Google Drive sample with gdown. The all command does this automatically.
+  --download-sample         Download the minimal Google Drive sample. The all command does this automatically.
   --skip-setup              For all: use the current environment.
   --skip-process            For all: skip material preprocessing.
   --skip-train              For all: skip training.
@@ -81,6 +83,7 @@ parse_args() {
       --input) INPUT_NAME="$2"; shift 2 ;;
       --target) TARGET_NAME="$2"; shift 2 ;;
       --max-lights) MAX_LIGHTS="$2"; shift 2 ;;
+      --light-start) LIGHT_START="$2"; shift 2 ;;
       --backend) BACKEND="$2"; shift 2 ;;
       --device) DEVICE="$2"; shift 2 ;;
       --train-steps) TRAIN_STEPS="$2"; shift 2 ;;
@@ -225,31 +228,113 @@ download_sample_if_requested() {
   cd "${REPO_ROOT}"
   activate_env || true
   mkdir -p "${DATA_ROOT}"
-  echo "[data] Downloading sample folder with gdown:"
+  echo "[data] Downloading the minimal sample needed for run.sh all:"
   echo "       ${SAMPLE_URL}"
-  echo "[data] This can take several minutes for the full sample."
-  if ! python - "${SAMPLE_URL}" "${DATA_ROOT}" <<'PY'; then
+  if ! python - "${SAMPLE_URL}" "${DATA_ROOT}" "${TARGET_NAME}" <<'PY'; then
+from __future__ import annotations
+
 import inspect
+import shutil
 import sys
+import tempfile
+import urllib.parse
+import urllib.request
+from pathlib import Path
 
-url, output = sys.argv[1:3]
-kwargs = {"url": url, "output": output, "quiet": True}
-try:
-    import gdown
+IMAGE_EXTS = (".exr", ".png", ".jpg", ".jpeg", ".tif", ".tiff")
 
+
+def fail(message: str) -> None:
+    print(f"[data] {message}")
+    raise SystemExit(1)
+
+
+def list_drive_folder(url: str, output: Path):
+    try:
+        import gdown
+    except Exception as exc:
+        fail(f"gdown is required to list the Drive folder: {exc}")
+
+    kwargs = {"url": url, "output": str(output / ".drive-list"), "quiet": True, "skip_download": True}
     signature = inspect.signature(gdown.download_folder)
     if "remaining_ok" in signature.parameters:
         kwargs["remaining_ok"] = True
     if "resume" in signature.parameters:
         kwargs["resume"] = True
-    downloaded = gdown.download_folder(**kwargs)
-except Exception as exc:
-    message = str(exc).strip().splitlines()[0] if str(exc).strip() else exc.__class__.__name__
-    print(f"[data] gdown failed: {message}")
-    raise SystemExit(1)
-if downloaded is None:
-    raise SystemExit(1)
-print(f"[data] gdown returned {len(downloaded)} file(s).")
+    try:
+        files = gdown.download_folder(**kwargs)
+    except Exception as exc:
+        fail(f"gdown folder listing failed: {str(exc).strip().splitlines()[0]}")
+    if not files:
+        fail("Drive folder listing returned no files.")
+    return files
+
+
+def find_sample_files(files, target_name: str) -> list:
+    by_path = {item.path: item for item in files}
+    camera_dirs = sorted({"/".join(path.split("/")[:2]) for path in by_path if "/cam" in path and len(path.split("/")) >= 3})
+    for camera_dir in camera_dirs:
+        static = first_existing(by_path, camera_dir, "static")
+        mask = first_existing(by_path, camera_dir, "mask")
+        target = first_existing(by_path, camera_dir, target_name)
+        cross = light_map(by_path, camera_dir, "cross")
+        parallel = light_map(by_path, camera_dir, "parallel")
+        paired_lights = sorted(set(cross) & set(parallel))
+        if static and mask and target and paired_lights:
+            light = paired_lights[0]
+            return [static, mask, target, cross[light], parallel[light]]
+    fail(f"Could not find a camera with static, mask, {target_name}, and paired OLAT files.")
+
+
+def first_existing(by_path: dict, camera_dir: str, stem: str):
+    for ext in IMAGE_EXTS:
+        item = by_path.get(f"{camera_dir}/{stem}{ext}")
+        if item:
+            return item
+    return None
+
+
+def light_map(by_path: dict, camera_dir: str, kind: str) -> dict[str, object]:
+    prefix = f"{camera_dir}/{kind}/"
+    out = {}
+    for path, item in by_path.items():
+        if not path.startswith(prefix):
+            continue
+        name = Path(path).stem
+        if name.isdigit() and Path(path).suffix.lower() in IMAGE_EXTS:
+            out[name] = item
+    return out
+
+
+def download_file(file_id: str, dst: Path) -> None:
+    if dst.exists() and dst.stat().st_size > 0:
+        print(f"[data] exists: {dst}")
+        return
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    params = urllib.parse.urlencode({"id": file_id, "export": "download", "confirm": "t"})
+    url = f"https://drive.usercontent.google.com/download?{params}"
+    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(request, timeout=120) as response:
+        content_type = response.headers.get("content-type", "")
+        if "text/html" in content_type.lower():
+            fail(f"Drive returned an HTML page instead of data for {dst.name}.")
+        with tempfile.NamedTemporaryFile(delete=False, dir=str(dst.parent), suffix=".part") as tmp:
+            tmp_path = Path(tmp.name)
+            shutil.copyfileobj(response, tmp)
+    if tmp_path.stat().st_size == 0:
+        tmp_path.unlink(missing_ok=True)
+        fail(f"Downloaded empty file for {dst.name}.")
+    tmp_path.replace(dst)
+    print(f"[data] downloaded: {dst}")
+
+
+drive_url, output_root, target = sys.argv[1:4]
+root = Path(output_root)
+files = list_drive_folder(drive_url, root)
+required_files = find_sample_files(files, target)
+for item in required_files:
+    download_file(item.id, root / item.path)
+print("[data] Minimal sample download complete.")
 PY
     cat <<EOF
 [data] Google Drive download did not complete.
@@ -299,6 +384,7 @@ process_materials() {
     --data-root "${DATA_ROOT}" \
     --out-root "${OUTPUT_ROOT}/materials" \
     --max-lights "${MAX_LIGHTS}" \
+    --light-start "${LIGHT_START}" \
     --backend "${BACKEND}" \
     --device "${DEVICE}" \
     --preview \
