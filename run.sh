@@ -431,9 +431,7 @@ process_materials() {
     "${light_root_args[@]}" \
     --backend "${BACKEND}" \
     --device "${DEVICE}" \
-    --noise "${DECOMP_NOISE}" \
-    --preview \
-    --save-aggregate
+    --noise "${DECOMP_NOISE}"
 }
 
 train_inverse() {

@@ -40,7 +40,7 @@ rerun the same command.
 | 1 | Set up the environment | Creates or reuses the `ictpolarreal` environment and installs the package. |
 | 2 | Check Python packages | Verifies imports and reports PyTorch/CUDA availability. |
 | 3 | Prepare sample data | Validates `data/sample`; if it is missing, downloads a minimal sample subset. |
-| 4 | Decompose polarization data | Writes per-light diffuse/specular previews plus material g-buffer maps. |
+| 4 | Decompose polarization data | Writes material g-buffer PNG maps. |
 | 5 | Run training smoke jobs | Runs inverse polarization-to-material training and forward g-buffer-to-image training. |
 | 6 | Evaluate predictions | Writes CSV metrics and a JSON summary under `outputs/`. |
 
@@ -68,7 +68,7 @@ lights. `run.sh process` can derive release g-buffers from the raw OLAT pairs.
 
 Default outputs are written to `outputs/`:
 
-- `outputs/materials/`: decomposed material maps and per-light polarization previews.
+- `outputs/materials/`: decomposed material PNG maps.
 - `outputs/train_inverse_albedo/`: inverse-stage checkpoint and predictions.
 - `outputs/train_forward_static/`: forward-stage checkpoint and predictions.
 - `outputs/eval_ictpolarreal_decomposition/`: CSV metrics and JSON summary.

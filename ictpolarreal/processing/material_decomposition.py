@@ -7,7 +7,7 @@ from typing import Iterable
 import numpy as np
 
 from ictpolarreal.data.dataset import CameraSample
-from ictpolarreal.data.polarization import apply_mask, hdr_to_ldr, separate_cross_parallel
+from ictpolarreal.data.polarization import hdr_to_ldr
 from ictpolarreal.utils.io import find_first_existing, read_image, write_image
 
 
@@ -95,8 +95,6 @@ def decompose_camera_sample(
     light_root: str | Path | None,
     backend: str,
     device: str,
-    preview: bool,
-    save_aggregate: bool,
     noise: float,
 ) -> int:
     light_ids = paired_light_ids(sample, light_start, max_lights)
@@ -110,12 +108,8 @@ def decompose_camera_sample(
         parallel_path = sample.light_path("parallel", light_id)
         if cross_path is None or parallel_path is None:
             continue
-        cross = read_image(cross_path)
-        parallel = read_image(parallel_path)
-        cross_images.append(cross)
-        parallel_images.append(parallel)
-        diffuse, specular = separate_cross_parallel(cross, parallel)
-        _write_light_preview(out_root, sample, light_id, diffuse, specular, preview)
+        cross_images.append(read_image(cross_path))
+        parallel_images.append(read_image(parallel_path))
 
     if not cross_images:
         return 0
@@ -136,7 +130,7 @@ def decompose_camera_sample(
         device=device,
         noise=noise,
     )
-    _write_material_maps(out_root, sample, maps, mask=mask, preview=preview, save_aggregate=save_aggregate)
+    _write_material_maps(out_root, sample, maps)
     return len(cross_images)
 
 
@@ -368,52 +362,20 @@ def _estimate_sigma_numpy(
     return sigma.reshape(height, width, 3)
 
 
-def _write_light_preview(out_root: str | Path, sample: CameraSample, light_id: int, diffuse: np.ndarray, specular: np.ndarray, preview: bool) -> None:
-    suffix = ".png" if preview else ".exr"
-    if preview:
-        diffuse = hdr_to_ldr(diffuse)
-        specular = hdr_to_ldr(specular)
-    base = Path(out_root) / sample.object_name / sample.camera / f"{light_id:06d}"
-    write_image(base / f"diffuse{suffix}", diffuse)
-    write_image(base / f"specular{suffix}", specular)
-
-
-def _write_material_maps(
-    out_root: str | Path,
-    sample: CameraSample,
-    maps: MaterialMaps,
-    *,
-    mask: np.ndarray | None,
-    preview: bool,
-    save_aggregate: bool,
-) -> None:
+def _write_material_maps(out_root: str | Path, sample: CameraSample, maps: MaterialMaps) -> None:
     material_dir = Path(out_root) / sample.object_name / sample.camera / "material_properties"
     outputs = {
-        "diffuse_albedo": maps.diffuse_albedo,
-        "diffuse_normal": maps.diffuse_normal,
-        "specular_albedo": maps.specular_albedo,
-        "specular_normal": maps.specular_normal,
+        "albedo": maps.diffuse_albedo,
+        "normal": maps.diffuse_normal,
+        "specular": maps.specular_albedo,
         "roughness": maps.roughness,
         "anisotropy": maps.anisotropy,
         "sigma": maps.sigma,
         "tangent": maps.tangent,
         "bitangent": maps.bitangent,
-        "occlusion": maps.occlusion,
-        "interreflection": maps.interreflection,
-        "albedo": maps.diffuse_albedo,
-        "normal": maps.diffuse_normal,
-        "specular": maps.specular_albedo,
     }
     for name, image in outputs.items():
-        write_image(material_dir / f"{name}.exr", image.astype(np.float32))
-        if preview:
-            write_image(material_dir / f"{name}.png", _preview_map(name, image))
-    if save_aggregate:
-        write_image(material_dir / "mean_diffuse.exr", maps.mean_diffuse.astype(np.float32))
-        write_image(material_dir / "mean_specular.exr", maps.mean_specular.astype(np.float32))
-        if preview:
-            write_image(material_dir / "mean_diffuse.png", apply_mask(hdr_to_ldr(maps.mean_diffuse), mask))
-            write_image(material_dir / "mean_specular.png", apply_mask(hdr_to_ldr(maps.mean_specular), mask))
+        write_image(material_dir / f"{name}.png", _preview_map(name, image))
 
 
 def _preview_map(name: str, image: np.ndarray) -> np.ndarray:
@@ -421,7 +383,9 @@ def _preview_map(name: str, image: np.ndarray) -> np.ndarray:
         return np.clip(image * 0.5 + 0.5, 0.0, 1.0)
     if name in {"anisotropy"}:
         return np.clip(image * 0.5 + 0.5, 0.0, 1.0)
-    return hdr_to_ldr(image) if float(np.nanmax(image)) > 1.0 else np.clip(image, 0.0, 1.0)
+    if name in {"roughness", "sigma", "occlusion"}:
+        return np.clip(image, 0.0, 1.0)
+    return hdr_to_ldr(image)
 
 
 def _load_light_table(data_root: str | Path, light_root: str | Path | None) -> np.ndarray | None:

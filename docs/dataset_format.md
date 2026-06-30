@@ -23,10 +23,10 @@ object_name/camXX/specular.exr
 Processed material maps are written separately so raw data remains unchanged:
 
 ```text
-outputs/materials/object_name/camXX/material_properties/albedo.exr
-outputs/materials/object_name/camXX/material_properties/normal.exr
-outputs/materials/object_name/camXX/material_properties/roughness.exr
-outputs/materials/object_name/camXX/material_properties/specular.exr
+outputs/materials/object_name/camXX/material_properties/albedo.png
+outputs/materials/object_name/camXX/material_properties/normal.png
+outputs/materials/object_name/camXX/material_properties/roughness.png
+outputs/materials/object_name/camXX/material_properties/specular.png
 ```
 
 The training loader can use raw `polarization` mode from `static` plus a paired
