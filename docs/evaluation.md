@@ -9,8 +9,8 @@ bash scripts/evaluate.sh \
   --eval-mode ictpolarreal \
   --eval-task decomposition \
   --data-root /path/to/data \
-  --pred-root outputs/predictions \
-  --target albedo
+  --pred-root outputs/train/inverse/predictions \
+  --eval-target albedo
 ```
 
 Objaverse-style samples use `configs/eval_objaverse_samples.json`:
@@ -20,7 +20,7 @@ bash scripts/evaluate.sh \
   --eval-mode objaverse \
   --eval-task relighting \
   --data-root /path/to/objaverse_sample \
-  --pred-root outputs/predictions \
+  --pred-root /path/to/objaverse/predictions \
   --eval-manifest configs/eval_objaverse_samples.json
 ```
 

@@ -24,7 +24,14 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "ruff>=0.5"]
-train = ["torch>=2.0"]
+train = [
+  "accelerate>=0.29",
+  "diffusers>=0.28",
+  "peft>=0.7",
+  "safetensors>=0.4",
+  "torch>=2.0",
+  "transformers>=4.40,<5",
+]
 
 [tool.setuptools.packages.find]
 include = ["ictpolarreal*"]

@@ -14,15 +14,11 @@ if [[ -n "${MATERIAL_ROOT:-}" ]]; then
   MATERIAL_ROOT_EXPLICIT=1
 fi
 MATERIAL_ROOT="${MATERIAL_ROOT:-${OUTPUT_ROOT}/material_acquisition}"
-INPUT_NAME="${INPUT_NAME:-polarization}"
-TARGET_NAME="${TARGET_NAME:-albedo}"
-INPUT_MODE="${INPUT_MODE:-polarization}"
-TARGET_MODE="${TARGET_MODE:-image}"
 TRAIN_STAGE="${TRAIN_STAGE:-both}"
-FORWARD_INPUT="${FORWARD_INPUT:-gbuffer}"
-FORWARD_INPUT_MODE="${FORWARD_INPUT_MODE:-gbuffer}"
-FORWARD_TARGET="${FORWARD_TARGET:-static}"
-FORWARD_TARGET_MODE="${FORWARD_TARGET_MODE:-image}"
+INVERSE_WORKFLOW="${INVERSE_WORKFLOW:-both}"
+FORWARD_MODE="${FORWARD_MODE:-both}"
+INVERSE_MODEL="${INVERSE_MODEL:-zheng95z/rgb-to-x}"
+FORWARD_MODEL="${FORWARD_MODEL:-zheng95z/x-to-rgb}"
 MAX_LIGHTS="${MAX_LIGHTS:-346}"
 MIN_DECOMP_LIGHTS="${MIN_DECOMP_LIGHTS:-32}"
 REQUIRED_DECOMP_LIGHTS="${MIN_DECOMP_LIGHTS}"
@@ -37,6 +33,17 @@ SIGMA_STEPS="${SIGMA_STEPS:-50}"
 DECOMP_CHUNK_SIZE="${DECOMP_CHUNK_SIZE:-4096}"
 TRAIN_STEPS="${TRAIN_STEPS:-20}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
+TRAIN_RESOLUTION="${TRAIN_RESOLUTION:-512}"
+LEARNING_RATE="${LEARNING_RATE:-3e-5}"
+LORA_RANK="${LORA_RANK:-8}"
+GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
+MIXED_PRECISION="${MIXED_PRECISION:-auto}"
+CHECKPOINTING_STEPS="${CHECKPOINTING_STEPS:-1000}"
+RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
+PREVIEW_SAMPLES="${PREVIEW_SAMPLES:-1}"
+INFERENCE_STEPS="${INFERENCE_STEPS:-10}"
+TRAIN_DRY_RUN=0
+LOCAL_FILES_ONLY=0
 PRED_ROOT_EXPLICIT=0
 if [[ -n "${PRED_ROOT:-}" ]]; then
   PRED_ROOT_EXPLICIT=1
@@ -44,6 +51,7 @@ fi
 PRED_ROOT="${PRED_ROOT:-${OUTPUT_ROOT}/train/inverse/predictions}"
 EVAL_MODE="${EVAL_MODE:-ictpolarreal}"
 EVAL_TASK="${EVAL_TASK:-decomposition}"
+EVAL_TARGET="${EVAL_TARGET:-albedo}"
 EVAL_MANIFEST="${EVAL_MANIFEST:-}"
 TORCH_VARIANT="${TORCH_VARIANT:-auto}"
 DOWNLOAD_SAMPLE=0
@@ -61,7 +69,7 @@ Commands:
   check-env    Verify Python package imports and CUDA availability.
   check-data   Validate DATA_ROOT and print Google Drive sample instructions if missing.
   process      Optimize OLAT cross/parallel images into material maps.
-  train        Run inverse and/or forward training smoke jobs.
+  train        Fine-tune the RGB2X inverse and/or forward rendering models.
   evaluate     Evaluate predictions against ICTPolarReal or Objaverse-style samples.
   all          setup -> check-env -> check-data -> process -> train -> evaluate.
 
@@ -71,14 +79,10 @@ Options:
   --material-root PATH      Processed material map root. Default: ${MATERIAL_ROOT}
   --env-name NAME           Conda/micromamba env name. Default: ${ENV_NAME}
   --train-stage STAGE       inverse, forward, or both. Default: ${TRAIN_STAGE}
-  --input NAME              Inverse input name. Default: ${INPUT_NAME}
-  --target NAME             Training target image stem. Default: ${TARGET_NAME}
-  --input-mode MODE         image, polarization, or gbuffer. Default: ${INPUT_MODE}
-  --target-mode MODE        image, polarization, or gbuffer. Default: ${TARGET_MODE}
-  --forward-input NAME      Forward input name. Default: ${FORWARD_INPUT}
-  --forward-input-mode MODE image, polarization, or gbuffer. Default: ${FORWARD_INPUT_MODE}
-  --forward-target NAME     Forward training target. Default: ${FORWARD_TARGET}
-  --forward-target-mode MODE image, polarization, or gbuffer. Default: ${FORWARD_TARGET_MODE}
+  --inverse-workflow MODE   pbr, polarization, or both. Default: ${INVERSE_WORKFLOW}
+  --forward-mode MODE       gbuffer, polarization, or both. Default: ${FORWARD_MODE}
+  --inverse-model ID        RGB-to-X checkpoint. Default: ${INVERSE_MODEL}
+  --forward-model ID        X-to-RGB checkpoint. Default: ${FORWARD_MODEL}
   --max-lights N            Number of OLAT lights to process. Default: ${MAX_LIGHTS}
   --min-lights N            Minimum available pairs required for decomposition. Default: ${MIN_DECOMP_LIGHTS}
   --light-start N           First OLAT light id to process. Default: ${LIGHT_START}
@@ -90,14 +94,26 @@ Options:
   --normal-steps N          PyTorch normal optimization steps. Default: ${NORMAL_STEPS}
   --sigma-steps N           PyTorch roughness optimization steps. Default: ${SIGMA_STEPS}
   --decomp-chunk-size N     Foreground pixels per optimizer chunk. Default: ${DECOMP_CHUNK_SIZE}
-  --train-steps N           Training smoke-test steps. Default: ${TRAIN_STEPS}
+  --train-steps N           Optimizer steps per model. Default: ${TRAIN_STEPS}
   --batch-size N            Training batch size. Default: ${BATCH_SIZE}
+  --resolution N            Maximum training image side. Default: ${TRAIN_RESOLUTION}
+  --learning-rate FLOAT     AdamW learning rate. Default: ${LEARNING_RATE}
+  --lora-rank N             LoRA rank. Default: ${LORA_RANK}
+  --grad-accum-steps N      Gradient accumulation steps. Default: ${GRAD_ACCUM_STEPS}
+  --mixed-precision MODE    auto, no, fp16, or bf16. Default: ${MIXED_PRECISION}
+  --checkpointing-steps N   Save interval; 0 disables periodic saves. Default: ${CHECKPOINTING_STEPS}
+  --resume PATH             Resume from a checkpoint path or latest.
+  --preview-samples N       Cameras to render after training. Default: ${PREVIEW_SAMPLES}
+  --inference-steps N       Diffusion steps per preview. Default: ${INFERENCE_STEPS}
   --pred-root PATH          Prediction root for training/evaluation. Default: ${PRED_ROOT}
+  --eval-target NAME        Decomposition target for evaluation. Default: ${EVAL_TARGET}
   --eval-mode MODE          ictpolarreal or objaverse. Default: ${EVAL_MODE}
   --eval-task TASK          decomposition or relighting. Default: ${EVAL_TASK}
   --eval-manifest PATH      Optional Objaverse/ICTPolarReal evaluation manifest.
   --torch-variant VARIANT   auto, cpu, cu121, cu124, cu126, cu128, or pypi. Default: ${TORCH_VARIANT}
   --download-sample         Download one complete sample camera. The all command does this automatically.
+  --local-files-only        Do not download RGB2X weights from Hugging Face.
+  --train-dry-run           Validate training tensors without loading RGB2X weights.
   --skip-setup              For all: use the current environment.
   --skip-process            For all: skip material preprocessing.
   --skip-train              For all: skip training.
@@ -106,8 +122,8 @@ Examples:
   bash run.sh all
   bash run.sh check-data
   bash run.sh process --backend torch --device cuda
-  bash run.sh train --train-stage inverse --input-mode polarization --target albedo
-  bash run.sh train --train-stage forward --forward-input-mode gbuffer --forward-target static
+  bash run.sh train --train-stage inverse --inverse-workflow both
+  bash run.sh train --train-stage forward --forward-mode gbuffer
 EOF
 }
 
@@ -119,14 +135,10 @@ parse_args() {
       --material-root) MATERIAL_ROOT="$2"; MATERIAL_ROOT_EXPLICIT=1; shift 2 ;;
       --env-name) ENV_NAME="$2"; shift 2 ;;
       --train-stage) TRAIN_STAGE="$2"; shift 2 ;;
-      --input) INPUT_NAME="$2"; shift 2 ;;
-      --target) TARGET_NAME="$2"; shift 2 ;;
-      --input-mode) INPUT_MODE="$2"; shift 2 ;;
-      --target-mode) TARGET_MODE="$2"; shift 2 ;;
-      --forward-input) FORWARD_INPUT="$2"; shift 2 ;;
-      --forward-input-mode) FORWARD_INPUT_MODE="$2"; shift 2 ;;
-      --forward-target) FORWARD_TARGET="$2"; shift 2 ;;
-      --forward-target-mode) FORWARD_TARGET_MODE="$2"; shift 2 ;;
+      --inverse-workflow) INVERSE_WORKFLOW="$2"; shift 2 ;;
+      --forward-mode) FORWARD_MODE="$2"; shift 2 ;;
+      --inverse-model) INVERSE_MODEL="$2"; shift 2 ;;
+      --forward-model) FORWARD_MODEL="$2"; shift 2 ;;
       --max-lights) MAX_LIGHTS="$2"; shift 2 ;;
       --min-lights) MIN_DECOMP_LIGHTS="$2"; shift 2 ;;
       --light-start) LIGHT_START="$2"; shift 2 ;;
@@ -140,12 +152,25 @@ parse_args() {
       --decomp-chunk-size) DECOMP_CHUNK_SIZE="$2"; shift 2 ;;
       --train-steps) TRAIN_STEPS="$2"; shift 2 ;;
       --batch-size) BATCH_SIZE="$2"; shift 2 ;;
+      --resolution) TRAIN_RESOLUTION="$2"; shift 2 ;;
+      --learning-rate) LEARNING_RATE="$2"; shift 2 ;;
+      --lora-rank) LORA_RANK="$2"; shift 2 ;;
+      --grad-accum-steps) GRAD_ACCUM_STEPS="$2"; shift 2 ;;
+      --mixed-precision) MIXED_PRECISION="$2"; shift 2 ;;
+      --checkpointing-steps) CHECKPOINTING_STEPS="$2"; shift 2 ;;
+      --resume) RESUME_FROM_CHECKPOINT="$2"; shift 2 ;;
+      --preview-samples) PREVIEW_SAMPLES="$2"; shift 2 ;;
+      --inference-steps) INFERENCE_STEPS="$2"; shift 2 ;;
       --pred-root) PRED_ROOT="$2"; PRED_ROOT_EXPLICIT=1; shift 2 ;;
       --eval-mode) EVAL_MODE="$2"; shift 2 ;;
       --eval-task) EVAL_TASK="$2"; shift 2 ;;
+      --eval-target) EVAL_TARGET="$2"; shift 2 ;;
+      --target) EVAL_TARGET="$2"; shift 2 ;; # backward-compatible evaluation alias
       --eval-manifest) EVAL_MANIFEST="$2"; shift 2 ;;
       --torch-variant) TORCH_VARIANT="$2"; shift 2 ;;
       --download-sample) DOWNLOAD_SAMPLE=1; shift ;;
+      --local-files-only) LOCAL_FILES_ONLY=1; shift ;;
+      --train-dry-run) TRAIN_DRY_RUN=1; shift ;;
       --skip-setup) SKIP_SETUP=1; shift ;;
       --skip-process) SKIP_PROCESS=1; shift ;;
       --skip-train) SKIP_TRAIN=1; shift ;;
@@ -205,6 +230,7 @@ setup_env() {
   python -m pip install --upgrade pip
   python -m pip install -e ".[dev]" gdown
   install_torch
+  python -m pip install -e ".[train]"
 }
 
 install_torch() {
@@ -276,8 +302,11 @@ try:
     import torch
     print(f"[env] torch: {torch.__version__}")
     print(f"[env] cuda_available: {torch.cuda.is_available()}")
-except ModuleNotFoundError:
-    print("[env] torch: missing; training and torch backend require setup/install")
+    for name in ["accelerate", "diffusers", "peft", "transformers"]:
+        module = importlib.import_module(name)
+        print(f"[env] {name}: {module.__version__}")
+except ModuleNotFoundError as exc:
+    raise SystemExit(f"[env] missing {exc.name}; run `bash run.sh setup`") from exc
 PY
 }
 
@@ -290,7 +319,7 @@ download_sample_if_requested() {
   mkdir -p "${DATA_ROOT}"
   echo "[data] Downloading one complete OLAT camera for material fitting:"
   echo "       ${SAMPLE_URL}"
-  if ! python - "${SAMPLE_URL}" "${DATA_ROOT}" "${TARGET_NAME}" "${MAX_LIGHTS}" "${MIN_DECOMP_LIGHTS}" <<'PY'; then
+  if ! python - "${SAMPLE_URL}" "${DATA_ROOT}" "${EVAL_TARGET}" "${MAX_LIGHTS}" "${MIN_DECOMP_LIGHTS}" <<'PY'; then
 from __future__ import annotations
 
 import inspect
@@ -344,6 +373,8 @@ def find_sample_files(files, target_name: str, requested_lights: int, minimum_li
     camera_dirs = sorted({"/".join(path.split("/")[:2]) for path in by_path if "/cam" in path and len(path.split("/")) >= 3})
     for camera_dir in camera_dirs:
         static = first_existing(by_path, camera_dir, "static")
+        static_cross = first_existing(by_path, camera_dir, "static_cross")
+        static_parallel = first_existing(by_path, camera_dir, "static_parallel")
         mask = first_existing(by_path, camera_dir, "mask")
         target = first_existing(by_path, camera_dir, target_name)
         cross = light_map(by_path, camera_dir, "cross")
@@ -351,12 +382,12 @@ def find_sample_files(files, target_name: str, requested_lights: int, minimum_li
         paired_lights = sorted(set(cross) & set(parallel))
         raw_layout = len(paired_lights) >= 348 or any(light >= 346 for light in paired_lights)
         valid_lights = [light for light in paired_lights if 2 <= light <= 347] if raw_layout else paired_lights
-        if not (static and mask and target and len(valid_lights) >= minimum_lights):
+        if not (static and static_cross and static_parallel and mask and target and len(valid_lights) >= minimum_lights):
             continue
         valid_lights = evenly_spaced(valid_lights, requested_lights)
 
-        selected = [static, mask, target]
-        for stem in ["normal", "normal_w2c", "specular", "sigma", "static_cross", "static_parallel"]:
+        selected = [static, static_cross, static_parallel, mask, target]
+        for stem in ["normal", "normal_w2c", "specular", "sigma"]:
             item = first_existing(by_path, camera_dir, stem)
             if item is not None:
                 selected.append(item)
@@ -364,7 +395,7 @@ def find_sample_files(files, target_name: str, requested_lights: int, minimum_li
         selected.extend(parallel[light] for light in valid_lights)
         return list({item.path: item for item in selected}.values())
     fail(
-        f"Could not find a camera with static, mask, {target_name}, "
+        f"Could not find a camera with static/static_cross/static_parallel, mask, {target_name}, "
         f"and at least {minimum_lights} valid OLAT pairs."
     )
 
@@ -488,48 +519,78 @@ process_materials() {
 train_inverse() {
   cd "${REPO_ROOT}"
   activate_env || true
-  if [[ "${TARGET_MODE}" == "image" ]]; then
-    python -m ictpolarreal.data.check \
-      --data-root "${DATA_ROOT}" \
-      --min-lights 1 \
-      --require-target "${TARGET_NAME}"
-  fi
+  local optional_args=()
+  if [[ "${TRAIN_DRY_RUN}" == "1" ]]; then optional_args+=(--dry-run); fi
+  if [[ "${LOCAL_FILES_ONLY}" == "1" ]]; then optional_args+=(--local-files-only); fi
+  if [[ -n "${RESUME_FROM_CHECKPOINT}" ]]; then optional_args+=(--resume-from-checkpoint "${RESUME_FROM_CHECKPOINT}"); fi
   python -m ictpolarreal.train.inverse \
     --data-root "${DATA_ROOT}" \
     --out-dir "${OUTPUT_ROOT}/train/inverse" \
     --material-root "${MATERIAL_ROOT}" \
-    --input "${INPUT_NAME}" \
-    --target "${TARGET_NAME}" \
-    --input-mode "${INPUT_MODE}" \
-    --target-mode "${TARGET_MODE}" \
+    --model-name "${INVERSE_MODEL}" \
+    --workflow "${INVERSE_WORKFLOW}" \
+    --resolution "${TRAIN_RESOLUTION}" \
+    --max-lights "${MAX_LIGHTS}" \
+    --light-start "${LIGHT_START}" \
+    --frame-layout "${FRAME_LAYOUT}" \
+    --light-root "${LIGHT_ROOT:-${REPO_ROOT}/metadata}" \
     --max-steps "${TRAIN_STEPS}" \
     --batch-size "${BATCH_SIZE}" \
+    --learning-rate "${LEARNING_RATE}" \
+    --lora-rank "${LORA_RANK}" \
+    --gradient-accumulation-steps "${GRAD_ACCUM_STEPS}" \
+    --mixed-precision "${MIXED_PRECISION}" \
+    --checkpointing-steps "${CHECKPOINTING_STEPS}" \
+    --preview-samples "${PREVIEW_SAMPLES}" \
+    --inference-steps "${INFERENCE_STEPS}" \
     --device "${DEVICE}" \
-    --pred-dir "${PRED_ROOT}"
+    --pred-dir "${PRED_ROOT}" \
+    "${optional_args[@]}"
+}
+
+train_forward_mode() {
+  local mode="$1"
+  cd "${REPO_ROOT}"
+  activate_env || true
+  local optional_args=()
+  if [[ "${TRAIN_DRY_RUN}" == "1" ]]; then optional_args+=(--dry-run); fi
+  if [[ "${LOCAL_FILES_ONLY}" == "1" ]]; then optional_args+=(--local-files-only); fi
+  if [[ -n "${RESUME_FROM_CHECKPOINT}" ]]; then optional_args+=(--resume-from-checkpoint "${RESUME_FROM_CHECKPOINT}"); fi
+  python -m ictpolarreal.train.forward \
+    --data-root "${DATA_ROOT}" \
+    --out-dir "${OUTPUT_ROOT}/train/forward/${mode}" \
+    --material-root "${MATERIAL_ROOT}" \
+    --model-name "${FORWARD_MODEL}" \
+    --conditioning "${mode}" \
+    --resolution "${TRAIN_RESOLUTION}" \
+    --max-lights "${MAX_LIGHTS}" \
+    --light-start "${LIGHT_START}" \
+    --frame-layout "${FRAME_LAYOUT}" \
+    --light-root "${LIGHT_ROOT:-${REPO_ROOT}/metadata}" \
+    --max-steps "${TRAIN_STEPS}" \
+    --batch-size "${BATCH_SIZE}" \
+    --learning-rate "${LEARNING_RATE}" \
+    --lora-rank "${LORA_RANK}" \
+    --gradient-accumulation-steps "${GRAD_ACCUM_STEPS}" \
+    --mixed-precision "${MIXED_PRECISION}" \
+    --checkpointing-steps "${CHECKPOINTING_STEPS}" \
+    --preview-samples "${PREVIEW_SAMPLES}" \
+    --inference-steps "${INFERENCE_STEPS}" \
+    --device "${DEVICE}" \
+    --pred-dir "${OUTPUT_ROOT}/train/forward/${mode}/predictions" \
+    "${optional_args[@]}"
 }
 
 train_forward() {
-  cd "${REPO_ROOT}"
-  activate_env || true
-  python -m ictpolarreal.data.check \
-    --data-root "${DATA_ROOT}" \
-    --min-lights 1 \
-    --require-target "${FORWARD_TARGET}"
-  python -m ictpolarreal.train.forward \
-    --data-root "${DATA_ROOT}" \
-    --out-dir "${OUTPUT_ROOT}/train/forward" \
-    --material-root "${MATERIAL_ROOT}" \
-    --input "${FORWARD_INPUT}" \
-    --target "${FORWARD_TARGET}" \
-    --input-mode "${FORWARD_INPUT_MODE}" \
-    --target-mode "${FORWARD_TARGET_MODE}" \
-    --max-steps "${TRAIN_STEPS}" \
-    --batch-size "${BATCH_SIZE}" \
-    --device "${DEVICE}" \
-    --pred-dir "${OUTPUT_ROOT}/train/forward/predictions"
+  case "${FORWARD_MODE}" in
+    gbuffer) train_forward_mode gbuffer ;;
+    polarization) train_forward_mode polarization ;;
+    both) train_forward_mode gbuffer; train_forward_mode polarization ;;
+    *) echo "Unknown --forward-mode: ${FORWARD_MODE}"; exit 2 ;;
+  esac
 }
 
-train_baseline() {
+train_models() {
   case "${TRAIN_STAGE}" in
     inverse) train_inverse ;;
     forward) train_forward ;;
@@ -551,7 +612,7 @@ evaluate_predictions() {
     --gt-root "${DATA_ROOT}" \
     --pred-root "${PRED_ROOT}" \
     --out-dir "${OUTPUT_ROOT}/eval_${EVAL_MODE}_${EVAL_TASK}" \
-    --target "${TARGET_NAME}" \
+    --target "${EVAL_TARGET}" \
     "${manifest_args[@]}"
 }
 
@@ -569,7 +630,7 @@ main() {
     check-env) check_env ;;
     check-data) check_data ;;
     process) check_data; process_materials ;;
-    train) train_baseline ;;
+    train) train_models ;;
     evaluate) evaluate_predictions ;;
     all)
       if [[ "${SKIP_SETUP}" != "1" ]]; then setup_env; fi
@@ -577,8 +638,8 @@ main() {
       ensure_data_for_all
       if [[ "${SKIP_PROCESS}" != "1" ]]; then process_materials; fi
       if [[ "${SKIP_TRAIN}" != "1" ]]; then
-        train_baseline
-        evaluate_predictions
+        train_models
+        if [[ "${TRAIN_DRY_RUN}" != "1" ]]; then evaluate_predictions; fi
       fi
       ;;
     -h|--help) usage ;;

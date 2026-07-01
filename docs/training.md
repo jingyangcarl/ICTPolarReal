@@ -1,39 +1,45 @@
 # Training
 
-The release includes compact baselines for validating the data path and
-experiment protocol. Training has two stages:
-
-- inverse: polarization observations -> material targets.
-- forward: material g-buffers -> relit/static image targets.
-
-The dataset loader supports `polarization`, `gbuffer`, and plain `image` modes.
-Run preprocessing first so forward training can read `outputs/material_acquisition`.
-
-Inverse decomposition example:
+ICTPolarReal fine-tunes RGB2X with LoRA, following the inverse and forward
+rendering experiments in the paper. Run material acquisition first, or run the
+complete workflow:
 
 ```bash
-bash run.sh train \
-  --data-root /path/to/data \
-  --train-stage inverse \
-  --input-mode polarization \
-  --target albedo \
-  --train-steps 1000
+bash run.sh all
 ```
 
-Forward relighting example:
+## Model Stages
+
+| Stage | Base checkpoint | Condition | Prediction | Output |
+| --- | --- | --- | --- | --- |
+| Inverse | `zheng95z/rgb-to-x` | Ordinary RGB | Albedo, camera-space normal, specular, cross, or parallel image selected by text prompt | `outputs/train/inverse` |
+| Forward G-buffer | `zheng95z/x-to-rgb` | Albedo, normal, specular, and irradiance | RGB under the sampled light | `outputs/train/forward/gbuffer` |
+| Forward polarization | `zheng95z/x-to-rgb` | Canonical cross/parallel images and irradiance | RGB under the sampled light | `outputs/train/forward/polarization` |
+
+The loader creates one all-white sample and one sample per calibrated OLAT pair.
+All stages use v-prediction in RGB2X latent space. The inverse model uses target
+prompts; both forward models use an empty prompt.
+
+## Selective Runs
+
+Run only inverse decomposition:
 
 ```bash
-bash run.sh train \
-  --data-root /path/to/data \
-  --train-stage forward \
-  --forward-input-mode gbuffer \
-  --forward-target static \
-  --train-steps 1000
+bash run.sh train --train-stage inverse
 ```
 
-For CVPR reproduction runs, record the data split, camera set, target, checkpoint
-path, GPU count, command, and output directory.
+Run one forward representation:
 
-Training artifacts are grouped by stage: inverse checkpoints and predictions
-are written to `outputs/train/inverse`, while forward artifacts are written to
-`outputs/train/forward`.
+```bash
+bash run.sh train --train-stage forward --forward-mode gbuffer
+```
+
+For full experiments, set `--train-steps`, `--batch-size`,
+`--grad-accum-steps`, and `--checkpointing-steps`. The YAML files under
+`configs/` record the paper-scale defaults. Use `--train-dry-run` to inspect the
+dataset contract without downloading model weights. Resume an interrupted run
+with `--resume latest`; each checkpoint contains the LoRA adapter, optimizer
+state, and global step.
+
+For reproduction runs, record the data split, selected lights, model revision,
+LoRA rank, GPU count, command, checkpoint, and output directory.

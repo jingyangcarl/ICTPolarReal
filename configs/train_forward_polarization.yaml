@@ -1,0 +1,10 @@
+data_root: /path/to/ictpolarreal
+material_root: outputs/material_acquisition
+out_dir: outputs/train/forward/polarization
+model_name: zheng95z/x-to-rgb
+conditioning: polarization
+resolution: 512
+batch_size: 4
+max_steps: 300000
+learning_rate: 0.00003
+lora_rank: 8

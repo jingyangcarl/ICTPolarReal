@@ -1,18 +1,19 @@
 from __future__ import annotations
 
-from ictpolarreal.train.inverse import build_parser, run_training
+import argparse
+
+from ictpolarreal.train.diffusion import add_training_arguments, run_diffusion_training
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Fine-tune RGB2X for ICTPolarReal forward rendering from PBR or polarization conditions."
+    )
+    return add_training_arguments(parser, stage="forward")
 
 
 def main() -> None:
-    parser = build_parser("Train a compact forward relighting baseline from material g-buffers.")
-    parser.set_defaults(
-        input="gbuffer",
-        target="static",
-        input_mode="gbuffer",
-        target_mode="image",
-        checkpoint_name="baseline_forward.pt",
-    )
-    run_training(parser.parse_args(), stage_name="forward")
+    run_diffusion_training(build_parser().parse_args(), stage="forward")
 
 
 if __name__ == "__main__":

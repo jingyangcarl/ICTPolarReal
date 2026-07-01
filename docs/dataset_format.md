@@ -7,6 +7,8 @@ Required files for most scripts:
 
 ```text
 object_name/camXX/static.exr
+object_name/camXX/static_cross.exr
+object_name/camXX/static_parallel.exr
 object_name/camXX/mask.png
 object_name/camXX/cross/000002.exr ... 000347.exr
 object_name/camXX/parallel/000002.exr ... 000347.exr
@@ -29,8 +31,11 @@ outputs/material_acquisition/object_name/camXX/brdf/roughness.png
 outputs/material_acquisition/object_name/camXX/brdf/specular.png
 ```
 
-The training loader can use raw `polarization` mode from `static` plus a paired
-OLAT cross/parallel image, or `gbuffer` mode from the processed material folder.
+The RGB2X training loader pairs the processed albedo, normal, and specular maps
+with static and calibrated OLAT observations. Inverse training predicts PBR or
+cross/parallel targets from RGB. Forward training conditions on either the PBR
+maps or canonical `static_cross`/`static_parallel` images plus per-light
+irradiance.
 
 PNG or JPG versions may be used for smoke tests. Full experiments should use
 linear EXR data and keep all data outside Git.

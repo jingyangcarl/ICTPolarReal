@@ -27,13 +27,15 @@ Run the full sample workflow:
 bash run.sh all
 ```
 
-No manual Python setup is needed for the default path. If `data/sample` is
-missing or incomplete, the script downloads one complete camera view, including
-all 346 calibrated cross/parallel OLAT pairs, from the sample Google Drive folder.
-The default sample download is approximately 400 MB. If Google Drive blocks
-command-line download, open
-the sample link in a browser and place the folder under `data/sample`, then
-rerun the same command.
+No manual Python setup is needed for the default path. The training stages use
+LoRA to fine-tune the RGB2X `rgb-to-x` and `x-to-rgb` diffusion checkpoints;
+a CUDA GPU is strongly recommended.
+
+If `data/sample` is missing or incomplete, the script downloads one complete
+camera view with all 346 calibrated cross/parallel OLAT pairs. The default
+sample is approximately 400 MB. If Google Drive blocks command-line access,
+download the sample in a browser, place it under `data/sample`, and rerun the
+same command.
 
 ## What `run.sh all` Does
 
@@ -43,7 +45,7 @@ rerun the same command.
 | 2 | Check Python packages | Verifies imports and reports PyTorch/CUDA availability. |
 | 3 | Prepare sample data | Validates `data/sample`; if needed, downloads one complete 346-light camera view. |
 | 4 | Decompose polarization data | Fits diffuse normals/albedo and specular BRDF parameters, then writes material PNG maps. |
-| 5 | Run training smoke jobs | Runs inverse polarization-to-material training and forward g-buffer-to-image training. |
+| 5 | Fine-tune RGB2X | Trains inverse PBR/polarization decomposition and separate G-buffer/polarization forward renderers. |
 | 6 | Evaluate predictions | Writes CSV metrics and a JSON summary under `outputs/`. |
 
 ## Expected Data Layout
@@ -55,6 +57,8 @@ data/sample/
   object_name/
     cam00/
       static.exr
+      static_cross.exr
+      static_parallel.exr
       mask.png
       albedo.exr
       cross/000002.exr ... 000347.exr
@@ -71,8 +75,9 @@ directions. `run.sh process` also accepts normalized 346-frame sequences.
 Default outputs are written to `outputs/`:
 
 - `outputs/material_acquisition/`: decomposed material PNG maps under `<object>/<camera>/brdf/`.
-- `outputs/train/inverse/`: inverse-stage checkpoint and predictions.
-- `outputs/train/forward/`: forward-stage checkpoint and predictions.
+- `outputs/train/inverse/`: prompt-conditioned RGB-to-PBR/polarization LoRA and predictions.
+- `outputs/train/forward/gbuffer/`: PBR G-buffer-to-RGB LoRA and relighting predictions.
+- `outputs/train/forward/polarization/`: cross/parallel-to-RGB LoRA and relighting predictions.
 - `outputs/eval_ictpolarreal_decomposition/`: CSV metrics and JSON summary.
 
 ## Flexible Usage
@@ -83,8 +88,8 @@ running on a different machine or dataset:
 ```bash
 bash run.sh check-data
 bash run.sh process --data-root /path/to/data --output-root /path/to/out
-bash run.sh train --data-root /path/to/data --train-stage inverse --target albedo
-bash run.sh train --data-root /path/to/data --train-stage forward --forward-input-mode gbuffer --forward-target static
+bash run.sh train --data-root /path/to/data --train-stage inverse
+bash run.sh train --data-root /path/to/data --train-stage forward --forward-mode gbuffer
 bash run.sh evaluate --data-root /path/to/data --pred-root /path/to/predictions
 ```
 
@@ -92,13 +97,16 @@ Useful options:
 
 - `--data-root PATH`: dataset location. Default: `data/sample`.
 - `--output-root PATH`: output location. Default: `outputs`.
-- `--torch-variant cpu`: force CPU PyTorch on machines without working CUDA.
+- `--torch-variant cpu --device cpu`: use CPU for diagnostics; diffusion training is slow without CUDA.
 - `--max-lights N`: use a sphere-wide subset for a quick diagnostic; the default
   346-light fit is recommended for material quality.
 - `--backend torch --device cuda`: explicitly select the PyTorch optimizer.
 - `--train-stage inverse|forward|both`: choose the training stage.
-- `--input-mode polarization|gbuffer|image`: choose the inverse input representation.
-- `--forward-input-mode gbuffer|polarization|image`: choose the forward input representation.
+- `--inverse-workflow pbr|polarization|both`: choose inverse supervision targets.
+- `--forward-mode gbuffer|polarization|both`: choose the forward conditioning representation.
+- `--train-steps N`: set optimizer steps for each selected model; the default 20-step run is a pipeline check.
+- `--train-dry-run`: validate all tensors without loading diffusion checkpoints.
+- `--resume latest`: continue from the newest checkpoint in each selected stage.
 - `--material-root PATH`: use precomputed material maps from another run.
 - `--skip-setup`: reuse the current environment.
 

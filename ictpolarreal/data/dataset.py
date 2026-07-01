@@ -43,7 +43,7 @@ def iter_camera_samples(data_root: str | Path) -> Iterator[CameraSample]:
 
 
 class ICTPolarRealDataset(Dataset):
-    """PyTorch dataset for inverse decomposition and forward relighting baselines."""
+    """General image, polarization, and g-buffer dataset utilities."""
 
     def __init__(
         self,

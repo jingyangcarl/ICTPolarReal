@@ -123,7 +123,6 @@ def _objaverse_pairs(args: argparse.Namespace) -> tuple[list[EvalPair], int]:
             object_root = render_root / object_name
             if args.task == "decomposition":
                 gt_path = object_root / "gbuffers" / args.target / f"Image{frame_id}.exr"
-                light = ""
                 pred_candidates = [
                     pred_root / object_name / "gbuffers" / args.target / f"Image{frame_id}.png",
                     pred_root / object_name / args.target / f"Image{frame_id}.png",
