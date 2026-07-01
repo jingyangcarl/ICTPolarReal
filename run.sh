@@ -13,7 +13,7 @@ MATERIAL_ROOT_EXPLICIT=0
 if [[ -n "${MATERIAL_ROOT:-}" ]]; then
   MATERIAL_ROOT_EXPLICIT=1
 fi
-MATERIAL_ROOT="${MATERIAL_ROOT:-${OUTPUT_ROOT}/materials}"
+MATERIAL_ROOT="${MATERIAL_ROOT:-${OUTPUT_ROOT}/material_acquisition}"
 INPUT_NAME="${INPUT_NAME:-polarization}"
 TARGET_NAME="${TARGET_NAME:-albedo}"
 INPUT_MODE="${INPUT_MODE:-polarization}"
@@ -157,7 +157,7 @@ parse_args() {
     PRED_ROOT="${OUTPUT_ROOT}/train_inverse_${TARGET_NAME}/predictions"
   fi
   if [[ "${MATERIAL_ROOT_EXPLICIT}" != "1" ]]; then
-    MATERIAL_ROOT="${OUTPUT_ROOT}/materials"
+    MATERIAL_ROOT="${OUTPUT_ROOT}/material_acquisition"
   fi
   if (( MAX_LIGHTS > MIN_DECOMP_LIGHTS )); then
     REQUIRED_DECOMP_LIGHTS="${MAX_LIGHTS}"

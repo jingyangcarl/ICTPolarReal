@@ -22,7 +22,7 @@ Polarization separation convention used internally:
 Material maps are written under:
 
 ```text
-outputs/materials/object_name/camXX/material_properties/
+outputs/material_acquisition/object_name/camXX/brdf/
 ```
 
 The folder contains only material maps: `albedo.png`, `normal.png`, `specular.png`,

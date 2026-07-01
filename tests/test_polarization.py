@@ -108,7 +108,7 @@ def test_torch_material_optimizer_recovers_synthetic_normal():
 def test_dataset_polarization_and_gbuffer_modes(tmp_path):
     pytest.importorskip("torch")
     data_root = tmp_path / "data"
-    material_root = tmp_path / "materials"
+    material_root = tmp_path / "material_acquisition"
     cam = data_root / "object" / "cam00"
     (cam / "cross").mkdir(parents=True)
     (cam / "parallel").mkdir()
@@ -119,7 +119,7 @@ def test_dataset_polarization_and_gbuffer_modes(tmp_path):
     write_image(cam / "cross" / "000000.png", image * 0.5)
     write_image(cam / "parallel" / "000000.png", image)
 
-    mats = material_root / "object" / "cam00" / "material_properties"
+    mats = material_root / "object" / "cam00" / "brdf"
     mats.mkdir(parents=True)
     write_image(mats / "albedo.png", image)
     write_image(mats / "normal.png", image)

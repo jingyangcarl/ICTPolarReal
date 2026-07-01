@@ -628,7 +628,7 @@ def _ward_response_torch(torch, functional, light_dirs, view_dirs, normal, tange
 
 
 def _write_material_maps(out_root: str | Path, sample: CameraSample, maps: MaterialMaps) -> None:
-    material_dir = Path(out_root) / sample.object_name / sample.camera / "material_properties"
+    material_dir = Path(out_root) / sample.object_name / sample.camera / "brdf"
     foreground = np.linalg.norm(maps.diffuse_normal, axis=-1, keepdims=True) > EPS
     outputs = {
         "albedo": maps.diffuse_albedo,

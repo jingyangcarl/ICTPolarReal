@@ -153,6 +153,7 @@ class ICTPolarRealDataset(Dataset):
         if self.material_root is not None:
             roots.extend(
                 [
+                    self.material_root / sample.object_name / sample.camera / "brdf",
                     self.material_root / sample.object_name / sample.camera / "material_properties",
                     self.material_root / sample.object_name / sample.camera,
                 ]

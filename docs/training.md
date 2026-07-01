@@ -7,7 +7,7 @@ experiment protocol. Training has two stages:
 - forward: material g-buffers -> relit/static image targets.
 
 The dataset loader supports `polarization`, `gbuffer`, and plain `image` modes.
-Run preprocessing first so forward training can read `outputs/materials`.
+Run preprocessing first so forward training can read `outputs/material_acquisition`.
 
 Inverse decomposition example:
 
