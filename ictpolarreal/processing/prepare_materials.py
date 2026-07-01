@@ -11,7 +11,7 @@ from ictpolarreal.processing.material_decomposition import decompose_camera_samp
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Decompose polarized OLAT captures into diffuse/specular material maps and previews."
+        description="Optimize polarized OLAT captures into diffuse/specular material maps."
     )
     parser.add_argument("--data-root", required=True)
     parser.add_argument("--out-root", required=True)
@@ -21,6 +21,10 @@ def main() -> None:
     parser.add_argument("--backend", choices=["auto", "cpu", "torch"], default="auto")
     parser.add_argument("--device", default="cuda", help="Torch device used when --backend torch/auto can use PyTorch.")
     parser.add_argument("--noise", type=float, default=1.5e-3, help="Radiance threshold used for robust normal and roughness fitting.")
+    parser.add_argument("--frame-layout", choices=["auto", "raw", "normalized"], default="auto")
+    parser.add_argument("--normal-steps", type=int, default=30)
+    parser.add_argument("--sigma-steps", type=int, default=50)
+    parser.add_argument("--chunk-size", type=int, default=4096)
     args = parser.parse_args()
 
     out_root = Path(args.out_root)
@@ -38,6 +42,10 @@ def main() -> None:
             backend=args.backend,
             device=args.device,
             noise=args.noise,
+            frame_layout=args.frame_layout,
+            normal_steps=args.normal_steps,
+            sigma_steps=args.sigma_steps,
+            chunk_size=args.chunk_size,
         )
         if used:
             processed += 1

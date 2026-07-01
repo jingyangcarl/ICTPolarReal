@@ -5,16 +5,14 @@ from collections import Counter
 from pathlib import Path
 
 from ictpolarreal.data.dataset import iter_camera_samples
+from ictpolarreal.data.olat import numeric_image_ids, paired_light_frames
 
 
 SAMPLE_DRIVE_URL = "https://drive.google.com/drive/u/1/folders/1J2lfWe8rO1ZXpbeVW68u2RSqOocCs-S6"
 
 
-def _count_lights(camera_dir: Path, kind: str) -> int:
-    light_dir = camera_dir / kind
-    if not light_dir.exists():
-        return 0
-    return sum(1 for path in light_dir.iterdir() if path.suffix.lower() in {".exr", ".png", ".jpg", ".jpeg", ".tif", ".tiff"})
+def _min_max(values: list[int]) -> str:
+    return f"{min(values) if values else 0} {max(values) if values else 0}"
 
 
 def main() -> None:
@@ -22,7 +20,7 @@ def main() -> None:
     parser.add_argument("--data-root", required=True)
     parser.add_argument("--min-objects", type=int, default=1)
     parser.add_argument("--min-cameras", type=int, default=1)
-    parser.add_argument("--min-lights", type=int, default=1)
+    parser.add_argument("--min-lights", type=int, default=16)
     parser.add_argument("--require-target", default=None, help="Optional training target, e.g. albedo, normal, specular.")
     parser.add_argument("--sample-url", default=SAMPLE_DRIVE_URL)
     args = parser.parse_args()
@@ -42,6 +40,9 @@ def main() -> None:
     missing_mask = []
     missing_target = []
     light_counts = []
+    cross_counts = []
+    parallel_counts = []
+    layouts = Counter()
 
     for sample in samples:
         if sample.image_path("static") is None:
@@ -50,7 +51,11 @@ def main() -> None:
             missing_mask.append(str(sample.camera_dir))
         if args.require_target and sample.image_path(args.require_target) is None:
             missing_target.append(str(sample.camera_dir))
-        light_counts.append(min(_count_lights(sample.camera_dir, "cross"), _count_lights(sample.camera_dir, "parallel")))
+        layout, pairs = paired_light_frames(sample.camera_dir)
+        layouts[layout] += 1
+        light_counts.append(len(pairs))
+        cross_counts.append(len(numeric_image_ids(sample.camera_dir / "cross")))
+        parallel_counts.append(len(numeric_image_ids(sample.camera_dir / "parallel")))
 
     failures = []
     if len(objects) < args.min_objects:
@@ -70,6 +75,9 @@ def main() -> None:
     print(f"[data-check] objects: {len(objects)}")
     print(f"[data-check] camera_samples: {len(samples)}")
     print(f"[data-check] cameras: {dict(sorted(cameras.items()))}")
+    print(f"[data-check] frame_layouts: {dict(sorted(layouts.items()))}")
+    print(f"[data-check] cross_frames_min_max: {_min_max(cross_counts)}")
+    print(f"[data-check] parallel_frames_min_max: {_min_max(parallel_counts)}")
     print(f"[data-check] paired_olat_lights_min_max: {min(light_counts) if light_counts else 0} {max(light_counts) if light_counts else 0}")
 
     if failures:

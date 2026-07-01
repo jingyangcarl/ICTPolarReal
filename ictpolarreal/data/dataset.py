@@ -7,6 +7,7 @@ from typing import Iterator
 import numpy as np
 
 from ictpolarreal.data.polarization import separate_cross_parallel
+from ictpolarreal.data.olat import paired_light_frames
 from ictpolarreal.utils.io import find_first_existing, read_image
 
 try:
@@ -133,14 +134,10 @@ class ICTPolarRealDataset(Dataset):
         return np.concatenate([static, cross, parallel, _prepare_image(diffuse), _prepare_image(specular)], axis=-1)
 
     def _first_paired_light(self, sample: CameraSample) -> int:
-        cross_dir = sample.camera_dir / "cross"
-        parallel_dir = sample.camera_dir / "parallel"
-        cross = {int(path.stem) for path in cross_dir.iterdir() if path.stem.isdigit()} if cross_dir.exists() else set()
-        parallel = {int(path.stem) for path in parallel_dir.iterdir() if path.stem.isdigit()} if parallel_dir.exists() else set()
-        paired = sorted(cross & parallel)
-        if not paired:
+        _, pairs = paired_light_frames(sample.camera_dir)
+        if not pairs:
             raise FileNotFoundError(f"Missing paired cross/parallel OLAT images for {sample.camera_dir}")
-        return paired[0]
+        return pairs[0][0].frame_id
 
     def _read_named(self, sample: CameraSample, name: str, *, for_gbuffer: bool = False) -> np.ndarray:
         path = self._resolve_named_path(sample, name)

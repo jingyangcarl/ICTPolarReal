@@ -23,12 +23,18 @@ FORWARD_INPUT="${FORWARD_INPUT:-gbuffer}"
 FORWARD_INPUT_MODE="${FORWARD_INPUT_MODE:-gbuffer}"
 FORWARD_TARGET="${FORWARD_TARGET:-static}"
 FORWARD_TARGET_MODE="${FORWARD_TARGET_MODE:-image}"
-MAX_LIGHTS="${MAX_LIGHTS:-8}"
+MAX_LIGHTS="${MAX_LIGHTS:-346}"
+MIN_DECOMP_LIGHTS="${MIN_DECOMP_LIGHTS:-32}"
+REQUIRED_DECOMP_LIGHTS="${MIN_DECOMP_LIGHTS}"
 LIGHT_START="${LIGHT_START:-0}"
 LIGHT_ROOT="${LIGHT_ROOT:-}"
+FRAME_LAYOUT="${FRAME_LAYOUT:-auto}"
 BACKEND="${BACKEND:-auto}"
 DEVICE="${DEVICE:-cuda}"
 DECOMP_NOISE="${DECOMP_NOISE:-1.5e-3}"
+NORMAL_STEPS="${NORMAL_STEPS:-30}"
+SIGMA_STEPS="${SIGMA_STEPS:-50}"
+DECOMP_CHUNK_SIZE="${DECOMP_CHUNK_SIZE:-4096}"
 TRAIN_STEPS="${TRAIN_STEPS:-20}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 PRED_ROOT_EXPLICIT=0
@@ -54,7 +60,7 @@ Commands:
   setup        Create/activate an environment and install ICTPolarReal.
   check-env    Verify Python package imports and CUDA availability.
   check-data   Validate DATA_ROOT and print Google Drive sample instructions if missing.
-  process      Decompose OLAT cross/parallel images into material maps and previews.
+  process      Optimize OLAT cross/parallel images into material maps.
   train        Run inverse and/or forward training smoke jobs.
   evaluate     Evaluate predictions against ICTPolarReal or Objaverse-style samples.
   all          setup -> check-env -> check-data -> process -> train -> evaluate.
@@ -74,11 +80,16 @@ Options:
   --forward-target NAME     Forward training target. Default: ${FORWARD_TARGET}
   --forward-target-mode MODE image, polarization, or gbuffer. Default: ${FORWARD_TARGET_MODE}
   --max-lights N            Number of OLAT lights to process. Default: ${MAX_LIGHTS}
+  --min-lights N            Minimum available pairs required for decomposition. Default: ${MIN_DECOMP_LIGHTS}
   --light-start N           First OLAT light id to process. Default: ${LIGHT_START}
   --light-root PATH         Optional LSX calibration folder for light positions.
+  --frame-layout LAYOUT     auto, raw, or normalized. Default: ${FRAME_LAYOUT}
   --backend auto|cpu|torch  Processing backend. Default: ${BACKEND}
   --device DEVICE           Torch device for processing/training. Default: ${DEVICE}
   --decomp-noise FLOAT      Decomposition radiance threshold. Default: ${DECOMP_NOISE}
+  --normal-steps N          PyTorch normal optimization steps. Default: ${NORMAL_STEPS}
+  --sigma-steps N           PyTorch roughness optimization steps. Default: ${SIGMA_STEPS}
+  --decomp-chunk-size N     Foreground pixels per optimizer chunk. Default: ${DECOMP_CHUNK_SIZE}
   --train-steps N           Training smoke-test steps. Default: ${TRAIN_STEPS}
   --batch-size N            Training batch size. Default: ${BATCH_SIZE}
   --pred-root PATH          Prediction root for training/evaluation. Default: ${PRED_ROOT}
@@ -86,7 +97,7 @@ Options:
   --eval-task TASK          decomposition or relighting. Default: ${EVAL_TASK}
   --eval-manifest PATH      Optional Objaverse/ICTPolarReal evaluation manifest.
   --torch-variant VARIANT   auto, cpu, cu121, cu124, cu126, cu128, or pypi. Default: ${TORCH_VARIANT}
-  --download-sample         Download the minimal Google Drive sample. The all command does this automatically.
+  --download-sample         Download one complete sample camera. The all command does this automatically.
   --skip-setup              For all: use the current environment.
   --skip-process            For all: skip material preprocessing.
   --skip-train              For all: skip training.
@@ -117,11 +128,16 @@ parse_args() {
       --forward-target) FORWARD_TARGET="$2"; shift 2 ;;
       --forward-target-mode) FORWARD_TARGET_MODE="$2"; shift 2 ;;
       --max-lights) MAX_LIGHTS="$2"; shift 2 ;;
+      --min-lights) MIN_DECOMP_LIGHTS="$2"; shift 2 ;;
       --light-start) LIGHT_START="$2"; shift 2 ;;
       --light-root) LIGHT_ROOT="$2"; shift 2 ;;
+      --frame-layout) FRAME_LAYOUT="$2"; shift 2 ;;
       --backend) BACKEND="$2"; shift 2 ;;
       --device) DEVICE="$2"; shift 2 ;;
       --decomp-noise) DECOMP_NOISE="$2"; shift 2 ;;
+      --normal-steps) NORMAL_STEPS="$2"; shift 2 ;;
+      --sigma-steps) SIGMA_STEPS="$2"; shift 2 ;;
+      --decomp-chunk-size) DECOMP_CHUNK_SIZE="$2"; shift 2 ;;
       --train-steps) TRAIN_STEPS="$2"; shift 2 ;;
       --batch-size) BATCH_SIZE="$2"; shift 2 ;;
       --pred-root) PRED_ROOT="$2"; PRED_ROOT_EXPLICIT=1; shift 2 ;;
@@ -142,6 +158,11 @@ parse_args() {
   fi
   if [[ "${MATERIAL_ROOT_EXPLICIT}" != "1" ]]; then
     MATERIAL_ROOT="${OUTPUT_ROOT}/materials"
+  fi
+  if (( MAX_LIGHTS > MIN_DECOMP_LIGHTS )); then
+    REQUIRED_DECOMP_LIGHTS="${MAX_LIGHTS}"
+  else
+    REQUIRED_DECOMP_LIGHTS="${MIN_DECOMP_LIGHTS}"
   fi
 }
 
@@ -267,9 +288,9 @@ download_sample_if_requested() {
   cd "${REPO_ROOT}"
   activate_env || true
   mkdir -p "${DATA_ROOT}"
-  echo "[data] Downloading the minimal sample needed for run.sh all:"
+  echo "[data] Downloading one complete OLAT camera for material fitting:"
   echo "       ${SAMPLE_URL}"
-  if ! python - "${SAMPLE_URL}" "${DATA_ROOT}" "${TARGET_NAME}" <<'PY'; then
+  if ! python - "${SAMPLE_URL}" "${DATA_ROOT}" "${TARGET_NAME}" "${MAX_LIGHTS}" "${MIN_DECOMP_LIGHTS}" <<'PY'; then
 from __future__ import annotations
 
 import inspect
@@ -309,7 +330,16 @@ def list_drive_folder(url: str, output: Path):
     return files
 
 
-def find_sample_files(files, target_name: str) -> list:
+def evenly_spaced(values: list[int], count: int) -> list[int]:
+    if len(values) <= count:
+        return values
+    if count == 1:
+        return [values[len(values) // 2]]
+    last = len(values) - 1
+    return [values[round(index * last / (count - 1))] for index in range(count)]
+
+
+def find_sample_files(files, target_name: str, requested_lights: int, minimum_lights: int) -> list:
     by_path = {item.path: item for item in files}
     camera_dirs = sorted({"/".join(path.split("/")[:2]) for path in by_path if "/cam" in path and len(path.split("/")) >= 3})
     for camera_dir in camera_dirs:
@@ -319,10 +349,24 @@ def find_sample_files(files, target_name: str) -> list:
         cross = light_map(by_path, camera_dir, "cross")
         parallel = light_map(by_path, camera_dir, "parallel")
         paired_lights = sorted(set(cross) & set(parallel))
-        if static and mask and target and paired_lights:
-            light = paired_lights[0]
-            return [static, mask, target, cross[light], parallel[light]]
-    fail(f"Could not find a camera with static, mask, {target_name}, and paired OLAT files.")
+        raw_layout = len(paired_lights) >= 348 or any(light >= 346 for light in paired_lights)
+        valid_lights = [light for light in paired_lights if 2 <= light <= 347] if raw_layout else paired_lights
+        if not (static and mask and target and len(valid_lights) >= minimum_lights):
+            continue
+        valid_lights = evenly_spaced(valid_lights, requested_lights)
+
+        selected = [static, mask, target]
+        for stem in ["normal", "normal_w2c", "specular", "sigma", "static_cross", "static_parallel"]:
+            item = first_existing(by_path, camera_dir, stem)
+            if item is not None:
+                selected.append(item)
+        selected.extend(cross[light] for light in valid_lights)
+        selected.extend(parallel[light] for light in valid_lights)
+        return list({item.path: item for item in selected}.values())
+    fail(
+        f"Could not find a camera with static, mask, {target_name}, "
+        f"and at least {minimum_lights} valid OLAT pairs."
+    )
 
 
 def first_existing(by_path: dict, camera_dir: str, stem: str):
@@ -333,7 +377,7 @@ def first_existing(by_path: dict, camera_dir: str, stem: str):
     return None
 
 
-def light_map(by_path: dict, camera_dir: str, kind: str) -> dict[str, object]:
+def light_map(by_path: dict, camera_dir: str, kind: str) -> dict[int, object]:
     prefix = f"{camera_dir}/{kind}/"
     out = {}
     for path, item in by_path.items():
@@ -341,14 +385,13 @@ def light_map(by_path: dict, camera_dir: str, kind: str) -> dict[str, object]:
             continue
         name = Path(path).stem
         if name.isdigit() and Path(path).suffix.lower() in IMAGE_EXTS:
-            out[name] = item
+            out[int(name)] = item
     return out
 
 
-def download_file(file_id: str, dst: Path) -> None:
+def download_file(file_id: str, dst: Path) -> bool:
     if dst.exists() and dst.stat().st_size > 0:
-        print(f"[data] exists: {dst}")
-        return
+        return False
     dst.parent.mkdir(parents=True, exist_ok=True)
     params = urllib.parse.urlencode({"id": file_id, "export": "download", "confirm": "t"})
     url = f"https://drive.usercontent.google.com/download?{params}"
@@ -364,16 +407,20 @@ def download_file(file_id: str, dst: Path) -> None:
         tmp_path.unlink(missing_ok=True)
         fail(f"Downloaded empty file for {dst.name}.")
     tmp_path.replace(dst)
-    print(f"[data] downloaded: {dst}")
+    return True
 
 
-drive_url, output_root, target = sys.argv[1:4]
+drive_url, output_root, target, requested, minimum = sys.argv[1:6]
 root = Path(output_root)
 files = list_drive_folder(drive_url, root)
-required_files = find_sample_files(files, target)
-for item in required_files:
-    download_file(item.id, root / item.path)
-print("[data] Minimal sample download complete.")
+required_files = find_sample_files(files, target, max(int(requested), int(minimum)), int(minimum))
+downloaded = 0
+print(f"[data] sample files required: {len(required_files)}")
+for index, item in enumerate(required_files, start=1):
+    downloaded += int(download_file(item.id, root / item.path))
+    if index % 25 == 0 or index == len(required_files):
+        print(f"[data] prepared {index}/{len(required_files)} files")
+print(f"[data] Complete sample camera ready ({downloaded} new files).")
 PY
     cat <<EOF
 [data] Google Drive download did not complete.
@@ -389,15 +436,15 @@ EOF
 check_data() {
   cd "${REPO_ROOT}"
   activate_env || true
-  if python -m ictpolarreal.data.check --data-root "${DATA_ROOT}" --min-lights 1; then
+  if python -m ictpolarreal.data.check --data-root "${DATA_ROOT}" --min-lights "${REQUIRED_DECOMP_LIGHTS}"; then
     return 0
   fi
   if [[ "${DOWNLOAD_SAMPLE}" == "1" ]]; then
     if ! download_sample_if_requested; then
-      python -m ictpolarreal.data.check --data-root "${DATA_ROOT}" --min-lights 1 || true
+      python -m ictpolarreal.data.check --data-root "${DATA_ROOT}" --min-lights "${REQUIRED_DECOMP_LIGHTS}" || true
       return 3
     fi
-    python -m ictpolarreal.data.check --data-root "${DATA_ROOT}" --min-lights 1
+    python -m ictpolarreal.data.check --data-root "${DATA_ROOT}" --min-lights "${REQUIRED_DECOMP_LIGHTS}"
     return 0
   fi
   return 2
@@ -410,10 +457,10 @@ ensure_data_for_all() {
   echo "[data] Data is not ready. Trying to download the sample dataset automatically."
   DOWNLOAD_SAMPLE=1
   if ! download_sample_if_requested; then
-    python -m ictpolarreal.data.check --data-root "${DATA_ROOT}" --min-lights 1 || true
+    python -m ictpolarreal.data.check --data-root "${DATA_ROOT}" --min-lights "${REQUIRED_DECOMP_LIGHTS}" || true
     return 3
   fi
-  python -m ictpolarreal.data.check --data-root "${DATA_ROOT}" --min-lights 1
+  python -m ictpolarreal.data.check --data-root "${DATA_ROOT}" --min-lights "${REQUIRED_DECOMP_LIGHTS}"
 }
 
 process_materials() {
@@ -428,10 +475,14 @@ process_materials() {
     --out-root "${MATERIAL_ROOT}" \
     --max-lights "${MAX_LIGHTS}" \
     --light-start "${LIGHT_START}" \
+    --frame-layout "${FRAME_LAYOUT}" \
     "${light_root_args[@]}" \
     --backend "${BACKEND}" \
     --device "${DEVICE}" \
-    --noise "${DECOMP_NOISE}"
+    --noise "${DECOMP_NOISE}" \
+    --normal-steps "${NORMAL_STEPS}" \
+    --sigma-steps "${SIGMA_STEPS}" \
+    --chunk-size "${DECOMP_CHUNK_SIZE}"
 }
 
 train_inverse() {

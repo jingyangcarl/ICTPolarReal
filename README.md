@@ -28,8 +28,10 @@ bash run.sh all
 ```
 
 No manual Python setup is needed for the default path. If `data/sample` is
-missing or incomplete, the script downloads a minimal runnable subset from the
-sample Google Drive folder. If Google Drive blocks command-line download, open
+missing or incomplete, the script downloads one complete camera view, including
+all 346 calibrated cross/parallel OLAT pairs, from the sample Google Drive folder.
+The default sample download is approximately 400 MB. If Google Drive blocks
+command-line download, open
 the sample link in a browser and place the folder under `data/sample`, then
 rerun the same command.
 
@@ -39,8 +41,8 @@ rerun the same command.
 | --- | --- | --- |
 | 1 | Set up the environment | Creates or reuses the `ictpolarreal` environment and installs the package. |
 | 2 | Check Python packages | Verifies imports and reports PyTorch/CUDA availability. |
-| 3 | Prepare sample data | Validates `data/sample`; if it is missing, downloads a minimal sample subset. |
-| 4 | Decompose polarization data | Writes material g-buffer PNG maps. |
+| 3 | Prepare sample data | Validates `data/sample`; if needed, downloads one complete 346-light camera view. |
+| 4 | Decompose polarization data | Fits diffuse normals/albedo and specular BRDF parameters, then writes material PNG maps. |
 | 5 | Run training smoke jobs | Runs inverse polarization-to-material training and forward g-buffer-to-image training. |
 | 6 | Evaluate predictions | Writes CSV metrics and a JSON summary under `outputs/`. |
 
@@ -55,14 +57,14 @@ data/sample/
       static.exr
       mask.png
       albedo.exr
-      cross/000000.exr
-      parallel/000000.exr
+      cross/000002.exr ... 000347.exr
+      parallel/000002.exr ... 000347.exr
 ```
 
-The automatic sample path requires `static`, `mask`, the training target
-(`albedo` by default), and at least one paired `cross`/`parallel` OLAT image.
-The full dataset may also include more material annotations, cameras, and OLAT
-lights. `run.sh process` can derive release g-buffers from the raw OLAT pairs.
+The original 350-frame capture layout reserves frames `000000`, `000001`,
+`000348`, and `000349` as indicators. They are excluded automatically. The
+bundled LSX calibration maps valid frames `000002` through `000347` to light
+directions. `run.sh process` also accepts normalized 346-frame sequences.
 
 ## Outputs
 
@@ -91,7 +93,9 @@ Useful options:
 - `--data-root PATH`: dataset location. Default: `data/sample`.
 - `--output-root PATH`: output location. Default: `outputs`.
 - `--torch-variant cpu`: force CPU PyTorch on machines without working CUDA.
-- `--max-lights N`: limit OLAT lights for a quick check.
+- `--max-lights N`: use a sphere-wide subset for a quick diagnostic; the default
+  346-light fit is recommended for material quality.
+- `--backend torch --device cuda`: explicitly select the PyTorch optimizer.
 - `--train-stage inverse|forward|both`: choose the training stage.
 - `--input-mode polarization|gbuffer|image`: choose the inverse input representation.
 - `--forward-input-mode gbuffer|polarization|image`: choose the forward input representation.
