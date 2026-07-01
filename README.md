@@ -71,8 +71,8 @@ directions. `run.sh process` also accepts normalized 346-frame sequences.
 Default outputs are written to `outputs/`:
 
 - `outputs/material_acquisition/`: decomposed material PNG maps under `<object>/<camera>/brdf/`.
-- `outputs/train_inverse_albedo/`: inverse-stage checkpoint and predictions.
-- `outputs/train_forward_static/`: forward-stage checkpoint and predictions.
+- `outputs/train/inverse/`: inverse-stage checkpoint and predictions.
+- `outputs/train/forward/`: forward-stage checkpoint and predictions.
 - `outputs/eval_ictpolarreal_decomposition/`: CSV metrics and JSON summary.
 
 ## Flexible Usage

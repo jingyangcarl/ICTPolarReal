@@ -41,7 +41,7 @@ PRED_ROOT_EXPLICIT=0
 if [[ -n "${PRED_ROOT:-}" ]]; then
   PRED_ROOT_EXPLICIT=1
 fi
-PRED_ROOT="${PRED_ROOT:-${OUTPUT_ROOT}/train_inverse_${TARGET_NAME}/predictions}"
+PRED_ROOT="${PRED_ROOT:-${OUTPUT_ROOT}/train/inverse/predictions}"
 EVAL_MODE="${EVAL_MODE:-ictpolarreal}"
 EVAL_TASK="${EVAL_TASK:-decomposition}"
 EVAL_MANIFEST="${EVAL_MANIFEST:-}"
@@ -154,7 +154,7 @@ parse_args() {
     esac
   done
   if [[ "${PRED_ROOT_EXPLICIT}" != "1" ]]; then
-    PRED_ROOT="${OUTPUT_ROOT}/train_inverse_${TARGET_NAME}/predictions"
+    PRED_ROOT="${OUTPUT_ROOT}/train/inverse/predictions"
   fi
   if [[ "${MATERIAL_ROOT_EXPLICIT}" != "1" ]]; then
     MATERIAL_ROOT="${OUTPUT_ROOT}/material_acquisition"
@@ -496,7 +496,7 @@ train_inverse() {
   fi
   python -m ictpolarreal.train.inverse \
     --data-root "${DATA_ROOT}" \
-    --out-dir "${OUTPUT_ROOT}/train_inverse_${TARGET_NAME}" \
+    --out-dir "${OUTPUT_ROOT}/train/inverse" \
     --material-root "${MATERIAL_ROOT}" \
     --input "${INPUT_NAME}" \
     --target "${TARGET_NAME}" \
@@ -517,7 +517,7 @@ train_forward() {
     --require-target "${FORWARD_TARGET}"
   python -m ictpolarreal.train.forward \
     --data-root "${DATA_ROOT}" \
-    --out-dir "${OUTPUT_ROOT}/train_forward_${FORWARD_TARGET}" \
+    --out-dir "${OUTPUT_ROOT}/train/forward" \
     --material-root "${MATERIAL_ROOT}" \
     --input "${FORWARD_INPUT}" \
     --target "${FORWARD_TARGET}" \
@@ -526,7 +526,7 @@ train_forward() {
     --max-steps "${TRAIN_STEPS}" \
     --batch-size "${BATCH_SIZE}" \
     --device "${DEVICE}" \
-    --pred-dir "${OUTPUT_ROOT}/train_forward_${FORWARD_TARGET}/predictions"
+    --pred-dir "${OUTPUT_ROOT}/train/forward/predictions"
 }
 
 train_baseline() {

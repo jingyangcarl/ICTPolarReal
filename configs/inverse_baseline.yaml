@@ -1,6 +1,6 @@
 data_root: /path/to/ictpolarreal
 material_root: outputs/material_acquisition
-out_dir: outputs/train_inverse_albedo
+out_dir: outputs/train/inverse
 input: polarization
 target: albedo
 input_mode: polarization

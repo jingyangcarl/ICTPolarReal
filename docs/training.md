@@ -12,7 +12,7 @@ Run preprocessing first so forward training can read `outputs/material_acquisiti
 Inverse decomposition example:
 
 ```bash
-bash scripts/ictpolarreal.sh train \
+bash run.sh train \
   --data-root /path/to/data \
   --train-stage inverse \
   --input-mode polarization \
@@ -23,7 +23,7 @@ bash scripts/ictpolarreal.sh train \
 Forward relighting example:
 
 ```bash
-bash scripts/ictpolarreal.sh train \
+bash run.sh train \
   --data-root /path/to/data \
   --train-stage forward \
   --forward-input-mode gbuffer \
@@ -33,3 +33,7 @@ bash scripts/ictpolarreal.sh train \
 
 For CVPR reproduction runs, record the data split, camera set, target, checkpoint
 path, GPU count, command, and output directory.
+
+Training artifacts are grouped by stage: inverse checkpoints and predictions
+are written to `outputs/train/inverse`, while forward artifacts are written to
+`outputs/train/forward`.

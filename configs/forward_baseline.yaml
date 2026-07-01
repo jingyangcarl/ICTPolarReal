@@ -1,6 +1,6 @@
 data_root: /path/to/ictpolarreal
 material_root: outputs/material_acquisition
-out_dir: outputs/train_forward_static
+out_dir: outputs/train/forward
 input: gbuffer
 target: static
 input_mode: gbuffer
