@@ -20,6 +20,21 @@ The loader creates one all-white sample and one sample per calibrated OLAT pair.
 All stages use v-prediction in RGB2X latent space. The inverse model uses target
 prompts; both forward models use an empty prompt.
 
+## Evaluation During Training
+
+Evaluation is part of the training loop. Every `--train-eval-steps`, the trainer
+runs the same fixed samples and diffusion noise through two methods:
+
+- `pretrained`: the original RGB2X model with the LoRA adapter disabled.
+- `finetuned`: the current checkpoint with the LoRA adapter enabled.
+
+Inverse runs compare every target enabled by `--inverse-workflow`. Forward runs
+compare the selected G-buffer or polarization model using ground-truth
+conditions. A final comparison runs even when training stops between intervals.
+Results are written under `outputs/train/<stage>/eval/step-NNNNNN/`, with
+`metrics.csv`, `summary.json`, predictions, targets, and `eval/history.jsonl`.
+Set `--train-eval-samples 0` to disable this hook.
+
 ## Selective Runs
 
 Run only inverse decomposition:

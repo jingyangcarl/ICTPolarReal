@@ -40,6 +40,9 @@ GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
 MIXED_PRECISION="${MIXED_PRECISION:-auto}"
 CHECKPOINTING_STEPS="${CHECKPOINTING_STEPS:-1000}"
 RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
+TRAIN_EVAL_STEPS="${TRAIN_EVAL_STEPS:-5000}"
+TRAIN_EVAL_SAMPLES="${TRAIN_EVAL_SAMPLES:-1}"
+TRAIN_EVAL_METHODS="${TRAIN_EVAL_METHODS:-pretrained,finetuned}"
 PREVIEW_SAMPLES="${PREVIEW_SAMPLES:-1}"
 INFERENCE_STEPS="${INFERENCE_STEPS:-10}"
 TRAIN_DRY_RUN=0
@@ -103,6 +106,9 @@ Options:
   --mixed-precision MODE    auto, no, fp16, or bf16. Default: ${MIXED_PRECISION}
   --checkpointing-steps N   Save interval; 0 disables periodic saves. Default: ${CHECKPOINTING_STEPS}
   --resume PATH             Resume from a checkpoint path or latest.
+  --train-eval-steps N      In-training evaluation interval. Default: ${TRAIN_EVAL_STEPS}
+  --train-eval-samples N    Fixed evaluation samples per method. Default: ${TRAIN_EVAL_SAMPLES}
+  --train-eval-methods LIST Comma-separated pretrained/finetuned methods. Default: ${TRAIN_EVAL_METHODS}
   --preview-samples N       Cameras to render after training. Default: ${PREVIEW_SAMPLES}
   --inference-steps N       Diffusion steps per preview. Default: ${INFERENCE_STEPS}
   --pred-root PATH          Prediction root for training/evaluation. Default: ${PRED_ROOT}
@@ -159,6 +165,9 @@ parse_args() {
       --mixed-precision) MIXED_PRECISION="$2"; shift 2 ;;
       --checkpointing-steps) CHECKPOINTING_STEPS="$2"; shift 2 ;;
       --resume) RESUME_FROM_CHECKPOINT="$2"; shift 2 ;;
+      --train-eval-steps) TRAIN_EVAL_STEPS="$2"; shift 2 ;;
+      --train-eval-samples) TRAIN_EVAL_SAMPLES="$2"; shift 2 ;;
+      --train-eval-methods) TRAIN_EVAL_METHODS="$2"; shift 2 ;;
       --preview-samples) PREVIEW_SAMPLES="$2"; shift 2 ;;
       --inference-steps) INFERENCE_STEPS="$2"; shift 2 ;;
       --pred-root) PRED_ROOT="$2"; PRED_ROOT_EXPLICIT=1; shift 2 ;;
@@ -541,6 +550,9 @@ train_inverse() {
     --gradient-accumulation-steps "${GRAD_ACCUM_STEPS}" \
     --mixed-precision "${MIXED_PRECISION}" \
     --checkpointing-steps "${CHECKPOINTING_STEPS}" \
+    --evaluation-steps "${TRAIN_EVAL_STEPS}" \
+    --evaluation-samples "${TRAIN_EVAL_SAMPLES}" \
+    --evaluation-methods "${TRAIN_EVAL_METHODS}" \
     --preview-samples "${PREVIEW_SAMPLES}" \
     --inference-steps "${INFERENCE_STEPS}" \
     --device "${DEVICE}" \
@@ -574,6 +586,9 @@ train_forward_mode() {
     --gradient-accumulation-steps "${GRAD_ACCUM_STEPS}" \
     --mixed-precision "${MIXED_PRECISION}" \
     --checkpointing-steps "${CHECKPOINTING_STEPS}" \
+    --evaluation-steps "${TRAIN_EVAL_STEPS}" \
+    --evaluation-samples "${TRAIN_EVAL_SAMPLES}" \
+    --evaluation-methods "${TRAIN_EVAL_METHODS}" \
     --preview-samples "${PREVIEW_SAMPLES}" \
     --inference-steps "${INFERENCE_STEPS}" \
     --device "${DEVICE}" \

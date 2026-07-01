@@ -45,7 +45,7 @@ same command.
 | 2 | Check Python packages | Verifies imports and reports PyTorch/CUDA availability. |
 | 3 | Prepare sample data | Validates `data/sample`; if needed, downloads one complete 346-light camera view. |
 | 4 | Decompose polarization data | Fits diffuse normals/albedo and specular BRDF parameters, then writes material PNG maps. |
-| 5 | Fine-tune RGB2X | Trains inverse PBR/polarization decomposition and separate G-buffer/polarization forward renderers. |
+| 5 | Fine-tune RGB2X | Trains inverse and forward models, periodically comparing pretrained and fine-tuned predictions. |
 | 6 | Evaluate predictions | Writes CSV metrics and a JSON summary under `outputs/`. |
 
 ## Expected Data Layout
@@ -78,6 +78,7 @@ Default outputs are written to `outputs/`:
 - `outputs/train/inverse/`: prompt-conditioned RGB-to-PBR/polarization LoRA and predictions.
 - `outputs/train/forward/gbuffer/`: PBR G-buffer-to-RGB LoRA and relighting predictions.
 - `outputs/train/forward/polarization/`: cross/parallel-to-RGB LoRA and relighting predictions.
+- `outputs/train/*/eval/`: per-step comparison images, CSV metrics, JSON summaries, and metric history.
 - `outputs/eval_ictpolarreal_decomposition/`: CSV metrics and JSON summary.
 
 ## Flexible Usage
@@ -107,6 +108,8 @@ Useful options:
 - `--train-steps N`: set optimizer steps for each selected model; the default 20-step run is a pipeline check.
 - `--train-dry-run`: validate all tensors without loading diffusion checkpoints.
 - `--resume latest`: continue from the newest checkpoint in each selected stage.
+- `--train-eval-steps N`: periodically compare frozen pretrained and current fine-tuned weights.
+- `--train-eval-samples N`: set the fixed evaluation subset size; `0` disables in-training evaluation.
 - `--material-root PATH`: use precomputed material maps from another run.
 - `--skip-setup`: reuse the current environment.
 

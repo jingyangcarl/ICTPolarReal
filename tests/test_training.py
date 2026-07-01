@@ -3,6 +3,7 @@ import pytest
 
 from ictpolarreal.data.training import ICTPolarRealTrainingDataset
 from ictpolarreal.train.contracts import build_forward_condition, inverse_target_names
+from ictpolarreal.train.diffusion import _write_training_evaluation
 from ictpolarreal.utils.io import write_image
 
 
@@ -91,3 +92,31 @@ def test_rgb2x_inverse_and_forward_contracts(tmp_path):
     polarization = build_forward_condition(batch, mode="polarization", encode=encode, latent_hw=(2, 4))
     assert gbuffer.shape == (1, 19, 2, 4)
     assert polarization.shape == (1, 19, 2, 4)
+
+
+def test_training_evaluation_writes_method_history(tmp_path):
+    rows = [
+        {
+            "step": 5,
+            "stage": "inverse",
+            "method": method,
+            "task": "albedo",
+            "object": "object",
+            "camera": "cam00",
+            "light": "static",
+            "prediction": f"{method}/albedo.png",
+            "mse": value,
+            "mae": value,
+            "psnr": 20.0,
+            "ssim": 0.8,
+        }
+        for method, value in (("pretrained", 0.2), ("finetuned", 0.1))
+    ]
+    step_root = tmp_path / "eval" / "step-000005"
+    _write_training_evaluation(rows, step_root=step_root, output_dir=tmp_path, step=5)
+
+    assert (step_root / "metrics.csv").exists()
+    summary = (step_root / "summary.json").read_text()
+    assert '"pretrained"' in summary
+    assert '"finetuned"' in summary
+    assert len((tmp_path / "eval" / "history.jsonl").read_text().splitlines()) == 1

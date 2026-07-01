@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import random
 from pathlib import Path
@@ -40,6 +41,11 @@ def add_training_arguments(parser: argparse.ArgumentParser, *, stage: str) -> ar
     parser.add_argument("--full-finetune", action="store_true")
     parser.add_argument("--checkpointing-steps", type=int, default=1000)
     parser.add_argument("--resume-from-checkpoint", default=None, help="Checkpoint path or 'latest'.")
+    parser.add_argument("--evaluation-steps", type=int, default=5000)
+    parser.add_argument("--evaluation-samples", type=int, default=4)
+    parser.add_argument("--evaluation-methods", default="pretrained,finetuned")
+    parser.add_argument("--eval-data-root", default=None)
+    parser.add_argument("--eval-material-root", default=None)
     parser.add_argument("--preview-samples", type=int, default=1)
     parser.add_argument("--inference-steps", type=int, default=10)
     parser.add_argument("--local-files-only", action="store_true")
@@ -75,6 +81,24 @@ def run_diffusion_training(args: argparse.Namespace, *, stage: str) -> None:
     if args.dry_run:
         _print_sample_contract(dataset[0], stage=stage, args=args)
         return
+
+    evaluation_methods = tuple(method.strip() for method in args.evaluation_methods.split(",") if method.strip())
+    invalid_methods = set(evaluation_methods) - {"pretrained", "finetuned"}
+    if invalid_methods:
+        raise ValueError(f"Unknown evaluation method(s): {', '.join(sorted(invalid_methods))}")
+    evaluation_dataset = None
+    if args.evaluation_samples > 0 and evaluation_methods:
+        evaluation_dataset = ICTPolarRealTrainingDataset(
+            args.eval_data_root or args.data_root,
+            material_root=args.eval_material_root or args.material_root,
+            resolution=args.resolution,
+            max_lights=args.max_lights,
+            light_start=args.light_start,
+            frame_layout=args.frame_layout,
+            light_root=args.light_root,
+            require_polarization_reference=stage == "forward" and args.conditioning == "polarization",
+        )
+        print(f"[eval:{stage}] dataset: {evaluation_dataset.summary()}")
 
     try:
         import torch
@@ -145,6 +169,9 @@ def run_diffusion_training(args: argparse.Namespace, *, stage: str) -> None:
                 parameter.data = parameter.data.float()
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
+    if args.full_finetune and "pretrained" in evaluation_methods:
+        evaluation_methods = tuple(method for method in evaluation_methods if method != "pretrained")
+        print("[eval] skipping pretrained comparison because --full-finetune cannot disable an adapter")
 
     trainable_parameters = [parameter for parameter in unet.parameters() if parameter.requires_grad]
     if not trainable_parameters:
@@ -192,6 +219,7 @@ def run_diffusion_training(args: argparse.Namespace, *, stage: str) -> None:
         _write_run_config(output_dir, args, stage=stage, dataset_summary=dataset.summary())
     accelerator.wait_for_everyone()
 
+    last_evaluation_step = -1
     while global_step < args.max_steps:
         for batch in loader:
             with accelerator.accumulate(unet):
@@ -254,11 +282,44 @@ def run_diffusion_training(args: argparse.Namespace, *, stage: str) -> None:
                         args,
                         global_step=global_step,
                     )
+                if (
+                    evaluation_dataset is not None
+                    and args.evaluation_steps > 0
+                    and global_step % args.evaluation_steps == 0
+                ):
+                    _run_periodic_evaluation(
+                        evaluation_dataset,
+                        stage=stage,
+                        args=args,
+                        methods=evaluation_methods,
+                        step=global_step,
+                        accelerator=accelerator,
+                        unet=unet,
+                        vae=vae,
+                        noise_scheduler=noise_scheduler,
+                        prompt_embeddings=prompt_embeddings,
+                        dtype=weight_dtype,
+                    )
+                    last_evaluation_step = global_step
             if global_step >= args.max_steps:
                 break
 
     accelerator.wait_for_everyone()
     _save_model(accelerator, unet, optimizer, output_dir / "final", args, global_step=global_step)
+    if evaluation_dataset is not None and last_evaluation_step != global_step:
+        _run_periodic_evaluation(
+            evaluation_dataset,
+            stage=stage,
+            args=args,
+            methods=evaluation_methods,
+            step=global_step,
+            accelerator=accelerator,
+            unet=unet,
+            vae=vae,
+            noise_scheduler=noise_scheduler,
+            prompt_embeddings=prompt_embeddings,
+            dtype=weight_dtype,
+        )
     if args.preview_samples > 0 and args.pred_dir and accelerator.is_main_process:
         _write_previews(
             dataset,
@@ -300,11 +361,12 @@ def _encode_prompts(prompts, *, tokenizer, text_encoder, device) -> dict[str, ob
     return encoded
 
 
-def _encode_images(images, *, vae, dtype):
+def _encode_images(images, *, vae, dtype, sample: bool = True):
     import torch
 
     with torch.no_grad():
-        latents = vae.encode(images.to(dtype=dtype)).latent_dist.sample()
+        distribution = vae.encode(images.to(dtype=dtype)).latent_dist
+        latents = distribution.sample() if sample else distribution.mean
     return latents * vae.config.scaling_factor
 
 
@@ -405,6 +467,179 @@ def _write_run_config(
 ) -> None:
     payload = {"stage": stage, "dataset": dataset_summary, "arguments": vars(args)}
     (output_dir / "run_config.json").write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+
+def _run_periodic_evaluation(
+    dataset: ICTPolarRealTrainingDataset,
+    *,
+    stage: str,
+    args: argparse.Namespace,
+    methods: tuple[str, ...],
+    step: int,
+    accelerator,
+    unet,
+    vae,
+    noise_scheduler,
+    prompt_embeddings,
+    dtype,
+) -> None:
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process and methods:
+        import torch
+
+        from ictpolarreal.utils.metrics import mae, mse, psnr, ssim_global
+
+        model = accelerator.unwrap_model(unet)
+        model.eval()
+        step_root = Path(args.out_dir) / "eval" / f"step-{step:06d}"
+        rows = []
+        indices = _evaluation_indices(dataset, stage=stage, count=args.evaluation_samples)
+        try:
+            for method in methods:
+                if not args.full_finetune:
+                    if method == "pretrained":
+                        model.disable_adapters()
+                    else:
+                        model.enable_adapters()
+                for index in indices:
+                    sample = dataset[index]
+                    batch = _sample_to_batch(sample, device=_model_device(model), torch_module=torch)
+
+                    def encode(image):
+                        return _encode_images(image, vae=vae, dtype=dtype, sample=False)
+
+                    if stage == "inverse":
+                        condition = encode(batch["rgb"])
+                        tasks = inverse_target_names(args.workflow)
+                    else:
+                        latent_hw = (batch["rgb"].shape[-2] // 8, batch["rgb"].shape[-1] // 8)
+                        condition = build_forward_condition(
+                            batch,
+                            mode=args.conditioning,
+                            encode=encode,
+                            latent_hw=latent_hw,
+                        )
+                        tasks = (f"forward_{args.conditioning}",)
+
+                    for task in tasks:
+                        prompt = INVERSE_PROMPTS[task] if stage == "inverse" else ""
+                        prediction = _sample_image(
+                            model,
+                            vae,
+                            noise_scheduler,
+                            condition=condition,
+                            prompt_embedding=prompt_embeddings[prompt],
+                            output_hw=batch["rgb"].shape[-2:],
+                            inference_steps=args.inference_steps,
+                            seed=args.seed + index,
+                            device=_model_device(model),
+                            dtype=dtype,
+                        )
+                        target_tensor = inverse_target(batch, task)[0] if stage == "inverse" else batch["rgb"]
+                        target = _tensor_image(target_tensor[0])
+                        mask = batch["mask"][0].float().cpu().permute(1, 2, 0).numpy()
+                        light = "static" if sample["frame_id"] < 0 else f"{sample['frame_id']:06d}"
+                        prediction_path = (
+                            step_root
+                            / method
+                            / "predictions"
+                            / sample["object"]
+                            / sample["camera"]
+                            / light
+                            / f"{task}.png"
+                        )
+                        target_path = (
+                            step_root
+                            / "ground_truth"
+                            / sample["object"]
+                            / sample["camera"]
+                            / light
+                            / f"{task}.png"
+                        )
+                        write_image(prediction_path, prediction)
+                        write_image(target_path, target)
+                        rows.append(
+                            {
+                                "step": step,
+                                "stage": stage,
+                                "method": method,
+                                "task": task,
+                                "object": sample["object"],
+                                "camera": sample["camera"],
+                                "light": light,
+                                "prediction": str(prediction_path),
+                                "mse": mse(prediction, target, mask),
+                                "mae": mae(prediction, target, mask),
+                                "psnr": psnr(prediction, target, mask),
+                                "ssim": ssim_global(prediction, target, mask),
+                            }
+                        )
+        finally:
+            if not args.full_finetune:
+                model.enable_adapters()
+            model.train()
+        _write_training_evaluation(rows, step_root=step_root, output_dir=Path(args.out_dir), step=step)
+    accelerator.wait_for_everyone()
+
+
+def _write_training_evaluation(rows: list[dict], *, step_root: Path, output_dir: Path, step: int) -> None:
+    if not rows:
+        return
+    step_root.mkdir(parents=True, exist_ok=True)
+    with (step_root / "metrics.csv").open("w", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    summary: dict[str, object] = {"step": step, "methods": {}}
+    for method in sorted({row["method"] for row in rows}):
+        method_summary = {}
+        for task in sorted({row["task"] for row in rows if row["method"] == method}):
+            selected = [row for row in rows if row["method"] == method and row["task"] == task]
+            method_summary[task] = {
+                "count": len(selected),
+                **{
+                    metric: float(sum(row[metric] for row in selected) / len(selected))
+                    for metric in ("mse", "mae", "psnr", "ssim")
+                },
+            }
+        summary["methods"][method] = method_summary
+    summary_text = json.dumps(summary, indent=2, sort_keys=True) + "\n"
+    (step_root / "summary.json").write_text(summary_text)
+    history_path = output_dir / "eval" / "history.jsonl"
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    with history_path.open("a") as file:
+        file.write(json.dumps(summary, sort_keys=True) + "\n")
+    print(f"[eval:training] step={step} wrote {step_root / 'metrics.csv'}")
+
+
+def _evaluation_indices(dataset: ICTPolarRealTrainingDataset, *, stage: str, count: int) -> list[int]:
+    indices = []
+    for index, record in enumerate(dataset.records):
+        if stage == "forward" and record.light_index is None:
+            continue
+        indices.append(index)
+        if len(indices) >= count:
+            break
+    return indices
+
+
+def _sample_to_batch(sample: dict, *, device, torch_module) -> dict:
+    return {
+        key: value.unsqueeze(0).to(device) if isinstance(value, torch_module.Tensor) else [value]
+        for key, value in sample.items()
+    }
+
+
+def _tensor_image(tensor) -> object:
+    import numpy as np
+
+    image = tensor.detach().float().cpu().permute(1, 2, 0).numpy()
+    return np.clip(image * 0.5 + 0.5, 0.0, 1.0)
+
+
+def _model_device(model):
+    return next(model.parameters()).device
 
 
 def _write_previews(
@@ -516,28 +751,29 @@ def _sample_image(
     import torch
     from diffusers import DDIMScheduler
 
-    sample_scheduler = DDIMScheduler.from_config(scheduler.config)
-    sample_scheduler.set_timesteps(inference_steps, device=device)
-    generator = torch.Generator(device=device).manual_seed(seed)
-    latent_hw = condition.shape[-2:]
-    latents = torch.randn((1, 4, *latent_hw), generator=generator, device=device, dtype=dtype)
-    latents *= sample_scheduler.init_noise_sigma
-    embeddings = prompt_embedding.repeat(latents.shape[0], 1, 1)
-    for timestep in sample_scheduler.timesteps:
-        scaled = sample_scheduler.scale_model_input(latents, timestep)
-        model_input = torch.cat((scaled, condition), dim=1)
-        prediction = unet(
-            model_input,
-            timestep,
-            encoder_hidden_states=embeddings,
+    with torch.inference_mode():
+        sample_scheduler = DDIMScheduler.from_config(scheduler.config)
+        sample_scheduler.set_timesteps(inference_steps, device=device)
+        generator = torch.Generator(device=device).manual_seed(seed)
+        latent_hw = condition.shape[-2:]
+        latents = torch.randn((1, 4, *latent_hw), generator=generator, device=device, dtype=dtype)
+        latents *= sample_scheduler.init_noise_sigma
+        embeddings = prompt_embedding.repeat(latents.shape[0], 1, 1)
+        for timestep in sample_scheduler.timesteps:
+            scaled = sample_scheduler.scale_model_input(latents, timestep)
+            model_input = torch.cat((scaled, condition), dim=1)
+            prediction = unet(
+                model_input,
+                timestep,
+                encoder_hidden_states=embeddings,
+                return_dict=False,
+            )[0]
+            latents = sample_scheduler.step(prediction, timestep, latents, return_dict=False)[0]
+        decoded = vae.decode(
+            (latents / vae.config.scaling_factor).to(dtype=dtype),
             return_dict=False,
         )[0]
-        latents = sample_scheduler.step(prediction, timestep, latents, return_dict=False)[0]
-    decoded = vae.decode(
-        (latents / vae.config.scaling_factor).to(dtype=dtype),
-        return_dict=False,
-    )[0]
-    image = (decoded.float().clamp(-1.0, 1.0) * 0.5 + 0.5)[0].permute(1, 2, 0).cpu().numpy()
+        image = (decoded.float().clamp(-1.0, 1.0) * 0.5 + 0.5)[0].permute(1, 2, 0).cpu().numpy()
     if image.shape[:2] != output_hw:
         import cv2
 
