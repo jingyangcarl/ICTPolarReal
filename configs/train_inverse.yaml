@@ -8,6 +8,7 @@ batch_size: 4
 max_steps: 300000
 learning_rate: 0.00003
 lora_rank: 8
+log_steps: 10
 evaluation_steps: 5000
 evaluation_samples: 10
-evaluation_methods: pretrained,finetuned
+evaluation_methods: rgb2x,rgb2x_ictpolarreal,diffusion_renderer,lotus,dsine

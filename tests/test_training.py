@@ -1,9 +1,16 @@
+import json
+
 import numpy as np
 import pytest
 
 from ictpolarreal.data.training import ICTPolarRealTrainingDataset
 from ictpolarreal.train.contracts import build_forward_condition, inverse_target_names
-from ictpolarreal.train.diffusion import _write_training_evaluation
+from ictpolarreal.train.diffusion import (
+    _find_external_prediction,
+    _parse_evaluation_baselines,
+    _parse_evaluation_methods,
+    _write_training_evaluation,
+)
 from ictpolarreal.utils.io import write_image
 
 
@@ -95,6 +102,8 @@ def test_rgb2x_inverse_and_forward_contracts(tmp_path):
 
 
 def test_training_evaluation_writes_method_history(tmp_path):
+    target_path = tmp_path / "target.png"
+    write_image(target_path, np.full((8, 8, 3), 0.5, dtype=np.float32))
     rows = [
         {
             "step": 5,
@@ -104,19 +113,61 @@ def test_training_evaluation_writes_method_history(tmp_path):
             "object": "object",
             "camera": "cam00",
             "light": "static",
-            "prediction": f"{method}/albedo.png",
+            "prediction": str(tmp_path / method / "albedo.png"),
+            "target": str(target_path),
             "mse": value,
             "mae": value,
             "psnr": 20.0,
             "ssim": 0.8,
         }
-        for method, value in (("pretrained", 0.2), ("finetuned", 0.1))
+        for method, value in (("rgb2x", 0.2), ("rgb2x_ictpolarreal", 0.1))
     ]
+    for row in rows:
+        write_image(row["prediction"], np.full((8, 8, 3), 0.4, dtype=np.float32))
     step_root = tmp_path / "eval" / "step-000005"
-    _write_training_evaluation(rows, step_root=step_root, output_dir=tmp_path, step=5)
+    _write_training_evaluation(
+        rows,
+        step_root=step_root,
+        output_dir=tmp_path,
+        step=5,
+        method_status={
+            "rgb2x": {"status": "evaluated", "count": 1},
+            "rgb2x_ictpolarreal": {"status": "evaluated", "count": 1},
+            "dsine": {"status": "skipped", "reason": "not configured"},
+        },
+    )
 
     assert (step_root / "metrics.csv").exists()
-    summary = (step_root / "summary.json").read_text()
-    assert '"pretrained"' in summary
-    assert '"finetuned"' in summary
+    assert (step_root / "comparisons" / "object" / "cam00" / "static" / "albedo.png").exists()
+    summary = json.loads((step_root / "summary.json").read_text())
+    assert summary["methods"]["rgb2x"]["label"] == "RGB2X (base)"
+    assert summary["methods"]["rgb2x_ictpolarreal"]["status"] == "evaluated"
+    assert summary["methods"]["dsine"]["status"] == "skipped"
     assert len((tmp_path / "eval" / "history.jsonl").read_text().splitlines()) == 1
+
+
+def test_evaluation_method_and_baseline_parsing(tmp_path):
+    methods = _parse_evaluation_methods(
+        "pretrained,finetuned,diffusion-renderer,lotus,dsine,lotus"
+    )
+    assert methods == (
+        "rgb2x",
+        "rgb2x_ictpolarreal",
+        "diffusion_renderer",
+        "lotus",
+        "dsine",
+    )
+    assert _parse_evaluation_baselines([f"lotus={tmp_path}"]) == {"lotus": tmp_path}
+    with pytest.raises(ValueError, match="Unknown evaluation method"):
+        _parse_evaluation_methods("unknown")
+    with pytest.raises(ValueError, match="METHOD=PATH"):
+        _parse_evaluation_baselines(["lotus"])
+
+
+def test_external_prediction_layouts(tmp_path):
+    normal_path = tmp_path / "predictions" / "object" / "cam00" / "static" / "normal.png"
+    write_image(normal_path, np.full((8, 8, 3), 0.5, dtype=np.float32))
+    sample = {"object": "object", "camera": "cam00", "frame_id": -1}
+
+    assert _find_external_prediction(tmp_path, sample=sample, task="normal") == normal_path
+    assert _find_external_prediction(tmp_path, sample=sample, task="albedo") is None

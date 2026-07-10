@@ -31,18 +31,20 @@ DECOMP_NOISE="${DECOMP_NOISE:-1.5e-3}"
 NORMAL_STEPS="${NORMAL_STEPS:-30}"
 SIGMA_STEPS="${SIGMA_STEPS:-50}"
 DECOMP_CHUNK_SIZE="${DECOMP_CHUNK_SIZE:-4096}"
-TRAIN_STEPS="${TRAIN_STEPS:-20}"
+TRAIN_STEPS="${TRAIN_STEPS:-1000}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 TRAIN_RESOLUTION="${TRAIN_RESOLUTION:-512}"
 LEARNING_RATE="${LEARNING_RATE:-3e-5}"
 LORA_RANK="${LORA_RANK:-8}"
 GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
 MIXED_PRECISION="${MIXED_PRECISION:-auto}"
-CHECKPOINTING_STEPS="${CHECKPOINTING_STEPS:-1000}"
+CHECKPOINTING_STEPS="${CHECKPOINTING_STEPS:-250}"
 RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
-TRAIN_EVAL_STEPS="${TRAIN_EVAL_STEPS:-5000}"
+TRAIN_EVAL_STEPS="${TRAIN_EVAL_STEPS:-100}"
 TRAIN_EVAL_SAMPLES="${TRAIN_EVAL_SAMPLES:-1}"
-TRAIN_EVAL_METHODS="${TRAIN_EVAL_METHODS:-pretrained,finetuned}"
+TRAIN_EVAL_METHODS="${TRAIN_EVAL_METHODS:-rgb2x,rgb2x_ictpolarreal,diffusion_renderer,lotus,dsine}"
+LOG_STEPS="${LOG_STEPS:-10}"
+EVAL_BASELINES=()
 PREVIEW_SAMPLES="${PREVIEW_SAMPLES:-1}"
 INFERENCE_STEPS="${INFERENCE_STEPS:-10}"
 TRAIN_DRY_RUN=0
@@ -108,7 +110,10 @@ Options:
   --resume PATH             Resume from a checkpoint path or latest.
   --train-eval-steps N      In-training evaluation interval. Default: ${TRAIN_EVAL_STEPS}
   --train-eval-samples N    Fixed evaluation samples per method. Default: ${TRAIN_EVAL_SAMPLES}
-  --train-eval-methods LIST Comma-separated pretrained/finetuned methods. Default: ${TRAIN_EVAL_METHODS}
+  --train-eval-methods LIST Methods to compare during training. Default: ${TRAIN_EVAL_METHODS}
+  --eval-baseline METHOD=PATH
+                            Cached Diffusion Renderer, Lotus, or DSINE predictions; repeat as needed.
+  --log-steps N             Console log interval. Default: ${LOG_STEPS}
   --preview-samples N       Cameras to render after training. Default: ${PREVIEW_SAMPLES}
   --inference-steps N       Diffusion steps per preview. Default: ${INFERENCE_STEPS}
   --pred-root PATH          Prediction root for training/evaluation. Default: ${PRED_ROOT}
@@ -130,6 +135,7 @@ Examples:
   bash run.sh process --backend torch --device cuda
   bash run.sh train --train-stage inverse --inverse-workflow both
   bash run.sh train --train-stage forward --forward-mode gbuffer
+  bash run.sh train --eval-baseline lotus=/path/to/lotus/predictions
 EOF
 }
 
@@ -168,6 +174,8 @@ parse_args() {
       --train-eval-steps) TRAIN_EVAL_STEPS="$2"; shift 2 ;;
       --train-eval-samples) TRAIN_EVAL_SAMPLES="$2"; shift 2 ;;
       --train-eval-methods) TRAIN_EVAL_METHODS="$2"; shift 2 ;;
+      --eval-baseline) EVAL_BASELINES+=("$2"); shift 2 ;;
+      --log-steps) LOG_STEPS="$2"; shift 2 ;;
       --preview-samples) PREVIEW_SAMPLES="$2"; shift 2 ;;
       --inference-steps) INFERENCE_STEPS="$2"; shift 2 ;;
       --pred-root) PRED_ROOT="$2"; PRED_ROOT_EXPLICIT=1; shift 2 ;;
@@ -532,6 +540,7 @@ train_inverse() {
   if [[ "${TRAIN_DRY_RUN}" == "1" ]]; then optional_args+=(--dry-run); fi
   if [[ "${LOCAL_FILES_ONLY}" == "1" ]]; then optional_args+=(--local-files-only); fi
   if [[ -n "${RESUME_FROM_CHECKPOINT}" ]]; then optional_args+=(--resume-from-checkpoint "${RESUME_FROM_CHECKPOINT}"); fi
+  for baseline in "${EVAL_BASELINES[@]}"; do optional_args+=(--evaluation-baseline "${baseline}"); done
   python -m ictpolarreal.train.inverse \
     --data-root "${DATA_ROOT}" \
     --out-dir "${OUTPUT_ROOT}/train/inverse" \
@@ -553,6 +562,7 @@ train_inverse() {
     --evaluation-steps "${TRAIN_EVAL_STEPS}" \
     --evaluation-samples "${TRAIN_EVAL_SAMPLES}" \
     --evaluation-methods "${TRAIN_EVAL_METHODS}" \
+    --log-steps "${LOG_STEPS}" \
     --preview-samples "${PREVIEW_SAMPLES}" \
     --inference-steps "${INFERENCE_STEPS}" \
     --device "${DEVICE}" \
@@ -568,6 +578,7 @@ train_forward_mode() {
   if [[ "${TRAIN_DRY_RUN}" == "1" ]]; then optional_args+=(--dry-run); fi
   if [[ "${LOCAL_FILES_ONLY}" == "1" ]]; then optional_args+=(--local-files-only); fi
   if [[ -n "${RESUME_FROM_CHECKPOINT}" ]]; then optional_args+=(--resume-from-checkpoint "${RESUME_FROM_CHECKPOINT}"); fi
+  for baseline in "${EVAL_BASELINES[@]}"; do optional_args+=(--evaluation-baseline "${baseline}"); done
   python -m ictpolarreal.train.forward \
     --data-root "${DATA_ROOT}" \
     --out-dir "${OUTPUT_ROOT}/train/forward/${mode}" \
@@ -589,6 +600,7 @@ train_forward_mode() {
     --evaluation-steps "${TRAIN_EVAL_STEPS}" \
     --evaluation-samples "${TRAIN_EVAL_SAMPLES}" \
     --evaluation-methods "${TRAIN_EVAL_METHODS}" \
+    --log-steps "${LOG_STEPS}" \
     --preview-samples "${PREVIEW_SAMPLES}" \
     --inference-steps "${INFERENCE_STEPS}" \
     --device "${DEVICE}" \

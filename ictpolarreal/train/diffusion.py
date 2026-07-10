@@ -13,7 +13,28 @@ from ictpolarreal.train.contracts import (
     inverse_target,
     inverse_target_names,
 )
-from ictpolarreal.utils.io import write_image
+from ictpolarreal.utils.io import IMAGE_EXTS, read_image, write_image
+
+
+BUILTIN_EVALUATION_METHODS = frozenset({"rgb2x", "rgb2x_ictpolarreal"})
+EXTERNAL_EVALUATION_METHODS = frozenset({"diffusion_renderer", "lotus", "dsine"})
+EVALUATION_METHOD_ALIASES = {
+    "pretrained": "rgb2x",
+    "finetuned": "rgb2x_ictpolarreal",
+    "diffusion-renderer": "diffusion_renderer",
+}
+EVALUATION_METHOD_LABELS = {
+    "rgb2x": "RGB2X (base)",
+    "rgb2x_ictpolarreal": "RGB2X + ICTPolarReal",
+    "diffusion_renderer": "Diffusion Renderer",
+    "lotus": "Lotus",
+    "dsine": "DSINE",
+}
+EXTERNAL_METHOD_TASKS = {
+    "diffusion_renderer": frozenset({"albedo", "normal", "specular", "forward_gbuffer"}),
+    "lotus": frozenset({"normal"}),
+    "dsine": frozenset({"normal"}),
+}
 
 
 def add_training_arguments(parser: argparse.ArgumentParser, *, stage: str) -> argparse.ArgumentParser:
@@ -39,13 +60,24 @@ def add_training_arguments(parser: argparse.ArgumentParser, *, stage: str) -> ar
     parser.add_argument("--mixed-precision", choices=["auto", "no", "fp16", "bf16"], default="auto")
     parser.add_argument("--lora-rank", type=int, default=8)
     parser.add_argument("--full-finetune", action="store_true")
-    parser.add_argument("--checkpointing-steps", type=int, default=1000)
+    parser.add_argument("--checkpointing-steps", type=int, default=250)
     parser.add_argument("--resume-from-checkpoint", default=None, help="Checkpoint path or 'latest'.")
-    parser.add_argument("--evaluation-steps", type=int, default=5000)
+    parser.add_argument("--evaluation-steps", type=int, default=100)
     parser.add_argument("--evaluation-samples", type=int, default=4)
-    parser.add_argument("--evaluation-methods", default="pretrained,finetuned")
+    parser.add_argument(
+        "--evaluation-methods",
+        default="rgb2x,rgb2x_ictpolarreal,diffusion_renderer,lotus,dsine",
+    )
+    parser.add_argument(
+        "--evaluation-baseline",
+        action="append",
+        default=[],
+        metavar="METHOD=PATH",
+        help="Cached prediction root for Diffusion Renderer, Lotus, or DSINE.",
+    )
     parser.add_argument("--eval-data-root", default=None)
     parser.add_argument("--eval-material-root", default=None)
+    parser.add_argument("--log-steps", type=int, default=10)
     parser.add_argument("--preview-samples", type=int, default=1)
     parser.add_argument("--inference-steps", type=int, default=10)
     parser.add_argument("--local-files-only", action="store_true")
@@ -65,6 +97,10 @@ def add_training_arguments(parser: argparse.ArgumentParser, *, stage: str) -> ar
 def run_diffusion_training(args: argparse.Namespace, *, stage: str) -> None:
     if stage not in {"inverse", "forward"}:
         raise ValueError("stage must be inverse or forward")
+    if args.max_steps < 1:
+        raise ValueError("--max-steps must be at least 1")
+    if args.log_steps < 0:
+        raise ValueError("--log-steps cannot be negative")
 
     dataset = ICTPolarRealTrainingDataset(
         args.data_root,
@@ -82,10 +118,8 @@ def run_diffusion_training(args: argparse.Namespace, *, stage: str) -> None:
         _print_sample_contract(dataset[0], stage=stage, args=args)
         return
 
-    evaluation_methods = tuple(method.strip() for method in args.evaluation_methods.split(",") if method.strip())
-    invalid_methods = set(evaluation_methods) - {"pretrained", "finetuned"}
-    if invalid_methods:
-        raise ValueError(f"Unknown evaluation method(s): {', '.join(sorted(invalid_methods))}")
+    evaluation_methods = _parse_evaluation_methods(args.evaluation_methods)
+    baseline_roots = _parse_evaluation_baselines(args.evaluation_baseline)
     evaluation_dataset = None
     if args.evaluation_samples > 0 and evaluation_methods:
         evaluation_dataset = ICTPolarRealTrainingDataset(
@@ -108,6 +142,7 @@ def run_diffusion_training(args: argparse.Namespace, *, stage: str) -> None:
         from diffusers import AutoencoderKL, DDIMScheduler, UNet2DConditionModel
         from peft import LoraConfig
         from torch.utils.data import DataLoader
+        from tqdm.auto import tqdm
         from transformers import CLIPTextModel, CLIPTokenizer
     except ModuleNotFoundError as exc:
         raise SystemExit("Diffusion training dependencies are missing. Run `bash run.sh setup`.") from exc
@@ -169,9 +204,8 @@ def run_diffusion_training(args: argparse.Namespace, *, stage: str) -> None:
                 parameter.data = parameter.data.float()
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
-    if args.full_finetune and "pretrained" in evaluation_methods:
-        evaluation_methods = tuple(method for method in evaluation_methods if method != "pretrained")
-        print("[eval] skipping pretrained comparison because --full-finetune cannot disable an adapter")
+    if args.full_finetune and "rgb2x" in evaluation_methods:
+        print("[eval] RGB2X (base) will be recorded as skipped during full fine-tuning")
 
     trainable_parameters = [parameter for parameter in unet.parameters() if parameter.requires_grad]
     if not trainable_parameters:
@@ -219,6 +253,13 @@ def run_diffusion_training(args: argparse.Namespace, *, stage: str) -> None:
         _write_run_config(output_dir, args, stage=stage, dataset_summary=dataset.summary())
     accelerator.wait_for_everyone()
 
+    progress = tqdm(
+        total=args.max_steps,
+        initial=min(global_step, args.max_steps),
+        desc=f"train {stage}",
+        disable=not accelerator.is_main_process,
+        dynamic_ncols=True,
+    )
     last_evaluation_step = -1
     while global_step < args.max_steps:
         for batch in loader:
@@ -271,8 +312,26 @@ def run_diffusion_training(args: argparse.Namespace, *, stage: str) -> None:
 
             if accelerator.sync_gradients:
                 global_step += 1
-                label = f" target={target_name}" if target_name else f" conditioning={args.conditioning}"
-                accelerator.print(f"[train:{stage}] step={global_step} loss={loss.detach().item():.6f}{label}")
+                loss_value = accelerator.gather(loss.detach().reshape(1)).mean().item()
+                task_label = target_name or args.conditioning
+                progress.update(1)
+                progress.set_postfix(loss=f"{loss_value:.6f}", task=task_label)
+                if accelerator.is_main_process:
+                    _append_training_history(
+                        output_dir,
+                        {
+                            "step": global_step,
+                            "stage": stage,
+                            "task": task_label,
+                            "loss": loss_value,
+                            "learning_rate": optimizer.param_groups[0]["lr"],
+                        },
+                    )
+                if global_step == 1 or (args.log_steps > 0 and global_step % args.log_steps == 0):
+                    accelerator.print(
+                        f"[train:{stage}] step={global_step}/{args.max_steps} "
+                        f"loss={loss_value:.6f} task={task_label}"
+                    )
                 if args.checkpointing_steps > 0 and global_step % args.checkpointing_steps == 0:
                     _save_model(
                         accelerator,
@@ -292,6 +351,7 @@ def run_diffusion_training(args: argparse.Namespace, *, stage: str) -> None:
                         stage=stage,
                         args=args,
                         methods=evaluation_methods,
+                        baseline_roots=baseline_roots,
                         step=global_step,
                         accelerator=accelerator,
                         unet=unet,
@@ -304,6 +364,7 @@ def run_diffusion_training(args: argparse.Namespace, *, stage: str) -> None:
             if global_step >= args.max_steps:
                 break
 
+    progress.close()
     accelerator.wait_for_everyone()
     _save_model(accelerator, unet, optimizer, output_dir / "final", args, global_step=global_step)
     if evaluation_dataset is not None and last_evaluation_step != global_step:
@@ -312,6 +373,7 @@ def run_diffusion_training(args: argparse.Namespace, *, stage: str) -> None:
             stage=stage,
             args=args,
             methods=evaluation_methods,
+            baseline_roots=baseline_roots,
             step=global_step,
             accelerator=accelerator,
             unet=unet,
@@ -342,6 +404,56 @@ def _print_sample_contract(sample: dict, *, stage: str, args: argparse.Namespace
         print(f"[train:{stage}] targets: {inverse_target_names(args.workflow)}")
     else:
         print(f"[train:{stage}] conditioning: {args.conditioning}")
+
+
+def _normalize_evaluation_method(value: str) -> str:
+    method = value.strip().lower()
+    return EVALUATION_METHOD_ALIASES.get(method, method)
+
+
+def _parse_evaluation_methods(value: str) -> tuple[str, ...]:
+    known_methods = BUILTIN_EVALUATION_METHODS | EXTERNAL_EVALUATION_METHODS
+    methods = []
+    for item in value.split(","):
+        method = _normalize_evaluation_method(item)
+        if not method or method in methods:
+            continue
+        if method not in known_methods:
+            choices = ", ".join(sorted(known_methods))
+            raise ValueError(f"Unknown evaluation method '{method}'. Choose from: {choices}")
+        methods.append(method)
+    return tuple(methods)
+
+
+def _parse_evaluation_baselines(specifications: list[str]) -> dict[str, Path]:
+    roots = {}
+    for specification in specifications:
+        if "=" not in specification:
+            raise ValueError(
+                f"Invalid --evaluation-baseline '{specification}'; expected METHOD=PATH"
+            )
+        method_value, path_value = specification.split("=", 1)
+        method = _normalize_evaluation_method(method_value)
+        if method not in EXTERNAL_EVALUATION_METHODS:
+            choices = ", ".join(sorted(EXTERNAL_EVALUATION_METHODS))
+            raise ValueError(f"Baseline method '{method}' must be one of: {choices}")
+        if not path_value.strip():
+            raise ValueError(f"Missing prediction path for baseline method '{method}'")
+        if method in roots:
+            raise ValueError(f"Prediction root for baseline method '{method}' was provided twice")
+        roots[method] = Path(path_value).expanduser()
+    return roots
+
+
+def _append_training_history(output_dir: Path, row: dict[str, object]) -> None:
+    path = output_dir / "training_history.csv"
+    fieldnames = ["step", "stage", "task", "loss", "learning_rate"]
+    write_header = not path.exists()
+    with path.open("a", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
 
 
 def _encode_prompts(prompts, *, tokenizer, text_encoder, device) -> dict[str, object]:
@@ -475,6 +587,7 @@ def _run_periodic_evaluation(
     stage: str,
     args: argparse.Namespace,
     methods: tuple[str, ...],
+    baseline_roots: dict[str, Path],
     step: int,
     accelerator,
     unet,
@@ -487,20 +600,41 @@ def _run_periodic_evaluation(
     if accelerator.is_main_process and methods:
         import torch
 
-        from ictpolarreal.utils.metrics import mae, mse, psnr, ssim_global
-
         model = accelerator.unwrap_model(unet)
         model.eval()
         step_root = Path(args.out_dir) / "eval" / f"step-{step:06d}"
         rows = []
+        method_status = {}
         indices = _evaluation_indices(dataset, stage=stage, count=args.evaluation_samples)
         try:
             for method in methods:
+                if method in EXTERNAL_EVALUATION_METHODS:
+                    method_status[method] = _evaluate_external_method(
+                        method,
+                        baseline_roots.get(method),
+                        dataset=dataset,
+                        indices=indices,
+                        stage=stage,
+                        args=args,
+                        step=step,
+                        step_root=step_root,
+                        rows=rows,
+                        torch_module=torch,
+                        device=_model_device(model),
+                    )
+                    continue
+                if method == "rgb2x" and args.full_finetune:
+                    method_status[method] = {
+                        "status": "skipped",
+                        "reason": "the base weights cannot be restored during --full-finetune",
+                    }
+                    continue
                 if not args.full_finetune:
-                    if method == "pretrained":
+                    if method == "rgb2x":
                         model.disable_adapters()
                     else:
                         model.enable_adapters()
+                row_start = len(rows)
                 for index in indices:
                     sample = dataset[index]
                     batch = _sample_to_batch(sample, device=_model_device(model), torch_module=torch)
@@ -559,40 +693,230 @@ def _run_periodic_evaluation(
                         write_image(prediction_path, prediction)
                         write_image(target_path, target)
                         rows.append(
-                            {
-                                "step": step,
-                                "stage": stage,
-                                "method": method,
-                                "task": task,
-                                "object": sample["object"],
-                                "camera": sample["camera"],
-                                "light": light,
-                                "prediction": str(prediction_path),
-                                "mse": mse(prediction, target, mask),
-                                "mae": mae(prediction, target, mask),
-                                "psnr": psnr(prediction, target, mask),
-                                "ssim": ssim_global(prediction, target, mask),
-                            }
+                            _evaluation_row(
+                                step=step,
+                                stage=stage,
+                                method=method,
+                                task=task,
+                                sample=sample,
+                                light=light,
+                                prediction=prediction,
+                                target=target,
+                                mask=mask,
+                                prediction_path=prediction_path,
+                                target_path=target_path,
+                            )
                         )
+                method_status[method] = {
+                    "status": "evaluated",
+                    "source": args.model_name,
+                    "count": len(rows) - row_start,
+                }
         finally:
             if not args.full_finetune:
                 model.enable_adapters()
             model.train()
-        _write_training_evaluation(rows, step_root=step_root, output_dir=Path(args.out_dir), step=step)
+        _write_training_evaluation(
+            rows,
+            step_root=step_root,
+            output_dir=Path(args.out_dir),
+            step=step,
+            method_status=method_status,
+        )
     accelerator.wait_for_everyone()
 
 
-def _write_training_evaluation(rows: list[dict], *, step_root: Path, output_dir: Path, step: int) -> None:
-    if not rows:
-        return
+def _evaluate_external_method(
+    method: str,
+    prediction_root: Path | None,
+    *,
+    dataset: ICTPolarRealTrainingDataset,
+    indices: list[int],
+    stage: str,
+    args: argparse.Namespace,
+    step: int,
+    step_root: Path,
+    rows: list[dict],
+    torch_module,
+    device,
+) -> dict[str, object]:
+    if prediction_root is None:
+        return {
+            "status": "skipped",
+            "reason": f"add --eval-baseline {method}=PATH to evaluate cached predictions",
+        }
+    if not prediction_root.exists():
+        return {"status": "skipped", "reason": f"prediction root does not exist: {prediction_root}"}
+
+    row_start = len(rows)
+    missing = 0
+    unsupported = 0
+    for index in indices:
+        sample = dataset[index]
+        batch = _sample_to_batch(sample, device=device, torch_module=torch_module)
+        tasks = inverse_target_names(args.workflow) if stage == "inverse" else (f"forward_{args.conditioning}",)
+        for task in tasks:
+            if task not in EXTERNAL_METHOD_TASKS[method]:
+                unsupported += 1
+                continue
+            source_path = _find_external_prediction(prediction_root, sample=sample, task=task)
+            if source_path is None:
+                missing += 1
+                continue
+            target_tensor = inverse_target(batch, task)[0] if stage == "inverse" else batch["rgb"]
+            target = _tensor_image(target_tensor[0])
+            prediction = _read_prediction(source_path, output_hw=target.shape[:2])
+            mask = batch["mask"][0].float().cpu().permute(1, 2, 0).numpy()
+            light = "static" if sample["frame_id"] < 0 else f"{sample['frame_id']:06d}"
+            prediction_path = (
+                step_root
+                / method
+                / "predictions"
+                / sample["object"]
+                / sample["camera"]
+                / light
+                / f"{task}.png"
+            )
+            target_path = (
+                step_root
+                / "ground_truth"
+                / sample["object"]
+                / sample["camera"]
+                / light
+                / f"{task}.png"
+            )
+            write_image(prediction_path, prediction)
+            write_image(target_path, target)
+            rows.append(
+                _evaluation_row(
+                    step=step,
+                    stage=stage,
+                    method=method,
+                    task=task,
+                    sample=sample,
+                    light=light,
+                    prediction=prediction,
+                    target=target,
+                    mask=mask,
+                    prediction_path=prediction_path,
+                    target_path=target_path,
+                )
+            )
+
+    count = len(rows) - row_start
+    status = {
+        "status": "evaluated" if count else "skipped",
+        "source": str(prediction_root),
+        "count": count,
+        "missing": missing,
+        "unsupported": unsupported,
+    }
+    if not count:
+        status["reason"] = (
+            "the selected training task is not supported by this method"
+            if unsupported and not missing
+            else "no compatible prediction files were found"
+        )
+    return status
+
+
+def _find_external_prediction(root: Path, *, sample: dict, task: str) -> Path | None:
+    light = "static" if sample["frame_id"] < 0 else f"{sample['frame_id']:06d}"
+    stems = [task, f"pred_{task}"]
+    if task == "albedo":
+        stems.extend(("basecolor", "base_color"))
+    elif task == "normal":
+        stems.extend(("normals", "pred_normal"))
+    elif task.startswith("forward_"):
+        stems.extend(("forward_rgb", "pred", "result"))
+
+    for base in (root, root / "predictions"):
+        folders = (
+            base / sample["object"] / sample["camera"] / light,
+            base / sample["object"] / sample["camera"],
+        )
+        for folder in folders:
+            for stem in dict.fromkeys(stems):
+                for extension in IMAGE_EXTS:
+                    candidate = folder / f"{stem}{extension}"
+                    if candidate.is_file():
+                        return candidate
+        for extension in IMAGE_EXTS:
+            candidate = base / f"{sample['object']}_{sample['camera']}_{task}{extension}"
+            if candidate.is_file():
+                return candidate
+    return None
+
+
+def _read_prediction(path: Path, *, output_hw: tuple[int, int]):
+    import cv2
+    import numpy as np
+
+    prediction = read_image(path, channels=3)
+    prediction = np.nan_to_num(prediction, nan=0.0, posinf=1.0, neginf=0.0)
+    if prediction.min(initial=0.0) < 0.0:
+        prediction = prediction * 0.5 + 0.5
+    if prediction.shape[:2] != output_hw:
+        prediction = cv2.resize(
+            prediction,
+            (output_hw[1], output_hw[0]),
+            interpolation=cv2.INTER_LINEAR,
+        )
+    return np.clip(prediction, 0.0, 1.0)
+
+
+def _evaluation_row(
+    *,
+    step: int,
+    stage: str,
+    method: str,
+    task: str,
+    sample: dict,
+    light: str,
+    prediction,
+    target,
+    mask,
+    prediction_path: Path,
+    target_path: Path,
+) -> dict[str, object]:
+    from ictpolarreal.utils.metrics import mae, mse, psnr, ssim_global
+
+    return {
+        "step": step,
+        "stage": stage,
+        "method": method,
+        "task": task,
+        "object": sample["object"],
+        "camera": sample["camera"],
+        "light": light,
+        "prediction": str(prediction_path),
+        "target": str(target_path),
+        "mse": mse(prediction, target, mask),
+        "mae": mae(prediction, target, mask),
+        "psnr": psnr(prediction, target, mask),
+        "ssim": ssim_global(prediction, target, mask),
+    }
+
+
+def _write_training_evaluation(
+    rows: list[dict],
+    *,
+    step_root: Path,
+    output_dir: Path,
+    step: int,
+    method_status: dict[str, dict[str, object]] | None = None,
+) -> None:
     step_root.mkdir(parents=True, exist_ok=True)
-    with (step_root / "metrics.csv").open("w", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=list(rows[0]))
-        writer.writeheader()
-        writer.writerows(rows)
+    if rows:
+        with (step_root / "metrics.csv").open("w", newline="") as file:
+            writer = csv.DictWriter(file, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+        _write_comparison_panels(rows, step_root=step_root)
 
     summary: dict[str, object] = {"step": step, "methods": {}}
-    for method in sorted({row["method"] for row in rows}):
+    all_methods = set(method_status or {}) | {row["method"] for row in rows}
+    for method in sorted(all_methods):
         method_summary = {}
         for task in sorted({row["task"] for row in rows if row["method"] == method}):
             selected = [row for row in rows if row["method"] == method and row["task"] == task]
@@ -603,14 +927,68 @@ def _write_training_evaluation(rows: list[dict], *, step_root: Path, output_dir:
                     for metric in ("mse", "mae", "psnr", "ssim")
                 },
             }
-        summary["methods"][method] = method_summary
+        summary["methods"][method] = {
+            "label": EVALUATION_METHOD_LABELS.get(method, method),
+            **(method_status or {}).get(method, {"status": "evaluated"}),
+            "tasks": method_summary,
+        }
     summary_text = json.dumps(summary, indent=2, sort_keys=True) + "\n"
     (step_root / "summary.json").write_text(summary_text)
     history_path = output_dir / "eval" / "history.jsonl"
     history_path.parent.mkdir(parents=True, exist_ok=True)
     with history_path.open("a") as file:
         file.write(json.dumps(summary, sort_keys=True) + "\n")
-    print(f"[eval:training] step={step} wrote {step_root / 'metrics.csv'}")
+    for method, details in summary["methods"].items():
+        if details["status"] == "skipped":
+            print(f"[eval:training] {method}: skipped ({details['reason']})")
+            continue
+        for task, metrics in details["tasks"].items():
+            print(
+                f"[eval:training] {method}/{task}: "
+                f"PSNR={metrics['psnr']:.3f} SSIM={metrics['ssim']:.4f} n={metrics['count']}"
+            )
+    print(f"[eval:training] step={step} wrote {step_root}")
+
+
+def _write_comparison_panels(rows: list[dict], *, step_root: Path) -> None:
+    import numpy as np
+    from PIL import Image, ImageDraw
+
+    grouped = {}
+    for row in rows:
+        key = (row["object"], row["camera"], row["light"], row["task"])
+        grouped.setdefault(key, []).append(row)
+
+    for (object_name, camera, light, task), selected in grouped.items():
+        images = [("Ground truth", read_image(selected[0]["target"], channels=3))]
+        images.extend(
+            (EVALUATION_METHOD_LABELS.get(row["method"], row["method"]), read_image(row["prediction"], channels=3))
+            for row in selected
+        )
+        panels = []
+        for label, image in images:
+            array = np.clip(np.nan_to_num(image), 0.0, 1.0)
+            array = (array * 255.0 + 0.5).astype(np.uint8)
+            panel_image = Image.fromarray(array, mode="RGB")
+            measure = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+            label_box = measure.textbbox((0, 0), label)
+            panel_width = max(panel_image.width, label_box[2] - label_box[0] + 12)
+            panel = Image.new("RGB", (panel_width, panel_image.height + 26), "white")
+            panel.paste(panel_image, ((panel_width - panel_image.width) // 2, 26))
+            ImageDraw.Draw(panel).text((6, 6), label, fill="black")
+            panels.append(panel)
+        comparison = Image.new(
+            "RGB",
+            (sum(panel.width for panel in panels), max(panel.height for panel in panels)),
+            "white",
+        )
+        x_offset = 0
+        for panel in panels:
+            comparison.paste(panel, (x_offset, 0))
+            x_offset += panel.width
+        comparison_path = step_root / "comparisons" / object_name / camera / light / f"{task}.png"
+        comparison_path.parent.mkdir(parents=True, exist_ok=True)
+        comparison.save(comparison_path)
 
 
 def _evaluation_indices(dataset: ICTPolarRealTrainingDataset, *, stage: str, count: int) -> list[int]:
