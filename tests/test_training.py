@@ -120,7 +120,7 @@ def test_training_evaluation_writes_method_history(tmp_path):
             "psnr": 20.0,
             "ssim": 0.8,
         }
-        for method, value in (("rgb2x", 0.2), ("rgb2x_ictpolarreal", 0.1))
+        for method, value in (("rgb2x", 0.2), ("ours", 0.1))
     ]
     for row in rows:
         write_image(row["prediction"], np.full((8, 8, 3), 0.4, dtype=np.float32))
@@ -132,7 +132,7 @@ def test_training_evaluation_writes_method_history(tmp_path):
         step=5,
         method_status={
             "rgb2x": {"status": "evaluated", "count": 1},
-            "rgb2x_ictpolarreal": {"status": "evaluated", "count": 1},
+            "ours": {"status": "evaluated", "count": 1},
             "dsine": {"status": "skipped", "reason": "not configured"},
         },
     )
@@ -140,8 +140,8 @@ def test_training_evaluation_writes_method_history(tmp_path):
     assert (step_root / "metrics.csv").exists()
     assert (step_root / "comparisons" / "object" / "cam00" / "static" / "albedo.png").exists()
     summary = json.loads((step_root / "summary.json").read_text())
-    assert summary["methods"]["rgb2x"]["label"] == "RGB2X (base)"
-    assert summary["methods"]["rgb2x_ictpolarreal"]["status"] == "evaluated"
+    assert summary["methods"]["rgb2x"]["label"] == "RGB2X"
+    assert summary["methods"]["ours"]["label"] == "Ours"
     assert summary["methods"]["dsine"]["status"] == "skipped"
     assert len((tmp_path / "eval" / "history.jsonl").read_text().splitlines()) == 1
 
@@ -152,7 +152,7 @@ def test_evaluation_method_and_baseline_parsing(tmp_path):
     )
     assert methods == (
         "rgb2x",
-        "rgb2x_ictpolarreal",
+        "ours",
         "diffusion_renderer",
         "lotus",
         "dsine",

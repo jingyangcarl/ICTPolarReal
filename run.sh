@@ -42,9 +42,33 @@ CHECKPOINTING_STEPS="${CHECKPOINTING_STEPS:-250}"
 RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
 TRAIN_EVAL_STEPS="${TRAIN_EVAL_STEPS:-100}"
 TRAIN_EVAL_SAMPLES="${TRAIN_EVAL_SAMPLES:-1}"
-TRAIN_EVAL_METHODS="${TRAIN_EVAL_METHODS:-rgb2x,rgb2x_ictpolarreal,diffusion_renderer,lotus,dsine}"
+TRAIN_EVAL_METHODS="${TRAIN_EVAL_METHODS:-rgb2x,ours,diffusion_renderer,lotus,dsine}"
 LOG_STEPS="${LOG_STEPS:-10}"
 EVAL_BASELINES=()
+BASELINE_ROOT_EXPLICIT=0
+if [[ -n "${BASELINE_ROOT:-}" ]]; then
+  BASELINE_ROOT_EXPLICIT=1
+fi
+BASELINE_ROOT="${BASELINE_ROOT:-${OUTPUT_ROOT}/baselines}"
+DEFAULT_LOTUS_REPO="${REPO_ROOT}/external/lotus"
+if [[ ! -d "${DEFAULT_LOTUS_REPO}" && -d "${REPO_ROOT}/../lotus" ]]; then
+  DEFAULT_LOTUS_REPO="${REPO_ROOT}/../lotus"
+fi
+LOTUS_REPO="${LOTUS_REPO:-${DEFAULT_LOTUS_REPO}}"
+LOTUS_PYTHON="${LOTUS_PYTHON:-}"
+DEFAULT_DSINE_REPO="${TORCH_HOME:-${HOME}/.cache/torch}/hub/hugoycj_DSINE-hub_main"
+if [[ ! -d "${DEFAULT_DSINE_REPO}" ]]; then DEFAULT_DSINE_REPO=""; fi
+DSINE_REPO="${DSINE_REPO:-${DEFAULT_DSINE_REPO}}"
+DSINE_PYTHON="${DSINE_PYTHON:-}"
+DEFAULT_DIFFUSION_RENDERER_REPO="${REPO_ROOT}/external/cosmos-transfer1-diffusion-renderer"
+if [[ ! -d "${DEFAULT_DIFFUSION_RENDERER_REPO}" && -d "${REPO_ROOT}/../cosmos-transfer1-diffusion-renderer" ]]; then
+  DEFAULT_DIFFUSION_RENDERER_REPO="${REPO_ROOT}/../cosmos-transfer1-diffusion-renderer"
+fi
+DIFFUSION_RENDERER_REPO="${DIFFUSION_RENDERER_REPO:-${DEFAULT_DIFFUSION_RENDERER_REPO}}"
+DIFFUSION_RENDERER_PYTHON="${DIFFUSION_RENDERER_PYTHON:-}"
+DIFFUSION_RENDERER_STEPS="${DIFFUSION_RENDERER_STEPS:-15}"
+SKIP_BASELINES=0
+FORCE_BASELINES=0
 PREVIEW_SAMPLES="${PREVIEW_SAMPLES:-1}"
 INFERENCE_STEPS="${INFERENCE_STEPS:-10}"
 TRAIN_DRY_RUN=0
@@ -74,9 +98,10 @@ Commands:
   check-env    Verify Python package imports and CUDA availability.
   check-data   Validate DATA_ROOT and print Google Drive sample instructions if missing.
   process      Optimize OLAT cross/parallel images into material maps.
-  train        Fine-tune the RGB2X inverse and/or forward rendering models.
+  baselines    Precompute Diffusion Renderer, Lotus, and DSINE predictions.
+  train        Train Ours and evaluate it with RGB2X and external methods.
   evaluate     Evaluate predictions against ICTPolarReal or Objaverse-style samples.
-  all          setup -> check-env -> check-data -> process -> train -> evaluate.
+  all          setup -> check-env -> check-data -> process -> baselines -> train -> evaluate.
 
 Options:
   --data-root PATH          Dataset root. Default: ${DATA_ROOT}
@@ -113,6 +138,19 @@ Options:
   --train-eval-methods LIST Methods to compare during training. Default: ${TRAIN_EVAL_METHODS}
   --eval-baseline METHOD=PATH
                             Cached Diffusion Renderer, Lotus, or DSINE predictions; repeat as needed.
+  --baseline-root PATH      Generated benchmark prediction cache. Default: ${BASELINE_ROOT}
+  --lotus-repo PATH         Lotus source checkout. Default: ${LOTUS_REPO}
+  --lotus-python PATH       Python executable for Lotus (also DSINE by default).
+  --dsine-repo PATH         Optional local DSINE torch-hub checkout.
+  --dsine-python PATH       Optional separate Python executable for DSINE.
+  --diffusion-renderer-repo PATH
+                            Cosmos Diffusion Renderer checkout. Default: ${DIFFUSION_RENDERER_REPO}
+  --diffusion-renderer-python PATH
+                            Python executable for Cosmos Diffusion Renderer.
+  --diffusion-renderer-steps N
+                            Diffusion Renderer inference steps. Default: ${DIFFUSION_RENDERER_STEPS}
+  --skip-baselines          Do not generate missing benchmark predictions before training.
+  --force-baselines         Regenerate benchmark prediction caches.
   --log-steps N             Console log interval. Default: ${LOG_STEPS}
   --preview-samples N       Cameras to render after training. Default: ${PREVIEW_SAMPLES}
   --inference-steps N       Diffusion steps per preview. Default: ${INFERENCE_STEPS}
@@ -133,6 +171,7 @@ Examples:
   bash run.sh all
   bash run.sh check-data
   bash run.sh process --backend torch --device cuda
+  bash run.sh baselines
   bash run.sh train --train-stage inverse --inverse-workflow both
   bash run.sh train --train-stage forward --forward-mode gbuffer
   bash run.sh train --eval-baseline lotus=/path/to/lotus/predictions
@@ -175,6 +214,16 @@ parse_args() {
       --train-eval-samples) TRAIN_EVAL_SAMPLES="$2"; shift 2 ;;
       --train-eval-methods) TRAIN_EVAL_METHODS="$2"; shift 2 ;;
       --eval-baseline) EVAL_BASELINES+=("$2"); shift 2 ;;
+      --baseline-root) BASELINE_ROOT="$2"; BASELINE_ROOT_EXPLICIT=1; shift 2 ;;
+      --lotus-repo) LOTUS_REPO="$2"; shift 2 ;;
+      --lotus-python) LOTUS_PYTHON="$2"; shift 2 ;;
+      --dsine-repo) DSINE_REPO="$2"; shift 2 ;;
+      --dsine-python) DSINE_PYTHON="$2"; shift 2 ;;
+      --diffusion-renderer-repo) DIFFUSION_RENDERER_REPO="$2"; shift 2 ;;
+      --diffusion-renderer-python) DIFFUSION_RENDERER_PYTHON="$2"; shift 2 ;;
+      --diffusion-renderer-steps) DIFFUSION_RENDERER_STEPS="$2"; shift 2 ;;
+      --skip-baselines) SKIP_BASELINES=1; shift ;;
+      --force-baselines) FORCE_BASELINES=1; shift ;;
       --log-steps) LOG_STEPS="$2"; shift 2 ;;
       --preview-samples) PREVIEW_SAMPLES="$2"; shift 2 ;;
       --inference-steps) INFERENCE_STEPS="$2"; shift 2 ;;
@@ -201,10 +250,23 @@ parse_args() {
   if [[ "${MATERIAL_ROOT_EXPLICIT}" != "1" ]]; then
     MATERIAL_ROOT="${OUTPUT_ROOT}/material_acquisition"
   fi
+  if [[ "${BASELINE_ROOT_EXPLICIT}" != "1" ]]; then
+    BASELINE_ROOT="${OUTPUT_ROOT}/baselines"
+  fi
   if (( MAX_LIGHTS > MIN_DECOMP_LIGHTS )); then
     REQUIRED_DECOMP_LIGHTS="${MAX_LIGHTS}"
   else
     REQUIRED_DECOMP_LIGHTS="${MIN_DECOMP_LIGHTS}"
+  fi
+}
+
+find_micromamba() {
+  if command -v micromamba >/dev/null 2>&1; then
+    command -v micromamba
+  elif [[ -x "${HOME}/.micromamba/bin/micromamba" ]]; then
+    printf '%s\n' "${HOME}/.micromamba/bin/micromamba"
+  else
+    return 1
   fi
 }
 
@@ -214,9 +276,11 @@ activate_env() {
     if conda env list | awk '{print $1}' | grep -Fxq "${ENV_NAME}"; then
       conda activate "${ENV_NAME}"
     fi
-  elif command -v micromamba >/dev/null 2>&1; then
-    eval "$(micromamba shell hook -s bash)"
-    if micromamba env list | awk '{print $1}' | grep -Fxq "${ENV_NAME}"; then
+  elif find_micromamba >/dev/null 2>&1; then
+    local micromamba_bin
+    micromamba_bin="$(find_micromamba)"
+    eval "$("${micromamba_bin}" shell hook -s bash)"
+    if "${micromamba_bin}" env list | awk '{print $1}' | grep -Fxq "${ENV_NAME}"; then
       micromamba activate "${ENV_NAME}"
     fi
   elif [[ -f "${REPO_ROOT}/.venv/bin/activate" ]]; then
@@ -233,10 +297,12 @@ setup_env() {
       conda create -n "${ENV_NAME}" "python=${PYTHON_VERSION}" -y
     fi
     conda activate "${ENV_NAME}"
-  elif command -v micromamba >/dev/null 2>&1; then
-    eval "$(micromamba shell hook -s bash)"
-    if ! micromamba env list | awk '{print $1}' | grep -Fxq "${ENV_NAME}"; then
-      micromamba create -n "${ENV_NAME}" "python=${PYTHON_VERSION}" -y
+  elif find_micromamba >/dev/null 2>&1; then
+    local micromamba_bin
+    micromamba_bin="$(find_micromamba)"
+    eval "$("${micromamba_bin}" shell hook -s bash)"
+    if ! "${micromamba_bin}" env list | awk '{print $1}' | grep -Fxq "${ENV_NAME}"; then
+      "${micromamba_bin}" create -n "${ENV_NAME}" "python=${PYTHON_VERSION}" -y
     fi
     micromamba activate "${ENV_NAME}"
   else
@@ -533,6 +599,103 @@ process_materials() {
     --chunk-size "${DECOMP_CHUNK_SIZE}"
 }
 
+resolve_baseline_python() {
+  local configured="$1"
+  local env_name="$2"
+  if [[ -n "${configured}" ]]; then
+    if [[ -x "${configured}" ]]; then
+      printf '%s\n' "${configured}"
+      return 0
+    fi
+    if command -v "${configured}" >/dev/null 2>&1; then
+      command -v "${configured}"
+      return 0
+    fi
+    echo "[baselines] Python executable not found: ${configured}" >&2
+    return 1
+  fi
+  local candidate
+  for candidate in \
+    "${HOME}/micromamba/envs/${env_name}/bin/python" \
+    "${HOME}/miniconda3/envs/${env_name}/bin/python" \
+    "${HOME}/anaconda3/envs/${env_name}/bin/python"; do
+    if [[ -x "${candidate}" ]]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+  command -v python
+}
+
+has_eval_baseline() {
+  local method="$1"
+  local baseline
+  for baseline in "${EVAL_BASELINES[@]}"; do
+    if [[ "${baseline%%=*}" == "${method}" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+prepare_baselines() {
+  if [[ "${SKIP_BASELINES}" == "1" || "${TRAIN_EVAL_SAMPLES}" == "0" ]]; then
+    return 0
+  fi
+  if [[ "${TRAIN_STAGE}" == "forward" || "${INVERSE_WORKFLOW}" == "polarization" ]]; then
+    return 0
+  fi
+
+  local requested=()
+  local method
+  while IFS= read -r method; do
+    case "${method}" in
+      diffusion_renderer|lotus|dsine)
+        if ! has_eval_baseline "${method}"; then requested+=("${method}"); fi
+        ;;
+    esac
+  done < <(printf '%s\n' "${TRAIN_EVAL_METHODS}" | tr ',' '\n')
+  if [[ "${#requested[@]}" == "0" ]]; then
+    return 0
+  fi
+
+  cd "${REPO_ROOT}"
+  activate_env || true
+  local lotus_python
+  local dsine_python
+  local diffusion_renderer_python
+  lotus_python="$(resolve_baseline_python "${LOTUS_PYTHON}" lotus)"
+  dsine_python="$(resolve_baseline_python "${DSINE_PYTHON:-${LOTUS_PYTHON}}" lotus)"
+  diffusion_renderer_python="$(resolve_baseline_python "${DIFFUSION_RENDERER_PYTHON}" cosmos-predict1)"
+
+  local methods_csv=""
+  for method in "${requested[@]}"; do
+    methods_csv="${methods_csv}${methods_csv:+,}${method}"
+  done
+  local optional_args=()
+  if [[ -n "${DSINE_REPO}" ]]; then optional_args+=(--dsine-repo "${DSINE_REPO}"); fi
+  if [[ "${LOCAL_FILES_ONLY}" == "1" ]]; then optional_args+=(--local-files-only); fi
+  if [[ "${FORCE_BASELINES}" == "1" ]]; then optional_args+=(--force); fi
+
+  python -m ictpolarreal.eval.baselines \
+    --data-root "${DATA_ROOT}" \
+    --out-root "${BASELINE_ROOT}" \
+    --methods "${methods_csv}" \
+    --max-samples "${TRAIN_EVAL_SAMPLES}" \
+    --device "${DEVICE}" \
+    --lotus-python "${lotus_python}" \
+    --lotus-repo "${LOTUS_REPO}" \
+    --dsine-python "${dsine_python}" \
+    --diffusion-renderer-python "${diffusion_renderer_python}" \
+    --diffusion-renderer-repo "${DIFFUSION_RENDERER_REPO}" \
+    --diffusion-renderer-steps "${DIFFUSION_RENDERER_STEPS}" \
+    "${optional_args[@]}"
+
+  for method in "${requested[@]}"; do
+    EVAL_BASELINES+=("${method}=${BASELINE_ROOT}/${method}")
+  done
+}
+
 train_inverse() {
   cd "${REPO_ROOT}"
   activate_env || true
@@ -618,6 +781,7 @@ train_forward() {
 }
 
 train_models() {
+  prepare_baselines
   case "${TRAIN_STAGE}" in
     inverse) train_inverse ;;
     forward) train_forward ;;
@@ -657,6 +821,7 @@ main() {
     check-env) check_env ;;
     check-data) check_data ;;
     process) check_data; process_materials ;;
+    baselines) check_data; prepare_baselines ;;
     train) train_models ;;
     evaluate) evaluate_predictions ;;
     all)

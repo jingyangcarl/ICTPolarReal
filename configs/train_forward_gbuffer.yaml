@@ -11,4 +11,4 @@ lora_rank: 8
 log_steps: 10
 evaluation_steps: 10000
 evaluation_samples: 10
-evaluation_methods: rgb2x,rgb2x_ictpolarreal,diffusion_renderer,lotus,dsine
+evaluation_methods: rgb2x,ours,diffusion_renderer,lotus,dsine

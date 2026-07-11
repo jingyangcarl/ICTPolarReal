@@ -27,9 +27,9 @@ Run the full sample workflow:
 bash run.sh all
 ```
 
-No manual Python setup is needed for the default path. The training stages use
-LoRA to fine-tune the RGB2X `rgb-to-x` and `x-to-rgb` diffusion checkpoints;
-a CUDA GPU is strongly recommended.
+The training stages use LoRA to fine-tune the RGB2X `rgb-to-x` and `x-to-rgb`
+diffusion checkpoints; a CUDA GPU is strongly recommended. Benchmark models
+are generated once and cached before training.
 
 If `data/sample` is missing or incomplete, the script downloads one complete
 camera view with all 346 calibrated cross/parallel OLAT pairs. The default
@@ -45,8 +45,9 @@ same command.
 | 2 | Check Python packages | Verifies imports and reports PyTorch/CUDA availability. |
 | 3 | Prepare sample data | Validates `data/sample`; if needed, downloads one complete 346-light camera view. |
 | 4 | Decompose polarization data | Fits diffuse normals/albedo and specular BRDF parameters, then writes material PNG maps. |
-| 5 | Train inverse and forward models | Fine-tunes RGB2X for inverse, G-buffer forward, and polarization forward tasks. Logs loss every 10 steps. |
-| 6 | Evaluate predictions | Writes CSV metrics and a JSON summary under `outputs/`. |
+| 5 | Run benchmark methods | Precomputes Diffusion Renderer, Lotus, and DSINE predictions once, then caches them. |
+| 6 | Train inverse and forward models | Fine-tunes RGB2X for inverse, G-buffer forward, and polarization forward tasks. Logs loss every 10 steps. |
+| 7 | Evaluate predictions | Writes CSV metrics and a JSON summary under `outputs/`. |
 
 ## Expected Data Layout
 
@@ -75,6 +76,7 @@ directions. `run.sh process` also accepts normalized 346-frame sequences.
 Default outputs are written to `outputs/`:
 
 - `outputs/material_acquisition/`: decomposed material PNG maps under `<object>/<camera>/brdf/`.
+- `outputs/baselines/`: real Diffusion Renderer, Lotus, and DSINE predictions reused during training.
 - `outputs/train/inverse/`: prompt-conditioned RGB-to-PBR/polarization LoRA and predictions.
 - `outputs/train/forward/gbuffer/`: PBR G-buffer-to-RGB LoRA and relighting predictions.
 - `outputs/train/forward/polarization/`: cross/parallel-to-RGB LoRA and relighting predictions.
@@ -86,27 +88,28 @@ Default outputs are written to `outputs/`:
 
 | Method ID | Role | How it is evaluated |
 | --- | --- | --- |
-| `rgb2x` | Original RGB2X checkpoint | Runs in the trainer with the ICTPolarReal adapter disabled. |
-| `rgb2x_ictpolarreal` | Current ICTPolarReal LoRA | Runs in the trainer with the adapter enabled. |
-| `diffusion_renderer` | Diffusion Renderer baseline | Reads cached inverse or forward predictions from its separate Cosmos environment. |
-| `lotus` | Lotus normal baseline | Reads cached normal predictions. |
-| `dsine` | DSINE normal baseline | Reads cached normal predictions. |
+| `rgb2x` | Original RGB2X checkpoint | Runs in the trainer and appears as `RGB2X`. |
+| `ours` | Current ICTPolarReal LoRA | Runs in the trainer and appears as `Ours`. |
+| `diffusion_renderer` | Diffusion Renderer | Runs the Cosmos inverse renderer for albedo, normal, and specular. |
+| `lotus` | Lotus | Runs the one-step Lotus normal model. |
+| `dsine` | DSINE | Runs the DSINE surface-normal model. |
 
-All five IDs appear in each evaluation summary. External methods without a
-configured prediction root are marked `skipped`; they are never reported as an
-RGB2X result. Add available baselines with repeatable options:
+`run.sh train` precomputes missing external results, writes a step-zero
+comparison, and reuses them at every evaluation interval. Run or refresh them
+directly with:
 
 ```bash
-bash run.sh train \
-  --eval-baseline diffusion_renderer=/path/to/diffusion_renderer \
-  --eval-baseline lotus=/path/to/lotus \
-  --eval-baseline dsine=/path/to/dsine
+bash run.sh baselines
+bash run.sh baselines --force-baselines
 ```
 
-Use `<root>/<object>/<camera>/<light>/<task>.png`, for example
-`lotus/dragondruit/cam00/static/normal.png`. The camera-level form
-`<root>/<object>/<camera>/normal.png` is also accepted. See
-`docs/training.md` for supported tasks and aliases.
+The launcher detects `external/lotus`,
+`external/cosmos-transfer1-diffusion-renderer`, and the Micromamba environments
+`lotus` and `cosmos-predict1`. Override those locations with
+`--lotus-repo`, `--lotus-python`, `--diffusion-renderer-repo`, and
+`--diffusion-renderer-python`. These official external environments and model
+weights must be installed once; they are intentionally not mixed into the
+RGB2X training environment. See `docs/training.md` for the cache layout.
 
 ## Flexible Usage
 
@@ -116,6 +119,7 @@ running on a different machine or dataset:
 ```bash
 bash run.sh check-data
 bash run.sh process --data-root /path/to/data --output-root /path/to/out
+bash run.sh baselines --data-root /path/to/data --output-root /path/to/out
 bash run.sh train --data-root /path/to/data --train-stage inverse
 bash run.sh train --data-root /path/to/data --train-stage forward --forward-mode gbuffer
 bash run.sh evaluate --data-root /path/to/data --pred-root /path/to/predictions
@@ -138,6 +142,7 @@ Useful options:
 - `--train-eval-steps N`: run the fixed benchmark subset periodically. The default is 100.
 - `--train-eval-samples N`: set the fixed evaluation subset size; `0` disables in-training evaluation.
 - `--eval-baseline METHOD=PATH`: add cached Diffusion Renderer, Lotus, or DSINE results.
+- `--skip-baselines`: train without generating missing external predictions.
 - `--material-root PATH`: use precomputed material maps from another run.
 - `--skip-setup`: reuse the current environment.
 

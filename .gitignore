@@ -8,6 +8,7 @@ __pycache__/
 
 /data/
 /datasets/
+/external/
 /checkpoints/
 /logs/
 /outputs/

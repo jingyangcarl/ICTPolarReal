@@ -22,34 +22,39 @@ prompts; both forward models use an empty prompt.
 
 ## Evaluation During Training
 
-Every 100 steps by default, the trainer evaluates a fixed subset with explicit
-method identities:
+A fresh run evaluates step 0, then repeats every 100 steps by default on the
+same fixed subset with explicit method identities:
 
 | Method | Supported tasks | Execution |
 | --- | --- | --- |
-| `rgb2x` | All selected inverse/forward tasks | Frozen base checkpoint in the active process. |
-| `rgb2x_ictpolarreal` | All selected inverse/forward tasks | Current LoRA checkpoint in the active process. |
-| `diffusion_renderer` | Albedo, normal, specular, G-buffer forward | Cached predictions from the separate Cosmos runner. |
-| `lotus` | Normal | Cached predictions. |
-| `dsine` | Normal | Cached predictions. |
+| `rgb2x` (`RGB2X`) | All selected inverse/forward tasks | Frozen base checkpoint in the active process. |
+| `ours` (`Ours`) | All selected inverse/forward tasks | Current LoRA checkpoint in the active process. |
+| `diffusion_renderer` | Inverse albedo, normal, and specular | Cosmos 7B inverse renderer, precomputed once. |
+| `lotus` | Inverse normal | Lotus normal model, precomputed once. |
+| `dsine` | Inverse normal | DSINE normal model, precomputed once. |
 
-Register cached results with `--eval-baseline METHOD=PATH`. Predictions may be
-stored as `<root>/<object>/<camera>/<light>/<task>.png` or, for camera-level
-inverse results, `<root>/<object>/<camera>/<task>.png`. `basecolor.png` and
-`base_color.png` are accepted for albedo; `forward_rgb.png`, `pred.png`, and
-`result.png` are accepted for forward RGB.
+Before inverse training, `run.sh` executes missing external methods on the same
+fixed sample subset. Their model processes exit before RGB2X training starts,
+so the GPU memory and dependency environments remain isolated. Results are
+cached as `outputs/baselines/<method>/<object>/<camera>/static/<task>.png` and
+reused at every evaluation step.
 
 ```bash
-bash run.sh train --train-stage inverse \
-  --eval-baseline diffusion_renderer=/path/to/diffusion_renderer \
-  --eval-baseline lotus=/path/to/lotus \
-  --eval-baseline dsine=/path/to/dsine
+bash run.sh baselines
+bash run.sh train --train-stage inverse
 ```
 
-Missing roots, files, and unsupported method/task pairs are recorded as
-`skipped` in `summary.json`. A final comparison runs when training ends. Each
-`step-NNNNNN` folder contains metrics, normalized predictions, targets, and
-labeled panels under `comparisons/`; `eval/history.jsonl` tracks all runs.
+Lotus and DSINE use the compatible `lotus` Python environment. Diffusion
+Renderer uses its official `cosmos-predict1` environment and 7B inverse
+checkpoint. The launcher finds standard Micromamba environments and source
+checkouts under `external/` or the parent directory. Use the corresponding
+`--*-python` and `--*-repo` options for other layouts. Manual prediction roots
+remain supported with repeatable `--eval-baseline METHOD=PATH` options.
+
+A final comparison runs when training ends. Each `step-NNNNNN` folder contains
+metrics, normalized predictions, targets, and labeled panels under
+`comparisons/`; `eval/history.jsonl` tracks all runs. Unsupported task/method
+pairs are explicitly recorded as `skipped` in `summary.json`.
 
 ## Selective Runs
 

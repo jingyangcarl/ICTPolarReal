@@ -16,16 +16,17 @@ from ictpolarreal.train.contracts import (
 from ictpolarreal.utils.io import IMAGE_EXTS, read_image, write_image
 
 
-BUILTIN_EVALUATION_METHODS = frozenset({"rgb2x", "rgb2x_ictpolarreal"})
+BUILTIN_EVALUATION_METHODS = frozenset({"rgb2x", "ours"})
 EXTERNAL_EVALUATION_METHODS = frozenset({"diffusion_renderer", "lotus", "dsine"})
 EVALUATION_METHOD_ALIASES = {
     "pretrained": "rgb2x",
-    "finetuned": "rgb2x_ictpolarreal",
+    "finetuned": "ours",
+    "rgb2x_ictpolarreal": "ours",
     "diffusion-renderer": "diffusion_renderer",
 }
 EVALUATION_METHOD_LABELS = {
-    "rgb2x": "RGB2X (base)",
-    "rgb2x_ictpolarreal": "RGB2X + ICTPolarReal",
+    "rgb2x": "RGB2X",
+    "ours": "Ours",
     "diffusion_renderer": "Diffusion Renderer",
     "lotus": "Lotus",
     "dsine": "DSINE",
@@ -66,7 +67,7 @@ def add_training_arguments(parser: argparse.ArgumentParser, *, stage: str) -> ar
     parser.add_argument("--evaluation-samples", type=int, default=4)
     parser.add_argument(
         "--evaluation-methods",
-        default="rgb2x,rgb2x_ictpolarreal,diffusion_renderer,lotus,dsine",
+        default="rgb2x,ours,diffusion_renderer,lotus,dsine",
     )
     parser.add_argument(
         "--evaluation-baseline",
@@ -205,7 +206,7 @@ def run_diffusion_training(args: argparse.Namespace, *, stage: str) -> None:
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
     if args.full_finetune and "rgb2x" in evaluation_methods:
-        print("[eval] RGB2X (base) will be recorded as skipped during full fine-tuning")
+        print("[eval] RGB2X will be recorded as skipped during full fine-tuning")
 
     trainable_parameters = [parameter for parameter in unet.parameters() if parameter.requires_grad]
     if not trainable_parameters:
@@ -261,6 +262,24 @@ def run_diffusion_training(args: argparse.Namespace, *, stage: str) -> None:
         dynamic_ncols=True,
     )
     last_evaluation_step = -1
+    initial_summary = output_dir / "eval" / f"step-{global_step:06d}" / "summary.json"
+    if evaluation_dataset is not None and evaluation_methods:
+        if not initial_summary.exists():
+            _run_periodic_evaluation(
+                evaluation_dataset,
+                stage=stage,
+                args=args,
+                methods=evaluation_methods,
+                baseline_roots=baseline_roots,
+                step=global_step,
+                accelerator=accelerator,
+                unet=unet,
+                vae=vae,
+                noise_scheduler=noise_scheduler,
+                prompt_embeddings=prompt_embeddings,
+                dtype=weight_dtype,
+            )
+        last_evaluation_step = global_step
     while global_step < args.max_steps:
         for batch in loader:
             with accelerator.accumulate(unet):
@@ -743,7 +762,7 @@ def _evaluate_external_method(
     if prediction_root is None:
         return {
             "status": "skipped",
-            "reason": f"add --eval-baseline {method}=PATH to evaluate cached predictions",
+            "reason": f"run `bash run.sh baselines` or add --eval-baseline {method}=PATH",
         }
     if not prediction_root.exists():
         return {"status": "skipped", "reason": f"prediction root does not exist: {prediction_root}"}
