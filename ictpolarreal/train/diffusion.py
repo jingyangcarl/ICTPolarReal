@@ -52,7 +52,7 @@ def add_training_arguments(parser: argparse.ArgumentParser, *, stage: str) -> ar
     parser.add_argument("--light-root", default=None)
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--max-steps", type=int, default=1000)
+    parser.add_argument("--max-steps", type=int, default=100000)
     parser.add_argument("--learning-rate", type=float, default=3e-5)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -61,9 +61,9 @@ def add_training_arguments(parser: argparse.ArgumentParser, *, stage: str) -> ar
     parser.add_argument("--mixed-precision", choices=["auto", "no", "fp16", "bf16"], default="auto")
     parser.add_argument("--lora-rank", type=int, default=8)
     parser.add_argument("--full-finetune", action="store_true")
-    parser.add_argument("--checkpointing-steps", type=int, default=250)
+    parser.add_argument("--checkpointing-steps", type=int, default=10000)
     parser.add_argument("--resume-from-checkpoint", default=None, help="Checkpoint path or 'latest'.")
-    parser.add_argument("--evaluation-steps", type=int, default=100)
+    parser.add_argument("--evaluation-steps", type=int, default=50000)
     parser.add_argument("--evaluation-samples", type=int, default=4)
     parser.add_argument(
         "--evaluation-methods",
@@ -262,24 +262,6 @@ def run_diffusion_training(args: argparse.Namespace, *, stage: str) -> None:
         dynamic_ncols=True,
     )
     last_evaluation_step = -1
-    initial_summary = output_dir / "eval" / f"step-{global_step:06d}" / "summary.json"
-    if evaluation_dataset is not None and evaluation_methods:
-        if not initial_summary.exists():
-            _run_periodic_evaluation(
-                evaluation_dataset,
-                stage=stage,
-                args=args,
-                methods=evaluation_methods,
-                baseline_roots=baseline_roots,
-                step=global_step,
-                accelerator=accelerator,
-                unet=unet,
-                vae=vae,
-                noise_scheduler=noise_scheduler,
-                prompt_embeddings=prompt_embeddings,
-                dtype=weight_dtype,
-            )
-        last_evaluation_step = global_step
     while global_step < args.max_steps:
         for batch in loader:
             with accelerator.accumulate(unet):

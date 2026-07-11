@@ -31,16 +31,16 @@ DECOMP_NOISE="${DECOMP_NOISE:-1.5e-3}"
 NORMAL_STEPS="${NORMAL_STEPS:-30}"
 SIGMA_STEPS="${SIGMA_STEPS:-50}"
 DECOMP_CHUNK_SIZE="${DECOMP_CHUNK_SIZE:-4096}"
-TRAIN_STEPS="${TRAIN_STEPS:-1000}"
+TRAIN_STEPS="${TRAIN_STEPS:-100000}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 TRAIN_RESOLUTION="${TRAIN_RESOLUTION:-512}"
 LEARNING_RATE="${LEARNING_RATE:-3e-5}"
 LORA_RANK="${LORA_RANK:-8}"
 GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
 MIXED_PRECISION="${MIXED_PRECISION:-auto}"
-CHECKPOINTING_STEPS="${CHECKPOINTING_STEPS:-250}"
+CHECKPOINTING_STEPS="${CHECKPOINTING_STEPS:-10000}"
 RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
-TRAIN_EVAL_STEPS="${TRAIN_EVAL_STEPS:-100}"
+TRAIN_EVAL_STEPS="${TRAIN_EVAL_STEPS:-50000}"
 TRAIN_EVAL_SAMPLES="${TRAIN_EVAL_SAMPLES:-1}"
 TRAIN_EVAL_METHODS="${TRAIN_EVAL_METHODS:-rgb2x,ours,diffusion_renderer,lotus,dsine}"
 LOG_STEPS="${LOG_STEPS:-10}"
@@ -49,7 +49,7 @@ BASELINE_ROOT_EXPLICIT=0
 if [[ -n "${BASELINE_ROOT:-}" ]]; then
   BASELINE_ROOT_EXPLICIT=1
 fi
-BASELINE_ROOT="${BASELINE_ROOT:-${OUTPUT_ROOT}/baselines}"
+BASELINE_ROOT="${BASELINE_ROOT:-${OUTPUT_ROOT}/train/baseline}"
 DEFAULT_LOTUS_REPO="${REPO_ROOT}/external/lotus"
 if [[ ! -d "${DEFAULT_LOTUS_REPO}" && -d "${REPO_ROOT}/../lotus" ]]; then
   DEFAULT_LOTUS_REPO="${REPO_ROOT}/../lotus"
@@ -101,7 +101,7 @@ Commands:
   baselines    Precompute Diffusion Renderer, Lotus, and DSINE predictions.
   train        Train Ours and evaluate it with RGB2X and external methods.
   evaluate     Evaluate predictions against ICTPolarReal or Objaverse-style samples.
-  all          setup -> check-env -> check-data -> process -> baselines -> train -> evaluate.
+  all          setup -> check-env -> check-data -> process -> baselines -> train with evaluation.
 
 Options:
   --data-root PATH          Dataset root. Default: ${DATA_ROOT}
@@ -251,7 +251,7 @@ parse_args() {
     MATERIAL_ROOT="${OUTPUT_ROOT}/material_acquisition"
   fi
   if [[ "${BASELINE_ROOT_EXPLICIT}" != "1" ]]; then
-    BASELINE_ROOT="${OUTPUT_ROOT}/baselines"
+    BASELINE_ROOT="${OUTPUT_ROOT}/train/baseline"
   fi
   if (( MAX_LIGHTS > MIN_DECOMP_LIGHTS )); then
     REQUIRED_DECOMP_LIGHTS="${MAX_LIGHTS}"
@@ -831,7 +831,6 @@ main() {
       if [[ "${SKIP_PROCESS}" != "1" ]]; then process_materials; fi
       if [[ "${SKIP_TRAIN}" != "1" ]]; then
         train_models
-        if [[ "${TRAIN_DRY_RUN}" != "1" ]]; then evaluate_predictions; fi
       fi
       ;;
     -h|--help) usage ;;

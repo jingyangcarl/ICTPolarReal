@@ -1,3 +1,4 @@
+import argparse
 import json
 
 import numpy as np
@@ -7,6 +8,7 @@ from ictpolarreal.data.training import ICTPolarRealTrainingDataset
 from ictpolarreal.train.contracts import build_forward_condition, inverse_target_names
 from ictpolarreal.train.diffusion import (
     _find_external_prediction,
+    add_training_arguments,
     _parse_evaluation_baselines,
     _parse_evaluation_methods,
     _write_training_evaluation,
@@ -162,6 +164,25 @@ def test_evaluation_method_and_baseline_parsing(tmp_path):
         _parse_evaluation_methods("unknown")
     with pytest.raises(ValueError, match="METHOD=PATH"):
         _parse_evaluation_baselines(["lotus"])
+
+
+def test_release_training_schedule_defaults():
+    parser = add_training_arguments(argparse.ArgumentParser(), stage="inverse")
+    args = parser.parse_args(
+        [
+            "--data-root",
+            "data",
+            "--material-root",
+            "materials",
+            "--out-dir",
+            "outputs",
+        ]
+    )
+
+    assert args.max_steps == 100000
+    assert args.checkpointing_steps == 10000
+    assert args.evaluation_steps == 50000
+    assert args.evaluation_methods == "rgb2x,ours,diffusion_renderer,lotus,dsine"
 
 
 def test_external_prediction_layouts(tmp_path):

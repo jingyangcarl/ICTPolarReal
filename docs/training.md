@@ -22,8 +22,8 @@ prompts; both forward models use an empty prompt.
 
 ## Evaluation During Training
 
-A fresh run evaluates step 0, then repeats every 100 steps by default on the
-same fixed subset with explicit method identities:
+The default 100,000-step run evaluates the same fixed subset at steps 50,000
+and 100,000 with explicit method identities:
 
 | Method | Supported tasks | Execution |
 | --- | --- | --- |
@@ -36,8 +36,10 @@ same fixed subset with explicit method identities:
 Before inverse training, `run.sh` executes missing external methods on the same
 fixed sample subset. Their model processes exit before RGB2X training starts,
 so the GPU memory and dependency environments remain isolated. Results are
-cached as `outputs/baselines/<method>/<object>/<camera>/static/<task>.png` and
-reused at every evaluation step.
+cached as
+`outputs/train/baseline/<method>/<object>/<camera>/static/<task>.png`. This
+directory stores predictions only. Metrics and comparison panels are always
+written under the selected training stage's `eval/step-NNNNNN/` directory.
 
 ```bash
 bash run.sh baselines
@@ -70,11 +72,11 @@ Run one forward representation:
 bash run.sh train --train-stage forward --forward-mode gbuffer
 ```
 
-The launcher runs 1,000 steps per selected model, prints loss every 10 steps,
-and saves every 250 steps. It also writes every update to
-`training_history.csv`. For full experiments, set `--train-steps`,
+The launcher runs 100,000 steps per selected model, prints loss every 10 steps,
+evaluates every 50,000 steps, and saves every 10,000 steps. It also writes
+every update to `training_history.csv`. For full experiments, set `--train-steps`,
 `--batch-size`, `--grad-accum-steps`, and `--checkpointing-steps`; the YAML
-files under `configs/` record the 300,000-step defaults. Use `--train-dry-run`
+files under `configs/` record the same 100,000-step defaults. Use `--train-dry-run`
 to inspect the dataset contract without downloading model weights. Resume with
 `--resume latest`; each checkpoint contains the LoRA adapter, optimizer state,
 and global step.

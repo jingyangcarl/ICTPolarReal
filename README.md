@@ -46,8 +46,7 @@ same command.
 | 3 | Prepare sample data | Validates `data/sample`; if needed, downloads one complete 346-light camera view. |
 | 4 | Decompose polarization data | Fits diffuse normals/albedo and specular BRDF parameters, then writes material PNG maps. |
 | 5 | Run benchmark methods | Precomputes Diffusion Renderer, Lotus, and DSINE predictions once, then caches them. |
-| 6 | Train inverse and forward models | Fine-tunes RGB2X for inverse, G-buffer forward, and polarization forward tasks. Logs loss every 10 steps. |
-| 7 | Evaluate predictions | Writes CSV metrics and a JSON summary under `outputs/`. |
+| 6 | Train and compare methods | Trains each selected model for 100,000 steps and writes combined evaluations at steps 50,000 and 100,000. |
 
 ## Expected Data Layout
 
@@ -76,12 +75,12 @@ directions. `run.sh process` also accepts normalized 346-frame sequences.
 Default outputs are written to `outputs/`:
 
 - `outputs/material_acquisition/`: decomposed material PNG maps under `<object>/<camera>/brdf/`.
-- `outputs/baselines/`: real Diffusion Renderer, Lotus, and DSINE predictions reused during training.
+- `outputs/train/baseline/`: reusable Diffusion Renderer, Lotus, and DSINE prediction cache; no benchmark metrics live here.
 - `outputs/train/inverse/`: prompt-conditioned RGB-to-PBR/polarization LoRA and predictions.
 - `outputs/train/forward/gbuffer/`: PBR G-buffer-to-RGB LoRA and relighting predictions.
 - `outputs/train/forward/polarization/`: cross/parallel-to-RGB LoRA and relighting predictions.
 - `outputs/train/*/training_history.csv`: step, task, loss, and learning-rate history.
-- `outputs/train/*/eval/`: labeled comparison panels, CSV metrics, JSON summaries, and metric history.
+- `outputs/train/inverse/eval/` and `outputs/train/forward/<mode>/eval/`: authoritative multi-method panels, CSV metrics, JSON summaries, and history.
 - `outputs/eval_ictpolarreal_decomposition/`: CSV metrics and JSON summary.
 
 ## Training-Time Methods
@@ -94,9 +93,9 @@ Default outputs are written to `outputs/`:
 | `lotus` | Lotus | Runs the one-step Lotus normal model. |
 | `dsine` | DSINE | Runs the DSINE surface-normal model. |
 
-`run.sh train` precomputes missing external results, writes a step-zero
-comparison, and reuses them at every evaluation interval. Run or refresh them
-directly with:
+`run.sh train` precomputes missing external results and includes them in the
+same comparison as RGB2X and Ours at steps 50,000 and 100,000. Run or refresh
+the reusable cache directly with:
 
 ```bash
 bash run.sh baselines
@@ -136,10 +135,10 @@ Useful options:
 - `--train-stage inverse|forward|both`: choose the training stage.
 - `--inverse-workflow pbr|polarization|both`: choose inverse supervision targets.
 - `--forward-mode gbuffer|polarization|both`: choose the forward conditioning representation.
-- `--train-steps N`: set optimizer steps for each selected model. The default is 1,000.
+- `--train-steps N`: set optimizer steps for each selected model. The default is 100,000.
 - `--train-dry-run`: validate all tensors without loading diffusion checkpoints.
 - `--resume latest`: continue from the newest checkpoint in each selected stage.
-- `--train-eval-steps N`: run the fixed benchmark subset periodically. The default is 100.
+- `--train-eval-steps N`: run the combined benchmark periodically. The default is 50,000.
 - `--train-eval-samples N`: set the fixed evaluation subset size; `0` disables in-training evaluation.
 - `--eval-baseline METHOD=PATH`: add cached Diffusion Renderer, Lotus, or DSINE results.
 - `--skip-baselines`: train without generating missing external predictions.
