@@ -1,161 +1,290 @@
 # Preprocessing
 
-Use the root release script to fit cross/parallel OLAT captures into material
-g-buffer PNGs:
+Material acquisition is one stage of the existing `run.sh` pipeline. The
+default remains the polarized Ward decomposition:
 
 ```bash
 bash run.sh process
 ```
 
-The default implementation follows the original JAX decomposition.
-Cross-polarized OLATs are fit with robust photometric stereo for diffuse albedo
-and normals. The `parallel - cross` stack is fit with the anisotropic Ward model
-for specular albedo, specular normals, sigma, roughness, anisotropy, tangent,
-and bitangent. `auto` uses the PyTorch optimizer when CUDA is available and the
-NumPy optimizer otherwise.
+The default path fits cross-polarized OLATs with robust photometric stereo for
+diffuse albedo and normals. It fits the `parallel - cross` stack with the
+anisotropic Ward model for specular albedo, specular normals, sigma, roughness,
+anisotropy, tangent, and bitangent. `--backend auto` uses the PyTorch optimizer
+when CUDA is available and the NumPy optimizer otherwise.
 
-The same pipeline can instead run the Imaginaire-style end-to-end acquisition,
-which optimizes a differentiable Disney BRDF against the calibrated
-ICTPolarReal OLAT observations:
+Select the Disney acquisition explicitly with `--material-acquisition
+end2end`. It is CUDA-only and should be submitted as a one-GPU Slurm job on a
+cluster:
 
 ```bash
 bash run.sh process \
   --material-acquisition end2end \
-  --end2end-eval-lights 16 \
+  --imaginaire-root ../imaginaire \
+  --end2end-hdri-root /path/to/hdr_maps_1k \
   --slurm \
   --backend torch \
   --device cuda
 ```
 
-`--material-acquisition default` is implicit when the option is omitted.
-This initial integration adapts Imaginaire's direct `olat` fitting branch; it
-does not run SuperDimension's separate HDRI-synthesis or mixed-lighting modes.
-End-to-end acquisition defaults to 33,000 optimizer steps and a learning rate
-of `1e-3`; change them with `--end2end-steps` and
-`--end2end-learning-rate`. It also defaults to
-`--end2end-eval-lights 16`. On the complete 346-light capture these 16 lights
-are deterministically reserved before optimization, leaving exactly 330 fit
-lights; the optimizer never sees the held-out targets. Use `--imaginaire-root`
-when the external Imaginaire checkout is not in the default sibling folder
-`../imaginaire`.
+Omitting `--material-acquisition` is equivalent to
+`--material-acquisition default`. The modes also use separate output roots:
 
-The base color and normal are initialized from ICTPolarReal's polarized
-decomposition and remain frozen during the Disney fit. The adapter converts
-Disney's documented physical scalar defaults into the renderer's sigmoid-logit
-storage space; for example, metallic `0` starts near zero rather than at
-`sigmoid(0) = 0.5`. `acquisition.json` and the resume signature record this
-initialization.
+- `default` writes `outputs/material_acquisition`.
+- `end2end` writes `outputs/material_acquisition_end2end`.
+- `--material-root PATH` overrides the root for the selected mode.
 
-Polarization separation convention used internally:
+Both roots receive a `run.json`. It records the acquisition mode, settings,
+camera list, timestamps, and `running`, `failed`, or `complete` status, so an
+interrupted multi-camera run remains auditable.
+
+## End-to-end lighting profiles
+
+End-to-end acquisition fits three independent
+`DisneyBRDFSimplifiedMultiLayer` models by default:
+
+- `olat` fits measured, calibrated one-light-at-a-time targets.
+- `hdri` fits environment-light targets synthesized from the measured OLATs.
+- `mix` alternates one block of HDRI conditions and one block of OLAT
+  conditions. The block size equals `--end2end-hdri-rotations`, which defaults
+  to four.
+
+These are separate material fits, not successive phases of one model. Select a
+comma-separated subset with `--end2end-profiles`; `all` is an alias for the
+default `olat,hdri,mix`:
+
+```bash
+# Fit only the OLAT profile and expose it downstream.
+bash run.sh process \
+  --material-acquisition end2end \
+  --end2end-profiles olat \
+  --end2end-primary-profile olat \
+  --end2end-hdri-root /path/to/hdr_maps_1k \
+  --slurm --backend torch --device cuda
+
+# Fit all profiles but use the mixed maps in later training stages.
+bash run.sh process \
+  --material-acquisition end2end \
+  --end2end-profiles all \
+  --end2end-primary-profile mix \
+  --end2end-hdri-root /path/to/hdr_maps_1k \
+  --slurm --backend torch --device cuda
+```
+
+The primary profile must be included in the requested profile list. Each
+camera's `manifest.json` records a `primary_material_dir` such as
+`mix/simplified-multilayer/material/maps`. Downstream ICTPolarReal loaders read
+that field, while preserving the legacy `brdf/` lookup for default Ward and
+older material roots.
+
+All requested profiles start from the same initialization. Base color and
+normal are computed from the fitted OLAT subset using ICTPolarReal's polarized
+decomposition, then frozen during each Disney fit. The adapter initializes the
+Disney scalars in the renderer's sigmoid-logit storage space so their physical
+starting values match the recorded configuration. Each profile has its own
+optimizer, checkpoint, material state, provenance, and evaluation output.
+
+End-to-end optimization defaults to 33,000 steps and a learning rate of
+`1e-3`. Set these with `--end2end-steps` and
+`--end2end-learning-rate`.
+
+## HDRI conditions and synthesized targets
+
+`--end2end-hdri-root` points to a folder of HDR, EXR, TIFF, or PNG latlong
+environment maps. It is required even for an OLAT-only fit because every fitted
+profile is evaluated on the common HDRI suite. The `run.sh` default refers to
+the Maxine cluster HDRI collection; pass an explicit path elsewhere and make
+sure the compute node can read it.
+
+The environment preparation is deterministic:
+
+1. Each natural environment is sampled at the camera's calibrated ICT light
+   directions and ranked by sampled-light variance.
+2. The top requested set is split by source identity into fit and held-out
+   groups. All yaw rotations of one source stay in the same group.
+3. Each latlong pixel is assigned to its nearest calibrated light, and
+   spherical solid angle is integrated within the resulting Voronoi cell.
+   The Voronoi assignment is recomputed separately on the fit-light and
+   evaluation-light bases, so both composites cover the full sphere without
+   borrowing directions from the other split.
+4. The measured ICTPolarReal OLAT targets are combined with those RGB weights
+   to synthesize the environment-lit target.
+
+The defaults select 100 natural fit identities, four held-out natural
+identities, and four yaw rotations per identity. Configure them with:
+
+- `--end2end-hdri-count N`
+- `--end2end-eval-hdris N`
+- `--end2end-hdri-rotations N`
+
+Generated white, red, green, and blue (`w/r/g/b`) calibration environments are
+also added to the fit conditions, with the same rotations. They are never part
+of the held-out natural-HDRI suite.
+
+HDRI ground truth is therefore synthesized from measured ICTPolarReal OLATs;
+it is not an independently captured HDRI-lit photograph. The camera manifest,
+lighting condition manifest, and evaluation summaries record this target
+origin. The output demonstrates that the same acquisition implementation can
+be driven by OLAT, synthesized HDRI, or mixed targets, but it makes no claim of
+numerical parity with SuperDimension or another dataset.
+
+## Strict evaluation splits
+
+The default full camera has 346 calibrated OLAT pairs. With
+`--end2end-eval-lights 16`, the deterministic split reserves 16 measurements
+before material initialization and optimization, leaving exactly 330 fit
+lights. Training OLAT targets and training HDRI composites use only those fit
+lights. The held-out OLATs are used only by evaluation, including as the
+measured support for held-out-HDRI evaluation targets.
+
+Natural HDRIs have a separate identity-level split controlled by
+`--end2end-eval-hdris`. A held-out environment identity and all its rotations
+are absent from the HDRI and mixed fit pools. Thus the default HDRI suite is
+strictly held out both in environment identity and in its measured OLAT
+support.
+
+Every fitted profile is evaluated on the exact same OLAT cases and the exact
+same HDRI identities/rotations. This produces an aligned profile-by-evaluation
+matrix rather than a different test set for each model. Setting
+`--end2end-eval-lights 0` changes the OLAT suite to sampled fitted-light
+reconstruction. Setting `--end2end-eval-hdris 0` similarly uses fit HDRIs for
+the HDRI evaluation suite; the summaries label these cases `fitted_olat` or
+`fitted_hdri` rather than held out.
+
+Targets use the polarization convention:
 
 - `diffuse = 2 * cross`
 - `specular = 2 * max(parallel - cross, 0)`
+- `target = diffuse + specular`
 
-Material maps are written under:
+Target and prediction are independently normalized over the foreground with
+99.5th-percentile linear scaling and clipping. Metrics are foreground-masked.
+They measure scale-normalized LDR appearance, not absolute radiometric HDR
+accuracy.
 
-```text
-outputs/material_acquisition/object_name/camXX/brdf/
-```
+## Output layout
 
-The default folder contains only material maps: `albedo.png`, `normal.png`,
-`specular.png`, `roughness.png`, `sigma.png`, `anisotropy.png`, `tangent.png`,
-and `bitangent.png`. Vector maps use the standard `[-1, 1]` to `[0, 1]` PNG
-encoding; sigma and roughness use `x / (1 + x)` to retain high values. The
-end-to-end mode keeps the common `albedo.png`, `normal.png`, `specular.png`,
-and `roughness.png` contract used by downstream training. It also writes
-`baseColor.png`, `metallic.png`, `specularTint.png`, `subsurface.png`,
-`anisotropic.png`, `clearcoat.png`, and
-`clearcoatGloss.png`, plus the fitted `disney_brdf.pt` state and an
-`acquisition.json` provenance/metrics record.
-
-The end-to-end folder also contains a relighting evaluation produced by the
-same acquisition stage:
+Default Ward maps retain the legacy tree:
 
 ```text
-brdf/
-  relighting_metrics.csv
-  relighting_summary.json
-  relighting_contact_sheet.png
-  relighting/
-    000002/
-      gt.png
-      pred.png
-      error.png
-      comparison.png
-    ...
+outputs/material_acquisition/
+  run.json
+  object_name/camXX/brdf/
+    albedo.png
+    normal.png
+    specular.png
+    roughness.png
+    sigma.png
+    anisotropy.png
+    tangent.png
+    bitangent.png
 ```
 
-The per-frame directory uses the original capture frame ID. Each comparison is
-ground truth, prediction, and 4x absolute error. The CSV contains the split,
-stack/light/frame identifiers, foreground-masked MSE, MAE, PSNR, and the
-repository's lightweight `ssim_global`; the JSON records aggregate values and
-the exact held-out frame and light IDs.
+Vector maps use the standard `[-1,1]` to `[0,1]` PNG encoding. Ward sigma and
+roughness use `x / (1 + x)` so values above one are retained in the PNG.
 
-Targets and Disney predictions are independently normalized to an LDR scale
-using 99.5th-percentile normalization and linear clipping. Metrics are then
-computed only inside the foreground mask. This follows the scale-normalized
-appearance comparison used by the acquisition flow, but it does not measure
-absolute radiometric scale or HDR reconstruction accuracy.
+End-to-end acquisition uses a profile-oriented camera tree:
 
-During a long Disney fit, `end2end_checkpoint.pt` is updated periodically in
-the same folder. Re-running the identical command and material root resumes
-that checkpoint automatically. It is removed after the final maps, state, and
-metrics have been written successfully; changing the lights, resolution,
-optimizer settings, or Imaginaire source requires a different material root.
+```text
+outputs/material_acquisition_end2end/
+  run.json
+  object_name/camXX/
+    manifest.json
+    lighting/
+      conditions.json
+      weights.npz
+      previews/<condition_id>.png
+    report/
+      overview.png
+      metrics.csv
+      summary.json
+    olat/simplified-multilayer/
+      acquisition.json
+      material/
+        disney_brdf.pt
+        maps/
+          albedo.png
+          baseColor.png
+          normal.png
+          specular.png
+          roughness.png
+          metallic.png
+          specularTint.png
+          subsurface.png
+          anisotropic.png
+          clearcoat.png
+          clearcoatGloss.png
+      evaluation/
+        metrics.csv
+        summary.json
+        olat/
+          metrics.csv
+          summary.json
+          contact_sheet.png
+          cases/<frame_id>/{gt,pred,error,comparison}.png
+        hdri/
+          metrics.csv
+          summary.json
+          contact_sheet.png
+          cases/<condition_id>/{lighting,gt,pred,error,comparison}.png
+    hdri/simplified-multilayer/...
+    mix/simplified-multilayer/...
+```
 
-Output roots are separated automatically for a side-by-side comparison. The
-default mode writes to `outputs/material_acquisition`, while end-to-end mode
-writes to `outputs/material_acquisition_end2end`. An explicit
-`--material-root` overrides the corresponding default when a custom comparison
-layout is needed.
+Only requested profiles are created. `report/overview.png` uses one shared
+representative OLAT case and one shared representative HDRI case across all
+rows, alongside maps and aggregate metrics, so the profile comparison is
+visually aligned. `report/metrics.csv` and `report/summary.json` provide the
+same comparison in machine-readable form.
+
+During each long fit, the resumable checkpoint is
+`<profile>/simplified-multilayer/checkpoints/latest.pt`. Re-running with the
+same inputs, profile, settings, material root, and Imaginaire source resumes
+it. The checkpoint is removed after maps, model state, acquisition provenance,
+and evaluations are written successfully. A later invocation validates those
+completed artifacts and skips the matching profile. A mismatched signature
+requires a different material root or explicit cleanup of the stale checkpoint.
+
+## Capture selection and Slurm
 
 The repository includes LSX light and camera calibration under `metadata/`.
-Raw 350-frame sequences automatically skip indicator frames `0`, `1`, `348`,
-and `349`. For a faster diagnostic, use `--max-lights 32`; publishable material
-maps should use the default 346 lights. Reducing `--max-lights` also reduces the
-fit pool because `--end2end-eval-lights` is reserved from the selected lights;
-the documented full evaluation contract is the default 330-fit/16-held-out
-split. The split always retains at least four fit lights. Setting
-`--end2end-eval-lights 0` disables the holdout and labels the resulting metrics
-as fitted-OLAT reconstruction rather than held-out relighting.
+Raw 350-frame sequences skip indicator frames 0, 1, 348, and 349. Use
+`--max-lights N` for a diagnostic subset; the default 346-light selection is
+recommended for a full acquisition. Reducing it also reduces the pool from
+which the OLAT holdout is made, while always retaining at least four fit
+lights.
 
-For a custom location or explicit GPU execution:
-
-```bash
-bash run.sh process --data-root /path/to/data --output-root /path/to/output --backend torch --device cuda
-```
-
-On a Slurm cluster, submit the same acquisition as a one-GPU batch job so the
-fit does not run on the login node:
+Do not run the Disney optimizer on a GPU-less login node. Submit it through the
+pipeline:
 
 ```bash
 bash run.sh process \
+  --material-acquisition end2end \
+  --end2end-hdri-root /shared/path/to/hdr_maps_1k \
   --slurm \
-  --env-name ictpolarreal \
   --backend torch \
   --device cuda \
   --slurm-account ACCOUNT \
-  --slurm-partition PARTITION
+  --slurm-partition PARTITION \
+  --slurm-gpus 1
 ```
 
-If the environment must be created on a GPU-less submit host, select a CUDA
-wheel explicitly (for example, `bash run.sh setup --torch-variant cu126` with a
-compatible cluster driver). Auto-detection on a host without a visible GPU
-otherwise selects CPU PyTorch, which the end-to-end worker intentionally
-rejects.
+End-to-end acquisition requires exactly one GPU per job. HDRI and mixed fits
+also require a GPU with at least 40 GiB memory; the worker checks the actual
+device and estimated Disney autograd graph before allocating the fit. The
+defaults request 16 CPU cores, 128 GB host memory, one GPU, and 3:59 hours. Use
+`--slurm-time`, `--slurm-cpus`, `--slurm-mem`, and the other `--slurm-*`
+options to match the cluster. `--slurm-dry-run` validates the inputs and prints
+the escaped `sbatch` command without submitting it; logs default to
+`outputs/slurm/`.
 
-The submit host validates the dataset before requesting a GPU, and the worker
-validates it again after leaving the queue. By default the job requests one GPU,
-16 CPU cores, 128 GB of host memory, and 3:59 hours. Slurm stdout/stderr logs go
-under `outputs/slurm/`, while material maps keep the selected mode's output
-layout. Use `--slurm-dry-run` to inspect the exact `sbatch` command without
-submitting it.
+The default three profiles perform 33,000 updates each. On clusters with a
+four-hour queue limit, a full run may need more than one submission. Re-run the
+same command with the same material root: completed profiles are verified and
+skipped, while the current profile resumes from `checkpoints/latest.pt`.
 
-End-to-end acquisition requires exactly one GPU per job and rejects any other
-`--slurm-gpus` value. Imaginaire
-is an external dependency: its source and license are not bundled or relicensed
-by ICTPolarReal. The checkout must be available on the compute node, and its
-runtime dependencies must be installed in the same environment activated by
-the Slurm job. The imported Disney implementation requires PyTorch,
-torchvision, SciPy, NumPy, and Pillow. Users are responsible for obtaining
-Imaginaire and complying with its license.
+If setup runs on a GPU-less submit host, select a compatible CUDA PyTorch wheel
+explicitly, for example `bash run.sh setup --torch-variant cu126`. The external
+Imaginaire checkout and HDRI root must both be visible on the compute node.
+Imaginaire is not bundled or relicensed here; users must obtain it, comply with
+its license, and install its runtime dependencies in the worker environment.

@@ -4,6 +4,7 @@ import csv
 import hashlib
 import json
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -15,10 +16,11 @@ import pytest
 from ictpolarreal.data.dataset import CameraSample
 from ictpolarreal.processing import (
     end2end_acquisition,
+    lighting_profiles,
     material_decomposition,
     prepare_materials,
 )
-from ictpolarreal.utils.io import read_image
+from ictpolarreal.utils.io import read_image, write_image
 
 
 def test_split_light_indices_reserves_sphere_spread_holdout():
@@ -41,6 +43,179 @@ def test_split_light_indices_keeps_minimum_training_set():
     np.testing.assert_array_equal(train, np.arange(4))
     assert heldout.dtype == np.int64
     assert heldout.size == 0
+
+
+@pytest.mark.parametrize(
+    ("requested", "expected"),
+    [
+        ("olat,hdri,mix", ("olat", "hdri", "mix")),
+        (" MIX, olat, mix ", ("olat", "mix")),
+        (["HDRI", "olat"], ("olat", "hdri")),
+        ("all", ("olat", "hdri", "mix")),
+    ],
+)
+def test_parse_lighting_profiles_normalizes_to_canonical_order(requested, expected):
+    assert lighting_profiles.parse_lighting_profiles(requested) == expected
+
+
+@pytest.mark.parametrize("requested", ["", [], "olat,unknown", "all,mix"])
+def test_parse_lighting_profiles_rejects_invalid_requests(requested):
+    with pytest.raises(ValueError):
+        lighting_profiles.parse_lighting_profiles(requested)
+
+
+def test_mix_profile_uses_four_hdri_then_four_olat_iterations():
+    kinds = [lighting_profiles.mix_condition_kind(step, rotations=4) for step in range(16)]
+
+    assert kinds == ["hdri"] * 4 + ["olat"] * 4 + ["hdri"] * 4 + ["olat"] * 4
+
+
+def test_hdri_sources_remain_grouped_across_rotations_and_project_to_olat_basis(
+    monkeypatch, tmp_path
+):
+    hdri_root = tmp_path / "hdris"
+    hdri_root.mkdir()
+    for index in range(3):
+        (hdri_root / f"studio_{index}.hdr").write_bytes(f"studio {index}".encode())
+
+    def fake_read_environment(path):
+        index = int(Path(path).stem.rsplit("_", 1)[1]) + 1
+        rows = np.linspace(0.25, 1.0, 4, dtype=np.float32)[:, None]
+        columns = np.linspace(0.5, 1.5, 8, dtype=np.float32)[None, :]
+        luminance = index * rows * columns
+        return np.stack(
+            [luminance, luminance * 0.75 + 0.1, luminance * 0.5 + 0.2], axis=-1
+        )
+
+    monkeypatch.setattr(lighting_profiles, "_read_environment", fake_read_environment)
+    light_dirs = np.asarray(
+        [
+            [0.0, 1.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [-1.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+    conditions = lighting_profiles.prepare_environment_conditions(
+        hdri_root,
+        light_dirs,
+        train_count=2,
+        eval_count=1,
+        rotations=4,
+        projection_height=4,
+        out_dir=tmp_path / "lighting",
+        fit_support_indices=np.asarray([0, 2, 3], dtype=np.int64),
+        evaluation_support_indices=np.asarray([1], dtype=np.int64),
+    )
+
+    assert len(conditions.train) == 24
+    assert len(conditions.evaluation) == 4
+    grouped = {}
+    natural_conditions = [
+        condition
+        for condition in conditions.all
+        if condition.source_kind == "environment_map"
+    ]
+    calibration_conditions = [
+        condition
+        for condition in conditions.all
+        if condition.source_kind == "generated_calibration"
+    ]
+    assert len(natural_conditions) == 12
+    assert len(calibration_conditions) == 16
+    assert {condition.split for condition in calibration_conditions} == {"fit"}
+    assert {condition.source_name for condition in calibration_conditions} == {
+        "calibration_w",
+        "calibration_r",
+        "calibration_g",
+        "calibration_b",
+    }
+    for condition in natural_conditions:
+        grouped.setdefault(condition.source_name, []).append(condition)
+    for condition in conditions.all:
+        assert condition.weights.shape == (len(light_dirs), 3)
+        assert np.isfinite(condition.weights).all()
+        assert np.all(condition.weights >= 0.0)
+        assert condition.weights.sum() > 0.0
+        if condition.split == "fit":
+            np.testing.assert_array_equal(condition.weights[1], 0.0)
+        else:
+            np.testing.assert_array_equal(condition.weights[[0, 2, 3]], 0.0)
+    assert set(grouped) == {f"studio_{index}.hdr" for index in range(3)}
+    for source_conditions in grouped.values():
+        assert len(source_conditions) == 4
+        assert len({condition.split for condition in source_conditions}) == 1
+        assert {condition.rotation_degrees for condition in source_conditions} == {
+            0,
+            90,
+            180,
+            270,
+        }
+
+    archive = np.load(tmp_path / "lighting" / "weights.npz")
+    assert archive["weights"].shape == (28, 4, 3)
+    assert list(archive["splits"]).count("fit") == 24
+    assert list(archive["splits"]).count("heldout") == 4
+    manifest = json.loads((tmp_path / "lighting" / "conditions.json").read_text())
+    assert manifest["target_origin"] == "synthesized_from_measured_olat"
+    assert manifest["natural_fit_conditions"] == 8
+    assert manifest["calibration_fit_conditions"] == 16
+    assert manifest["projection"]["fit_support_indices"] == [0, 2, 3]
+    assert manifest["projection"]["evaluation_support_indices"] == [1]
+    assert len(manifest["conditions"]) == 28
+
+
+def test_synthesized_hdri_targets_use_rgb_weights_and_requested_olat_support(tmp_path):
+    torch = pytest.importorskip("torch")
+    raw_targets = torch.arange(1, 19, dtype=torch.float32).reshape(3, 3, 1, 2)
+    weights = np.asarray(
+        [
+            [[1.0, 0.5, 0.25], [999.0, 999.0, 999.0], [0.25, 0.5, 1.0]],
+            [[0.1, 0.2, 0.3], [999.0, 999.0, 999.0], [0.4, 0.5, 0.6]],
+        ],
+        dtype=np.float32,
+    )
+    conditions = [
+        lighting_profiles.EnvironmentCondition(
+            condition_id=f"studio_rot{index * 90:03d}",
+            source_path=tmp_path / "studio.hdr",
+            source_name="studio.hdr",
+            source_sha256="digest",
+            rotation_degrees=index * 90,
+            split="fit",
+            variance_score=1.0,
+            weights=condition_weights,
+            preview=np.zeros((2, 4, 3), dtype=np.float32),
+        )
+        for index, condition_weights in enumerate(weights)
+    ]
+    support = np.asarray([0, 2], dtype=np.int64)
+
+    synthesized = end2end_acquisition._synthesize_environment_targets(
+        torch,
+        raw_targets,
+        conditions,
+        support,
+        np.ones((1, 2, 1), dtype=np.float32),
+        torch.device("cpu"),
+        storage_dtype=torch.float32,
+    )
+
+    weighted = torch.einsum(
+        "bnc,nchw->bchw",
+        torch.from_numpy(weights[:, support]),
+        raw_targets.index_select(0, torch.from_numpy(support)),
+    )
+    expected = torch.stack(
+        [
+            (target / target.quantile(end2end_acquisition.PERCENTILE / 100.0)).clamp_max(1.0)
+            for target in weighted
+        ]
+    )
+    assert synthesized.dtype == torch.float32
+    assert torch.allclose(synthesized, expected)
 
 
 def test_end2end_initialization_and_optimizer_exclude_same_heldout_lights(
@@ -130,6 +305,36 @@ def test_render_normalization_uses_foreground_and_masks_background():
 
     assert torch.allclose(normalized[:, 0, 0], torch.ones(3))
     assert torch.count_nonzero(normalized[:, 1, 1]) == 0
+
+
+def test_safe_torch_quantile_strides_below_cuda_element_limit(monkeypatch):
+    torch = pytest.importorskip("torch")
+    values = torch.arange(100, dtype=torch.float32)
+    monkeypatch.setattr(end2end_acquisition, "MAX_QUANTILE_ELEMENTS", 10)
+
+    result = end2end_acquisition._safe_torch_quantile(values, 0.5)
+
+    assert result == torch.quantile(values[::10], 0.5)
+
+
+def test_hdri_gpu_preflight_rejects_low_memory_device():
+    low_memory_torch = SimpleNamespace(
+        cuda=SimpleNamespace(
+            get_device_properties=lambda _device: SimpleNamespace(
+                name="test-gpu",
+                total_memory=24 * (1 << 30),
+            )
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="high-memory GPU"):
+        end2end_acquisition._validate_hdri_gpu_memory(
+            low_memory_torch,
+            "cuda",
+            n_lights=330,
+            height=512,
+            width=282,
+        )
 
 
 def test_disney_scalar_defaults_are_initialized_in_physical_space():
@@ -238,7 +443,7 @@ def test_end2end_material_map_outputs_include_legacy_and_disney_aliases(
     np.testing.assert_allclose(written["normal.png"][:, 1], 0.0)
 
 
-def test_write_relighting_evaluation_writes_heldout_artifacts_and_metrics(tmp_path):
+def test_write_olat_evaluation_writes_profile_scoped_artifacts_and_metrics(tmp_path):
     torch = pytest.importorskip("torch")
     target_chw = torch.stack(
         [torch.full((3, 2, 2), value) for value in (0.2, 0.3, 0.4)]
@@ -255,8 +460,15 @@ def test_write_relighting_evaluation_writes_heldout_artifacts_and_metrics(tmp_pa
         rendered.append(stack_index)
         return target_chw[stack_index] + 0.1
 
-    relighting_dir = tmp_path / "brdf" / "relighting"
-    stale_dir = relighting_dir / "999999"
+    evaluation_dir = (
+        tmp_path
+        / "olat"
+        / end2end_acquisition.PROFILE_MODEL
+        / "evaluation"
+        / "olat"
+    )
+    cases_dir = evaluation_dir / "cases"
+    stale_dir = cases_dir / "999999"
     stale_dir.mkdir(parents=True)
     (stale_dir / "stale.png").touch()
     summary, losses = end2end_acquisition._write_relighting_evaluation(
@@ -266,7 +478,7 @@ def test_write_relighting_evaluation_writes_heldout_artifacts_and_metrics(tmp_pa
         light_ids,
         frame_ids,
         foreground,
-        relighting_dir,
+        cases_dir,
         split="heldout_olat",
     )
 
@@ -283,17 +495,17 @@ def test_write_relighting_evaluation_writes_heldout_artifacts_and_metrics(tmp_pa
     assert 0.0 < summary["metrics"]["ssim_global"] < 1.0
 
     for frame_id in (2, 4):
-        frame_dir = relighting_dir / f"{frame_id:06d}"
+        frame_dir = cases_dir / f"{frame_id:06d}"
         assert {path.name for path in frame_dir.iterdir()} == {
             "pred.png",
             "gt.png",
             "error.png",
             "comparison.png",
         }
-    assert (tmp_path / "brdf" / "relighting_contact_sheet.png").is_file()
+    assert (evaluation_dir / "contact_sheet.png").is_file()
 
-    metrics_path = tmp_path / "brdf" / "relighting_metrics.csv"
-    summary_path = tmp_path / "brdf" / "relighting_summary.json"
+    metrics_path = evaluation_dir / "metrics.csv"
+    summary_path = evaluation_dir / "summary.json"
     assert metrics_path.is_file()
     assert summary_path.is_file()
     with metrics_path.open(newline="", encoding="utf-8") as stream:
@@ -303,6 +515,79 @@ def test_write_relighting_evaluation_writes_heldout_artifacts_and_metrics(tmp_pa
     assert [float(row["mse"]) for row in rows] == pytest.approx([0.01, 0.01])
     on_disk_summary = json.loads(summary_path.read_text(encoding="utf-8"))
     assert on_disk_summary == summary
+    assert summary["representative"]["gt_path"].startswith("cases/")
+
+
+def test_camera_report_writes_three_by_two_profile_evaluation_matrix(tmp_path):
+    profiles = ("olat", "hdri", "mix")
+    profile_results = {}
+    image = np.full((6, 10, 3), 0.4, dtype=np.float32)
+    metric_names = {"mse": 0.01, "mae": 0.1, "psnr": 20.0, "ssim_global": 0.8}
+
+    for profile_index, profile in enumerate(profiles):
+        profile_dir = tmp_path / profile / end2end_acquisition.PROFILE_MODEL
+        maps_dir = profile_dir / "material" / "maps"
+        for name in ("baseColor", "normal", "roughness", "specular"):
+            write_image(maps_dir / f"{name}.png", image + profile_index * 0.05)
+
+        olat_case = profile_dir / "evaluation" / "olat" / "cases" / "000002"
+        for name in ("gt", "pred", "error"):
+            write_image(olat_case / f"{name}.png", image)
+        hdri_case = profile_dir / "evaluation" / "hdri" / "cases" / "studio_rot000"
+        for name in ("lighting", "gt", "pred", "error"):
+            write_image(hdri_case / f"{name}.png", image)
+
+        profile_results[profile] = {
+            "fit_conditions": {
+                "olat": 8 if profile in {"olat", "mix"} else 0,
+                "hdri": 24 if profile in {"hdri", "mix"} else 0,
+            },
+            "evaluation": {
+                "evaluations": {
+                    "olat": {
+                        "metrics": dict(metric_names),
+                        "representative": {
+                            "frame_id": 2,
+                            "gt_path": "cases/000002/gt.png",
+                            "pred_path": "cases/000002/pred.png",
+                            "error_path": "cases/000002/error.png",
+                        },
+                    },
+                    "hdri": {
+                        "metrics": dict(metric_names),
+                        "representative": {
+                            "condition_id": "studio_rot000",
+                            "lighting_path": "cases/studio_rot000/lighting.png",
+                            "gt_path": "cases/studio_rot000/gt.png",
+                            "pred_path": "cases/studio_rot000/pred.png",
+                            "error_path": "cases/studio_rot000/error.png",
+                        },
+                    },
+                }
+            }
+        }
+
+    artifacts = end2end_acquisition._write_camera_report(
+        tmp_path, profiles, profile_results
+    )
+
+    assert artifacts == {
+        "overview": "report/overview.png",
+        "summary": "report/summary.json",
+        "metrics": "report/metrics.csv",
+    }
+    for relative_path in artifacts.values():
+        assert (tmp_path / relative_path).is_file()
+    summary = json.loads((tmp_path / artifacts["summary"]).read_text())
+    assert summary["profiles"] == list(profiles)
+    assert [row["training_profile"] for row in summary["rows"]] == list(profiles)
+    assert all({"olat", "hdri"}.issubset(row) for row in summary["rows"])
+    with (tmp_path / artifacts["metrics"]).open(newline="", encoding="utf-8") as stream:
+        rows = list(csv.DictReader(stream))
+    assert len(rows) == 6
+    assert {
+        (row["training_profile"], row["evaluation_lighting"]) for row in rows
+    } == {(profile, lighting) for profile in profiles for lighting in ("olat", "hdri")}
 
 
 def test_end2end_provenance_records_git_state_and_exact_source_hash(
@@ -353,6 +638,18 @@ def test_end2end_provenance_records_git_state_and_exact_source_hash(
                 "0.002",
                 "--end2end-eval-lights",
                 "7",
+                "--end2end-profiles",
+                "hdri,mix",
+                "--end2end-hdri-root",
+                "/tmp/hdris",
+                "--end2end-hdri-count",
+                "5",
+                "--end2end-eval-hdris",
+                "2",
+                "--end2end-hdri-rotations",
+                "6",
+                "--end2end-primary-profile",
+                "mix",
             ],
             "end2end",
             "torch",
@@ -370,7 +667,7 @@ def test_prepare_materials_dispatches_acquisition_mode(
     expected_steps,
     expected_eval_lights,
 ):
-    sample = object()
+    sample = SimpleNamespace(object_name="object", camera="cam00")
     calls = []
     monkeypatch.setattr(prepare_materials, "iter_camera_samples", lambda _root: [sample])
     monkeypatch.setattr(prepare_materials, "tqdm", lambda iterable, **_kwargs: iterable)
@@ -404,6 +701,13 @@ def test_prepare_materials_dispatches_acquisition_mode(
     assert calls[0]["end2end_learning_rate"] == pytest.approx(
         0.002 if expected_mode == "end2end" else 1e-3
     )
+    if expected_mode == "end2end":
+        assert calls[0]["end2end_profiles"] == "hdri,mix"
+        assert calls[0]["end2end_hdri_root"] == "/tmp/hdris"
+        assert calls[0]["end2end_hdri_count"] == 5
+        assert calls[0]["end2end_eval_hdris"] == 2
+        assert calls[0]["end2end_hdri_rotations"] == 6
+        assert calls[0]["end2end_primary_profile"] == "mix"
 
 
 def test_slurm_dry_run_propagates_end2end_selector_and_options(tmp_path):
@@ -412,6 +716,8 @@ def test_slurm_dry_run_propagates_end2end_selector_and_options(tmp_path):
     output_root = tmp_path / "outputs"
     imaginaire_root = tmp_path / "imaginaire"
     imaginaire_root.mkdir()
+    hdri_root = tmp_path / "hdris"
+    hdri_root.mkdir()
     # This test covers shell argument serialization, not Python data validation. Keep
     # it independent of the active Conda installation and its compiled dependencies.
     fake_bin = tmp_path / "bin"
@@ -442,6 +748,18 @@ def test_slurm_dry_run_propagates_end2end_selector_and_options(tmp_path):
             "0.002",
             "--end2end-eval-lights",
             "7",
+            "--end2end-profiles",
+            "hdri,mix",
+            "--end2end-hdri-root",
+            str(hdri_root),
+            "--end2end-hdri-count",
+            "5",
+            "--end2end-eval-hdris",
+            "2",
+            "--end2end-hdri-rotations",
+            "6",
+            "--end2end-primary-profile",
+            "mix",
             "--max-lights",
             "4",
             "--min-lights",
@@ -469,4 +787,11 @@ def test_slurm_dry_run_propagates_end2end_selector_and_options(tmp_path):
     assert "--end2end-steps 17" in result.stdout
     assert "--end2end-learning-rate 0.002" in result.stdout
     assert "--end2end-eval-lights 7" in result.stdout
+    command = shlex.split(result.stdout.partition(":")[2])
+    assert command[command.index("--end2end-profiles") + 1] == "hdri,mix"
+    assert f"--end2end-hdri-root {hdri_root}" in result.stdout
+    assert "--end2end-hdri-count 5" in result.stdout
+    assert "--end2end-eval-hdris 2" in result.stdout
+    assert "--end2end-hdri-rotations 6" in result.stdout
+    assert "--end2end-primary-profile mix" in result.stdout
     assert "--gpus-per-node=1" in result.stdout

@@ -22,7 +22,8 @@ object_name/camXX/normal.exr
 object_name/camXX/specular.exr
 ```
 
-Processed material maps are written separately so raw data remains unchanged:
+Processed material maps are written separately so raw data remains unchanged.
+The default Ward acquisition keeps the legacy `brdf/` layout:
 
 ```text
 outputs/material_acquisition/object_name/camXX/brdf/albedo.png
@@ -31,35 +32,91 @@ outputs/material_acquisition/object_name/camXX/brdf/roughness.png
 outputs/material_acquisition/object_name/camXX/brdf/specular.png
 ```
 
-This is the default Ward acquisition root. With
-`--material-acquisition end2end`, the same object/camera layout and common map
-names are written under `outputs/material_acquisition_end2end/`, alongside the
-additional `baseColor`, `metallic`, `specularTint`, `subsurface`,
-`anisotropic`, `clearcoat`, and `clearcoatGloss` maps. The folder
-also records `disney_brdf.pt` and `acquisition.json`. An explicit
-`--material-root` overrides either mode-specific root.
+Its root also contains `run.json`, which records settings, processed cameras,
+timestamps, and completion status.
 
-With the default `--end2end-eval-lights 16`, a full 346-light camera is split
-deterministically into 330 fit lights and 16 held-out relighting lights. The
-held-out predictions use the original capture frame IDs:
+With `--material-acquisition end2end`, each requested lighting profile has its
+own clean subtree instead of sharing a `brdf/` directory:
 
 ```text
-outputs/material_acquisition_end2end/object_name/camXX/brdf/
-  relighting_metrics.csv
-  relighting_summary.json
-  relighting_contact_sheet.png
-  relighting/000002/gt.png
-  relighting/000002/pred.png
-  relighting/000002/error.png
-  relighting/000002/comparison.png
+outputs/material_acquisition_end2end/
+  run.json
+  object_name/camXX/
+    manifest.json
+    lighting/
+      conditions.json
+      weights.npz
+      previews/<condition_id>.png
+    report/
+      overview.png
+      metrics.csv
+      summary.json
+    olat/simplified-multilayer/
+      acquisition.json
+      material/
+        disney_brdf.pt
+        maps/
+          albedo.png
+          baseColor.png
+          normal.png
+          specular.png
+          roughness.png
+          metallic.png
+          specularTint.png
+          subsurface.png
+          anisotropic.png
+          clearcoat.png
+          clearcoatGloss.png
+      evaluation/
+        metrics.csv
+        summary.json
+        olat/
+          metrics.csv
+          summary.json
+          contact_sheet.png
+          cases/<frame_id>/{gt,pred,error,comparison}.png
+        hdri/
+          metrics.csv
+          summary.json
+          contact_sheet.png
+          cases/<condition_id>/{lighting,gt,pred,error,comparison}.png
+    hdri/simplified-multilayer/...
+    mix/simplified-multilayer/...
 ```
 
-Only frames selected for the deterministic holdout are present below
-`relighting/`; `relighting_summary.json` records their frame IDs, calibrated
-light indices, normalization, and aggregate metrics. The images are clipped
-LDR visualizations. Prediction and target are independently scale-normalized,
-and metrics are foreground-masked, so these files do not preserve or evaluate
-absolute radiometric HDR scale.
+The default `--end2end-profiles olat,hdri,mix` creates all three profile
+subtrees as independent fits. A subset creates only the requested directories.
+The camera `manifest.json` lists the available profiles and contains
+`primary_material_dir`, for example
+`olat/simplified-multilayer/material/maps`. The RGB2X loaders resolve this field
+first, so `--end2end-primary-profile` selects the maps exposed downstream
+without copying or flattening files. Legacy roots without a manifest still use
+the `brdf/`, `material_properties/`, and camera-root fallbacks.
+
+`lighting/conditions.json` records the ranked natural HDRI identities, strict
+fit/held-out identity split, rotations, generated `w/r/g/b` calibration
+conditions, source hashes, and preview paths. `weights.npz` contains their
+spherical-Voronoi weights on the calibrated ICT light basis. HDRI targets are
+weighted combinations of the measured polarized OLAT images, not independently
+captured environment-lit frames.
+
+With the defaults, a full 346-light camera has 330 OLAT fit measurements and 16
+strictly held-out measurements. It also has 100 natural HDRI fit identities and
+four held-out identities, each with four rotations; all rotations of one HDRI
+identity remain in the same split. Every requested profile is evaluated on the
+same OLAT and HDRI suites. OLAT case folders retain original capture frame IDs,
+while HDRI case folders use the condition IDs recorded in
+`lighting/conditions.json`.
+
+`report/overview.png` aligns one representative OLAT and HDRI case across the
+profile rows and shows selected material maps and aggregate metrics.
+`report/summary.json` and `report/metrics.csv` are its machine-readable
+companions. The images and metrics use independent foreground 99.5th-percentile
+normalization and clipping. They do not preserve absolute radiometric HDR scale
+and should not be treated as evidence of numerical parity with another
+dataset.
+
+An explicit `--material-root` overrides either mode-specific output root.
 
 The RGB2X training loader pairs the processed albedo, normal, and specular maps
 with static and calibrated OLAT observations. Inverse training predicts PBR or

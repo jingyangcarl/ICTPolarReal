@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
@@ -40,6 +41,41 @@ def iter_camera_samples(data_root: str | Path) -> Iterator[CameraSample]:
             continue
         for camera_dir in sorted(object_dir.glob("cam[0-9][0-9]")):
             yield CameraSample(object_dir.name, camera_dir.name, camera_dir)
+
+
+def material_map_roots(
+    material_root: str | Path,
+    object_name: str,
+    camera: str,
+) -> list[Path]:
+    """Return canonical then legacy material-map search roots for one camera."""
+    camera_root = Path(material_root) / object_name / camera
+    roots: list[Path] = []
+    manifest_path = camera_root / "manifest.json"
+    if manifest_path.is_file():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Could not read material manifest {manifest_path}: {exc}") from exc
+        relative = manifest.get("primary_material_dir")
+        if not isinstance(relative, str) or not relative.strip():
+            raise ValueError(
+                f"Material manifest {manifest_path} is missing primary_material_dir"
+            )
+        relative_path = Path(relative)
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            raise ValueError(
+                f"Material manifest {manifest_path} has unsafe primary_material_dir: {relative}"
+            )
+        roots.append(camera_root / relative_path)
+    roots.extend(
+        [
+            camera_root / "brdf",
+            camera_root / "material_properties",
+            camera_root,
+        ]
+    )
+    return roots
 
 
 class ICTPolarRealDataset(Dataset):
@@ -152,11 +188,11 @@ class ICTPolarRealDataset(Dataset):
         roots = [sample.camera_dir]
         if self.material_root is not None:
             roots.extend(
-                [
-                    self.material_root / sample.object_name / sample.camera / "brdf",
-                    self.material_root / sample.object_name / sample.camera / "material_properties",
-                    self.material_root / sample.object_name / sample.camera,
-                ]
+                material_map_roots(
+                    self.material_root,
+                    sample.object_name,
+                    sample.camera,
+                )
             )
         for root in roots:
             for stem in names:

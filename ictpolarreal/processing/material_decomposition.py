@@ -116,6 +116,12 @@ def decompose_camera_sample(
     end2end_steps: int = 33000,
     end2end_learning_rate: float = 1e-3,
     end2end_eval_lights: int = 16,
+    end2end_profiles: str = "olat,hdri,mix",
+    end2end_hdri_root: str | Path | None = None,
+    end2end_hdri_count: int = 100,
+    end2end_eval_hdris: int = 4,
+    end2end_hdri_rotations: int = 4,
+    end2end_primary_profile: str = "olat",
 ) -> int:
     if material_acquisition not in {"default", "end2end"}:
         raise ValueError("material_acquisition must be default or end2end")
@@ -187,7 +193,7 @@ def decompose_camera_sample(
     else:
         from ictpolarreal.processing.end2end_acquisition import acquire_disney_material
 
-        material_dir = Path(out_root) / sample.object_name / sample.camera / "brdf"
+        material_dir = Path(out_root) / sample.object_name / sample.camera
         acquire_disney_material(
             cross_stack,
             parallel_stack,
@@ -204,6 +210,12 @@ def decompose_camera_sample(
             steps=end2end_steps,
             learning_rate=end2end_learning_rate,
             eval_lights=end2end_eval_lights,
+            lighting_profiles=end2end_profiles,
+            hdri_root=end2end_hdri_root,
+            hdri_count=end2end_hdri_count,
+            eval_hdris=end2end_eval_hdris,
+            hdri_rotations=end2end_hdri_rotations,
+            primary_profile=end2end_primary_profile,
         )
     return len(cross_images)
 

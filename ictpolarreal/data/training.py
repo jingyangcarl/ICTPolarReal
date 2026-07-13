@@ -5,7 +5,11 @@ from pathlib import Path
 
 import numpy as np
 
-from ictpolarreal.data.dataset import CameraSample, iter_camera_samples
+from ictpolarreal.data.dataset import (
+    CameraSample,
+    iter_camera_samples,
+    material_map_roots,
+)
 from ictpolarreal.data.olat import CALIBRATED_LIGHT_COUNT, LightFrame, paired_light_frames, select_light_pairs
 from ictpolarreal.processing.material_decomposition import load_light_directions
 from ictpolarreal.utils.io import find_first_existing, read_image
@@ -202,11 +206,14 @@ class ICTPolarRealTrainingDataset(Dataset):
             "normal": ("normal", "diffuse_normal", "normal_w2c"),
             "specular": ("specular", "specular_albedo"),
         }[name]
-        roots = (
-            self.material_root / camera.object_name / camera.camera / "brdf",
-            self.material_root / camera.object_name / camera.camera,
+        roots = [
+            *material_map_roots(
+                self.material_root,
+                camera.object_name,
+                camera.camera,
+            ),
             camera.camera_dir,
-        )
+        ]
         for root in roots:
             for stem in aliases:
                 path = find_first_existing(root, stem)

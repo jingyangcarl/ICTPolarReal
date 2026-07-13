@@ -74,9 +74,11 @@ directions. `run.sh process` also accepts normalized 346-frame sequences.
 
 Default outputs are written to `outputs/`:
 
-- `outputs/material_acquisition/`: decomposed material PNG maps under `<object>/<camera>/brdf/`.
-- `outputs/material_acquisition_end2end/`: Disney BRDF maps and held-out OLAT
-  relighting evaluation when `--material-acquisition end2end` is selected.
+- `outputs/material_acquisition/`: the default Ward material maps under
+  `<object>/<camera>/brdf/`.
+- `outputs/material_acquisition_end2end/`: independent OLAT-, HDRI-, and
+  mixed-lighting Disney fits, their common evaluation suites, and a per-camera
+  comparison report. `run.json` records the complete acquisition run.
 - `outputs/train/inverse/`: prompt-conditioned RGB-to-PBR/polarization LoRA and predictions.
 - `outputs/train/forward/gbuffer/`: PBR G-buffer-to-RGB LoRA and relighting predictions.
 - `outputs/train/forward/polarization/`: cross/parallel-to-RGB LoRA and relighting predictions.
@@ -92,7 +94,7 @@ running on a different machine or dataset:
 bash run.sh check-data
 bash run.sh process --data-root /path/to/data --output-root /path/to/out
 bash run.sh process --slurm --backend torch --device cuda --slurm-account ACCOUNT --slurm-partition PARTITION
-bash run.sh process --material-acquisition end2end --end2end-eval-lights 16 --slurm --backend torch --device cuda
+bash run.sh process --material-acquisition end2end --end2end-hdri-root /path/to/hdr_maps_1k --slurm --backend torch --device cuda
 bash run.sh train --data-root /path/to/data --train-stage inverse
 bash run.sh train --data-root /path/to/data --train-stage forward --forward-mode gbuffer
 bash run.sh evaluate --data-root /path/to/data --pred-root /path/to/predictions
@@ -103,17 +105,30 @@ Useful options:
 - `--data-root PATH`: dataset location. Default: `data/sample`.
 - `--output-root PATH`: output location. Default: `outputs`.
 - `--material-acquisition default|end2end`: keep the current polarized Ward
-  decomposition (`default`) or use Imaginaire's direct-OLAT differentiable
-  Disney BRDF fit (`end2end`).
+  decomposition (`default`, and the implicit choice when omitted) or run the
+  differentiable Disney BRDF acquisition (`end2end`).
 - `--imaginaire-root PATH`: path to the external Imaginaire checkout used by
   `end2end`. The default is the sibling folder `../imaginaire`.
 - `--end2end-steps N` and `--end2end-learning-rate FLOAT`: control the Disney
   optimization. Defaults are 33,000 steps and a learning rate of `1e-3`.
+- `--end2end-profiles LIST`: choose independent `olat`, `hdri`, and `mix` fits.
+  The default is `olat,hdri,mix`; `all` is an alias, and a subset such as
+  `--end2end-profiles olat` avoids fitting the other profiles.
+- `--end2end-primary-profile olat|hdri|mix`: select which requested profile is
+  exposed to downstream loaders by each camera's `manifest.json`. The default
+  is `olat`.
 - `--end2end-eval-lights N`: reserve up to `N` calibrated OLATs from fitting and
   use them only for end-to-end relighting evaluation. The default is 16, so a
   full 346-light capture fits 330 lights and evaluates the other 16. At least
   four fit lights are always retained; `0` reports fitted-light reconstruction
   instead of a held-out result.
+- `--end2end-hdri-root PATH`: folder of HDR/EXR environment maps. It must be
+  visible on the worker; the repository default points at the Maxine cluster
+  HDRI collection.
+- `--end2end-hdri-count N`, `--end2end-eval-hdris N`, and
+  `--end2end-hdri-rotations N`: control the natural HDRI fit identities,
+  held-out identities, and yaw rotations. Defaults are 100, 4, and 4. Generated
+  white/red/green/blue calibration environments are added to the fit suite.
 - `--torch-variant cpu --device cpu`: use CPU for diagnostics; diffusion training is slow without CUDA.
 - `--max-lights N`: use a sphere-wide subset for a quick diagnostic; the default
   346-light fit is recommended for material quality.
@@ -121,6 +136,10 @@ Useful options:
 - `--slurm`: submit material acquisition to Slurm instead of running it in the
   current shell. Resource options include `--slurm-account`, `--slurm-partition`,
   `--slurm-time`, `--slurm-cpus`, `--slurm-mem`, and `--slurm-gpus`.
+- HDRI/mix fitting preflights the allocated device and requires at least a
+  40 GiB GPU. The default three-profile run performs 99,000 total updates; if a
+  queue time limit interrupts it, submit the identical command again to skip
+  completed profiles and resume the active checkpoint.
 - `--slurm-dry-run`: validate data and print the fully escaped `sbatch` command
   without submitting a job. Logs default to `outputs/slurm/`.
 - `--train-stage inverse|forward|both`: choose the training stage.
@@ -137,23 +156,34 @@ Useful options:
 
 The end-to-end mode does not vendor Imaginaire. Its source code, license, and
 runtime dependencies remain external to this repository. Obtain an authorized
-Imaginaire checkout, comply with its license, and install its required Python
-dependencies (including PyTorch, torchvision, SciPy, NumPy, and Pillow) in the
-same environment used by the Slurm worker. The modes are separated
-automatically for comparison: `default` writes to
-`outputs/material_acquisition`, while `end2end` writes to
+Imaginaire checkout, comply with its license, and install PyTorch, torchvision,
+SciPy, NumPy, and Pillow in the environment used by the Slurm worker. The two
+acquisition modes write to separate roots automatically: `default` uses
+`outputs/material_acquisition`, while `end2end` uses
 `outputs/material_acquisition_end2end`. An explicit `--material-root` overrides
-these defaults when a different comparison layout is needed.
+the selected root.
 
-For a full 346-light end-to-end run, the deterministic split is strictly 330
-fit lights and 16 held-out lights. Each camera's `brdf/` folder includes
-per-light ground truth, Disney prediction, absolute-error and comparison PNGs
-under `relighting/`, plus `relighting_metrics.csv`,
-`relighting_summary.json`, and `relighting_contact_sheet.png`. The CSV reports
-foreground-masked MSE, MAE, PSNR, and `ssim_global` for the held-out lights.
-These values compare independently 99.5th-percentile-normalized, clipped LDR
-images. They are scale-normalized appearance metrics, not radiometric HDR
-accuracy measurements.
+End-to-end HDRI targets are not separately photographed environment-light
+captures. They are synthesized from the measured ICTPolarReal polarized OLAT
+stack by projecting each environment map onto the calibrated light basis with
+spherical-Voronoi solid-angle weights. Fit and evaluation Voronoi cells are
+recomputed on their respective light bases, keeping both composites
+full-sphere while preserving the strict split. Natural environment maps are ranked by
+sampled-light variance. The requested top set is divided by HDRI identity, so
+all rotations of each held-out identity stay out of fitting; `w/r/g/b`
+calibration environments and their rotations are fit-only conditions.
+
+The `olat`, `hdri`, and `mix` models are separate fits. Mixed fitting alternates
+one block of HDRI rotations with one block of OLAT conditions. Every fitted
+profile is then evaluated on exactly the same OLAT and HDRI suites, including
+the deterministic OLAT holdout and held-out natural HDRI identities. A camera
+`manifest.json` records all profiles and `primary_material_dir`; downstream
+training follows that field instead of assuming a `brdf/` directory. See
+`report/overview.png` for the aligned profile comparison and `run.json` at the
+material root for run status and settings. The reported foreground-masked MSE,
+MAE, PSNR, and `ssim_global` compare independently normalized, clipped LDR
+images. They support within-run evaluation and do not establish numerical
+parity with another dataset or pipeline.
 
 Objaverse-style evaluation uses `configs/eval_objaverse_samples.json`; see
 `samples/objaverse/README.md` for the expected sample layout.

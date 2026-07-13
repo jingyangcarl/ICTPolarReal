@@ -2,7 +2,8 @@
 set -euo pipefail
 export OPENCV_IO_ENABLE_OPENEXR="${OPENCV_IO_ENABLE_OPENEXR:-1}"
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INVOKE_ROOT="$(pwd -P)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
 SAMPLE_URL="https://drive.google.com/drive/u/1/folders/1J2lfWe8rO1ZXpbeVW68u2RSqOocCs-S6"
 ENV_NAME="${ENV_NAME:-ictpolarreal}"
@@ -23,6 +24,12 @@ IMAGINAIRE_ROOT="${IMAGINAIRE_ROOT:-${REPO_ROOT}/../imaginaire}"
 END2END_STEPS="${END2END_STEPS:-33000}"
 END2END_LEARNING_RATE="${END2END_LEARNING_RATE:-1e-3}"
 END2END_EVAL_LIGHTS="${END2END_EVAL_LIGHTS:-16}"
+END2END_PROFILES="${END2END_PROFILES:-olat,hdri,mix}"
+END2END_HDRI_ROOT="${END2END_HDRI_ROOT:-/lustre/fsw/portfolios/maxine/projects/maxine_video/VideoRelighting/datasets/HDR/hdr_maps_1k}"
+END2END_HDRI_COUNT="${END2END_HDRI_COUNT:-100}"
+END2END_EVAL_HDRIS="${END2END_EVAL_HDRIS:-4}"
+END2END_HDRI_ROTATIONS="${END2END_HDRI_ROTATIONS:-4}"
+END2END_PRIMARY_PROFILE="${END2END_PRIMARY_PROFILE:-olat}"
 TRAIN_STAGE="${TRAIN_STAGE:-both}"
 INVERSE_WORKFLOW="${INVERSE_WORKFLOW:-both}"
 FORWARD_MODE="${FORWARD_MODE:-both}"
@@ -107,6 +114,14 @@ Options:
   --end2end-learning-rate FLOAT
                             Disney BRDF learning rate. Default: ${END2END_LEARNING_RATE}
   --end2end-eval-lights N  OLATs held out for relighting evaluation. Default: ${END2END_EVAL_LIGHTS}
+  --end2end-profiles LIST   Independent olat,hdri,mix fits; comma-separated or all. Default: ${END2END_PROFILES}
+  --end2end-hdri-root PATH HDR/EXR maps used to synthesize environment targets. Default: ${END2END_HDRI_ROOT}
+  --end2end-hdri-count N   HDRIs used for fitting before rotations. Default: ${END2END_HDRI_COUNT}
+  --end2end-eval-hdris N   HDRI identities held out from fitting. Default: ${END2END_EVAL_HDRIS}
+  --end2end-hdri-rotations N
+                            Yaw rotations per HDRI. Default: ${END2END_HDRI_ROTATIONS}
+  --end2end-primary-profile PROFILE
+                            olat, hdri, or mix for downstream material loading. Default: ${END2END_PRIMARY_PROFILE}
   --env-name NAME           Conda/micromamba env name. Default: ${ENV_NAME}
   --train-stage STAGE       inverse, forward, or both. Default: ${TRAIN_STAGE}
   --inverse-workflow MODE   pbr, polarization, or both. Default: ${INVERSE_WORKFLOW}
@@ -184,6 +199,12 @@ parse_args() {
       --end2end-steps) END2END_STEPS="$2"; shift 2 ;;
       --end2end-learning-rate) END2END_LEARNING_RATE="$2"; shift 2 ;;
       --end2end-eval-lights) END2END_EVAL_LIGHTS="$2"; shift 2 ;;
+      --end2end-profiles) END2END_PROFILES="$2"; shift 2 ;;
+      --end2end-hdri-root) END2END_HDRI_ROOT="$2"; shift 2 ;;
+      --end2end-hdri-count) END2END_HDRI_COUNT="$2"; shift 2 ;;
+      --end2end-eval-hdris) END2END_EVAL_HDRIS="$2"; shift 2 ;;
+      --end2end-hdri-rotations) END2END_HDRI_ROTATIONS="$2"; shift 2 ;;
+      --end2end-primary-profile) END2END_PRIMARY_PROFILE="$2"; shift 2 ;;
       --env-name) ENV_NAME="$2"; shift 2 ;;
       --train-stage) TRAIN_STAGE="$2"; shift 2 ;;
       --inverse-workflow) INVERSE_WORKFLOW="$2"; shift 2 ;;
@@ -251,15 +272,59 @@ parse_args() {
     echo "--end2end-eval-lights must be a non-negative integer; got: ${END2END_EVAL_LIGHTS}" >&2
     exit 2
   fi
+  if ! [[ "${END2END_STEPS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "--end2end-steps must be a positive integer; got: ${END2END_STEPS}" >&2
+    exit 2
+  fi
+  if ! [[ "${END2END_HDRI_COUNT}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "--end2end-hdri-count must be a positive integer; got: ${END2END_HDRI_COUNT}" >&2
+    exit 2
+  fi
+  if ! [[ "${END2END_EVAL_HDRIS}" =~ ^[0-9]+$ ]]; then
+    echo "--end2end-eval-hdris must be a non-negative integer; got: ${END2END_EVAL_HDRIS}" >&2
+    exit 2
+  fi
+  if ! [[ "${END2END_HDRI_ROTATIONS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "--end2end-hdri-rotations must be a positive integer; got: ${END2END_HDRI_ROTATIONS}" >&2
+    exit 2
+  fi
+  case "${END2END_PRIMARY_PROFILE}" in
+    olat|hdri|mix) ;;
+    *) echo "Unknown --end2end-primary-profile: ${END2END_PRIMARY_PROFILE}; expected olat, hdri, or mix." >&2; exit 2 ;;
+  esac
+  if [[ ! "${END2END_PROFILES}" =~ ^(all|(olat|hdri|mix)(,(olat|hdri|mix))*)$ ]]; then
+    echo "--end2end-profiles must be all or a comma-separated subset of olat,hdri,mix; got: ${END2END_PROFILES}" >&2
+    exit 2
+  fi
+  if [[ "${END2END_PROFILES}" != "all" && ",${END2END_PROFILES}," != *",${END2END_PRIMARY_PROFILE},"* ]]; then
+    echo "--end2end-primary-profile ${END2END_PRIMARY_PROFILE} must be included in --end2end-profiles ${END2END_PROFILES}." >&2
+    exit 2
+  fi
   if [[ "${MATERIAL_ACQUISITION}" == "end2end" ]]; then
     if [[ ! -d "${IMAGINAIRE_ROOT}" ]]; then
       echo "Missing --imaginaire-root directory: ${IMAGINAIRE_ROOT}" >&2
       exit 2
     fi
     IMAGINAIRE_ROOT="$(cd "${IMAGINAIRE_ROOT}" && pwd -P)"
+    if [[ ! -d "${END2END_HDRI_ROOT}" ]]; then
+      echo "Missing --end2end-hdri-root directory: ${END2END_HDRI_ROOT}" >&2
+      exit 2
+    fi
+    END2END_HDRI_ROOT="$(cd "${END2END_HDRI_ROOT}" && pwd -P)"
+  fi
+  if [[ "${DATA_ROOT}" != /* ]]; then
+    DATA_ROOT="${INVOKE_ROOT}/${DATA_ROOT}"
+  fi
+  if [[ "${OUTPUT_ROOT}" != /* ]]; then
+    OUTPUT_ROOT="${INVOKE_ROOT}/${OUTPUT_ROOT}"
+  fi
+  if [[ -n "${LIGHT_ROOT}" && "${LIGHT_ROOT}" != /* ]]; then
+    LIGHT_ROOT="${INVOKE_ROOT}/${LIGHT_ROOT}"
   fi
   if [[ "${PRED_ROOT_EXPLICIT}" != "1" ]]; then
     PRED_ROOT="${OUTPUT_ROOT}/train/inverse/predictions"
+  elif [[ "${PRED_ROOT}" != /* ]]; then
+    PRED_ROOT="${INVOKE_ROOT}/${PRED_ROOT}"
   fi
   if [[ "${MATERIAL_ROOT_EXPLICIT}" != "1" ]]; then
     if [[ "${MATERIAL_ACQUISITION}" == "end2end" ]]; then
@@ -269,10 +334,12 @@ parse_args() {
     fi
   fi
   if [[ "${MATERIAL_ROOT}" != /* ]]; then
-    MATERIAL_ROOT="${PWD}/${MATERIAL_ROOT}"
+    MATERIAL_ROOT="${INVOKE_ROOT}/${MATERIAL_ROOT}"
   fi
   if [[ -z "${SLURM_LOG_DIR}" ]]; then
     SLURM_LOG_DIR="${OUTPUT_ROOT}/slurm"
+  elif [[ "${SLURM_LOG_DIR}" != /* ]]; then
+    SLURM_LOG_DIR="${INVOKE_ROOT}/${SLURM_LOG_DIR}"
   fi
   if (( MAX_LIGHTS > MIN_DECOMP_LIGHTS )); then
     REQUIRED_DECOMP_LIGHTS="${MAX_LIGHTS}"
@@ -282,6 +349,10 @@ parse_args() {
 }
 
 activate_env() {
+  # Conda/micromamba activation hooks commonly probe optional variables. Keep
+  # the pipeline's strict nounset mode, but suspend it only while sourcing the
+  # environment hook and restore it before returning.
+  set +u
   if command -v conda >/dev/null 2>&1; then
     eval "$(conda shell.bash hook)"
     if conda env list | awk '{print $1}' | grep -Fxq "${ENV_NAME}"; then
@@ -296,10 +367,12 @@ activate_env() {
     # shellcheck disable=SC1091
     source "${REPO_ROOT}/.venv/bin/activate"
   fi
+  set -u
 }
 
 setup_env() {
   cd "${REPO_ROOT}"
+  set +u
   if command -v conda >/dev/null 2>&1; then
     eval "$(conda shell.bash hook)"
     if ! conda env list | awk '{print $1}' | grep -Fxq "${ENV_NAME}"; then
@@ -317,6 +390,7 @@ setup_env() {
     # shellcheck disable=SC1091
     source "${REPO_ROOT}/.venv/bin/activate"
   fi
+  set -u
   python -m pip install --upgrade pip
   python -m pip install -e ".[dev]" gdown
   install_torch
@@ -599,6 +673,12 @@ process_materials() {
     --end2end-steps "${END2END_STEPS}" \
     --end2end-learning-rate "${END2END_LEARNING_RATE}" \
     --end2end-eval-lights "${END2END_EVAL_LIGHTS}" \
+    --end2end-profiles "${END2END_PROFILES}" \
+    --end2end-hdri-root "${END2END_HDRI_ROOT}" \
+    --end2end-hdri-count "${END2END_HDRI_COUNT}" \
+    --end2end-eval-hdris "${END2END_EVAL_HDRIS}" \
+    --end2end-hdri-rotations "${END2END_HDRI_ROTATIONS}" \
+    --end2end-primary-profile "${END2END_PRIMARY_PROFILE}" \
     --max-lights "${MAX_LIGHTS}" \
     --light-start "${LIGHT_START}" \
     --frame-layout "${FRAME_LAYOUT}" \
@@ -675,6 +755,12 @@ submit_process_slurm() {
     --end2end-steps "${END2END_STEPS}"
     --end2end-learning-rate "${END2END_LEARNING_RATE}"
     --end2end-eval-lights "${END2END_EVAL_LIGHTS}"
+    --end2end-profiles "${END2END_PROFILES}"
+    --end2end-hdri-root "${END2END_HDRI_ROOT}"
+    --end2end-hdri-count "${END2END_HDRI_COUNT}"
+    --end2end-eval-hdris "${END2END_EVAL_HDRIS}"
+    --end2end-hdri-rotations "${END2END_HDRI_ROTATIONS}"
+    --end2end-primary-profile "${END2END_PRIMARY_PROFILE}"
     --env-name "${ENV_NAME}"
     --max-lights "${MAX_LIGHTS}"
     --min-lights "${MIN_DECOMP_LIGHTS}"

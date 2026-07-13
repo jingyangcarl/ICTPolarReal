@@ -1,6 +1,9 @@
+import json
+
 import numpy as np
 import pytest
 
+from ictpolarreal.data.dataset import material_map_roots
 from ictpolarreal.data.training import ICTPolarRealTrainingDataset
 from ictpolarreal.train.contracts import build_forward_condition, inverse_target_names
 from ictpolarreal.train.diffusion import _write_training_evaluation
@@ -66,6 +69,60 @@ def test_rgb2x_training_dataset_contract(tmp_path):
     assert sample["mask"].shape == (1, 16, 32)
     assert sample["light_index"] == 0
     assert sample["frame_id"] == 0
+
+
+def test_training_dataset_resolves_primary_material_directory_from_manifest(tmp_path):
+    torch = pytest.importorskip("torch")
+    data_root, material_root = _training_fixture(tmp_path)
+    camera_root = material_root / "object" / "cam00"
+    profile_maps = (
+        camera_root / "mix" / "simplified-multilayer" / "material" / "maps"
+    )
+    profile_maps.mkdir(parents=True)
+    profile_albedo = np.full((8, 16, 3), 0.8, dtype=np.float32)
+    write_image(profile_maps / "albedo.png", profile_albedo)
+    write_image(
+        profile_maps / "normal.png",
+        np.dstack(
+            (
+                np.full((8, 16), 0.5),
+                np.full((8, 16), 0.5),
+                np.ones((8, 16)),
+            )
+        ),
+    )
+    write_image(
+        profile_maps / "specular.png",
+        np.full((8, 16, 1), 0.7, dtype=np.float32),
+    )
+    (camera_root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema": "ictpolarreal.material-profiles.v1",
+                "primary_profile": "mix",
+                "primary_material_dir": "mix/simplified-multilayer/material/maps",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    roots = material_map_roots(material_root, "object", "cam00")
+    assert roots[0] == profile_maps
+    assert camera_root / "brdf" in roots
+
+    dataset = ICTPolarRealTrainingDataset(
+        data_root,
+        material_root=material_root,
+        resolution=32,
+        max_lights=1,
+    )
+    camera = dataset.records[0].camera
+    assert dataset._material_path(camera, "albedo") == profile_maps / "albedo.png"
+    sample = dataset[0]
+    expected_albedo = round(0.8 * 255.0) / 255.0 * 2.0 - 1.0
+    assert torch.allclose(
+        sample["albedo"], torch.full_like(sample["albedo"], expected_albedo)
+    )
 
 
 def test_rgb2x_inverse_and_forward_contracts(tmp_path):
