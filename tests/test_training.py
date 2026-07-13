@@ -166,6 +166,13 @@ def test_training_evaluation_writes_method_history(tmp_path):
     ).exists()
     video_path = step_root / "videos" / "object__cam00__albedo__static.mp4"
     assert video_path.stat().st_size > 0
+    imageio_ffmpeg = pytest.importorskip("imageio_ffmpeg")
+    reader = imageio_ffmpeg.read_frames(str(video_path))
+    metadata = next(reader)
+    reader.close()
+    assert metadata["codec"] == "h264"
+    payload = video_path.read_bytes()
+    assert payload.index(b"moov") < payload.index(b"mdat")
     assert (step_root / "README.md").exists()
     summary = json.loads((step_root / "summary.json").read_text())
     assert summary["methods"]["rgb2x"]["label"] == "RGB2X"

@@ -1114,6 +1114,7 @@ def _write_comparison_videos(
     step_root: Path,
 ) -> dict[str, str]:
     import cv2
+    import imageio_ffmpeg
     import numpy as np
 
     grouped = {}
@@ -1140,23 +1141,28 @@ def _write_comparison_videos(
         output_path = step_root / "videos" / filename
         output_path.parent.mkdir(parents=True, exist_ok=True)
         fps = 6.0 if lighting_type == "olat" else 2.0
-        writer = cv2.VideoWriter(
+        writer = imageio_ffmpeg.write_frames(
             str(output_path),
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            fps,
             (width, height),
+            pix_fmt_in="bgr24",
+            pix_fmt_out="yuv420p",
+            fps=fps,
+            codec="libx264",
+            quality=8,
+            macro_block_size=2,
+            output_params=["-movflags", "+faststart"],
+            ffmpeg_log_level="error",
         )
-        if not writer.isOpened():
-            raise RuntimeError(f"Could not create evaluation video: {output_path}")
+        writer.send(None)
         try:
             for frame in frames:
                 canvas = np.full((height, width, 3), 255, dtype=np.uint8)
                 y = (height - frame.shape[0]) // 2
                 x = (width - frame.shape[1]) // 2
                 canvas[y : y + frame.shape[0], x : x + frame.shape[1]] = frame
-                writer.write(canvas)
+                writer.send(canvas)
         finally:
-            writer.release()
+            writer.close()
         if not output_path.is_file() or output_path.stat().st_size == 0:
             raise RuntimeError(f"Evaluation video is empty: {output_path}")
         group = f"{object_name}/{camera}/{task}/{lighting_type}"
