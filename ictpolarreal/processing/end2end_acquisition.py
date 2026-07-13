@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import csv
 import hashlib
 import importlib
 import json
 import math
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -12,10 +14,57 @@ from typing import Any
 import numpy as np
 
 from ictpolarreal.utils.io import write_image
+from ictpolarreal.utils.metrics import mae, mse, psnr, ssim_global
 
 
 PERCENTILE = 99.5
 MIN_LR_RATIO = 0.01
+MIN_TRAIN_LIGHTS = 4
+SCALAR_INIT_EPS = 1e-4
+DISNEY_PHYSICAL_DEFAULTS = {
+    "metallic": 0.0,
+    "subsurface": 0.0,
+    "specular": 0.5,
+    "roughness": 0.5,
+    "specularTint": 0.0,
+    "anisotropic": 0.0,
+    "sheen": 0.0,
+    "sheenTint": 0.5,
+    "clearcoat": 0.0,
+    "clearcoatGloss": 0.5,
+}
+
+
+def _array_sha256(array: np.ndarray) -> str:
+    values = np.ascontiguousarray(array)
+    return hashlib.sha256(memoryview(values).cast("B")).hexdigest()
+
+
+def _initialize_disney_scalars(torch, model) -> None:
+    """Initialize physical scalar defaults in the model's sigmoid-logit space."""
+    with torch.no_grad():
+        for name, physical_value in DISNEY_PHYSICAL_DEFAULTS.items():
+            value = min(max(float(physical_value), SCALAR_INIT_EPS), 1.0 - SCALAR_INIT_EPS)
+            unconstrained = math.log(value / (1.0 - value))
+            getattr(model, f"{name}_un").fill_(unconstrained)
+
+
+def split_light_indices(
+    n_lights: int, eval_lights: int
+) -> tuple[np.ndarray, np.ndarray]:
+    if n_lights < MIN_TRAIN_LIGHTS:
+        raise ValueError(
+            f"end2end acquisition needs at least {MIN_TRAIN_LIGHTS} calibrated lights"
+        )
+    if eval_lights < 0:
+        raise ValueError("end2end evaluation light count must be non-negative")
+    heldout_count = min(int(eval_lights), max(n_lights - MIN_TRAIN_LIGHTS, 0))
+    if heldout_count == 0:
+        return np.arange(n_lights, dtype=np.int64), np.zeros((0,), dtype=np.int64)
+    heldout = np.linspace(0, n_lights - 1, heldout_count, dtype=np.int64)
+    heldout = np.unique(heldout)
+    train = np.setdiff1d(np.arange(n_lights, dtype=np.int64), heldout)
+    return train, heldout
 
 
 def validate_end2end_runtime(imaginaire_root: str | Path, device: str = "cuda") -> None:
@@ -39,6 +88,8 @@ def acquire_disney_material(
     parallel_stack: np.ndarray,
     light_dirs: np.ndarray,
     *,
+    light_ids: np.ndarray | None = None,
+    frame_ids: np.ndarray | None = None,
     base_color: np.ndarray,
     normal: np.ndarray,
     mask: np.ndarray | None,
@@ -48,6 +99,7 @@ def acquire_disney_material(
     device: str = "cuda",
     steps: int = 33000,
     learning_rate: float = 1e-3,
+    eval_lights: int = 16,
 ) -> dict[str, Any]:
     """Fit Imaginaire's per-pixel Disney material model to ICTPolarReal OLATs.
 
@@ -62,6 +114,8 @@ def acquire_disney_material(
         raise ValueError("end2end steps must be a positive integer")
     if learning_rate <= 0:
         raise ValueError("end2end learning rate must be positive")
+    if eval_lights < 0:
+        raise ValueError("end2end evaluation light count must be non-negative")
     torch_device = torch.device(device)
     validate_end2end_runtime(imaginaire_root, device)
 
@@ -83,6 +137,28 @@ def acquire_disney_material(
         raise ValueError(f"light directions must be finite with shape ({n_lights},3)")
     if np.any(np.linalg.norm(light_dirs, axis=-1) <= 1e-8):
         raise ValueError("end2end acquisition received a zero-length light direction")
+    if light_ids is None:
+        light_ids = np.arange(n_lights, dtype=np.int64)
+    light_ids = np.asarray(light_ids, dtype=np.int64)
+    if light_ids.shape != (n_lights,) or len(np.unique(light_ids)) != n_lights:
+        raise ValueError(f"light ids must be unique with shape ({n_lights},)")
+    if frame_ids is None:
+        frame_ids = light_ids.copy()
+    frame_ids = np.asarray(frame_ids, dtype=np.int64)
+    if frame_ids.shape != (n_lights,) or len(np.unique(frame_ids)) != n_lights:
+        raise ValueError(f"frame ids must be unique with shape ({n_lights},)")
+    train_indices, heldout_indices = split_light_indices(n_lights, eval_lights)
+    evaluation_indices = (
+        heldout_indices
+        if len(heldout_indices)
+        else np.linspace(0, n_lights - 1, min(n_lights, 16), dtype=np.int64)
+    )
+    evaluation_split = "heldout_olat" if len(heldout_indices) else "fitted_olat"
+    print(
+        f"[end2end] light split: {len(train_indices)} fit, "
+        f"{len(heldout_indices)} held out for relighting evaluation",
+        flush=True,
+    )
     foreground = _foreground_mask(mask, height, width)
     if not np.any(foreground > 0.5):
         raise ValueError("end2end acquisition requires a non-empty foreground mask")
@@ -91,8 +167,16 @@ def acquire_disney_material(
     base_color = _normalize_base_color(base_color, foreground)
     normal = _normalize_vectors(normal)
     view_dirs = _normalize_vectors(view_dirs)
+    input_hashes = {
+        "normalized_targets_sha256": _array_sha256(target_stack),
+        "foreground_sha256": _array_sha256(foreground),
+        "base_color_sha256": _array_sha256(base_color),
+        "normal_sha256": _array_sha256(normal),
+        "view_directions_sha256": _array_sha256(view_dirs),
+    }
 
     model = model_class(height, width, device=torch_device, cfg=param_config).to(torch_device)
+    _initialize_disney_scalars(torch, model)
     model.init_basecolor_from_image(
         torch.as_tensor(base_color, device=torch_device), require_grad=False
     )
@@ -123,33 +207,41 @@ def acquire_disney_material(
     checkpoint_path = out_dir / "end2end_checkpoint.pt"
     checkpoint_temp_path = out_dir / "end2end_checkpoint.tmp"
     signature = {
-        "schema": "ictpolarreal.end2end-checkpoint.v1",
+        "schema": "ictpolarreal.end2end-checkpoint.v4",
         "height": height,
         "width": width,
         "lights": n_lights,
-        "light_directions_sha256": hashlib.sha256(
-            np.ascontiguousarray(light_dirs).tobytes()
-        ).hexdigest(),
+        "light_directions_sha256": _array_sha256(light_dirs),
+        "light_ids_sha256": _array_sha256(light_ids),
+        "frame_ids_sha256": _array_sha256(frame_ids),
+        **input_hashes,
+        "train_indices": [int(index) for index in train_indices],
+        "heldout_indices": [int(index) for index in heldout_indices],
+        "scalar_initialization": {
+            "physical_values": DISNEY_PHYSICAL_DEFAULTS,
+            "boundary_epsilon": SCALAR_INIT_EPS,
+        },
         "steps": int(steps),
         "learning_rate": float(learning_rate),
         "disney_brdf_sha256": provenance["disney_brdf_sha256"],
     }
 
-    def render_loss(light_index: int):
-        target = target_chw[light_index].to(device=torch_device, non_blocking=True)
+    def render_prediction(light_index: int):
         prediction, _, _ = model(
             V=views,
             L_dir=lights[light_index : light_index + 1],
             L_rgb=light_rgb,
             mask=mask_hwc,
-            tone_map_method="linear",
+            return_hdr=True,
         )
+        return _normalize_render_foreground(prediction, mask_chw)
+
+    def render_loss(light_index: int):
+        target = target_chw[light_index].to(device=torch_device, non_blocking=True)
+        prediction = render_prediction(light_index)
         residual = (prediction - target) * mask_chw
         return residual.square().sum() / foreground_values
 
-    evaluation_indices = np.linspace(
-        0, n_lights - 1, min(n_lights, 16), dtype=np.int64
-    )
     start_step = 0
     initial_evaluation_losses = None
     if checkpoint_path.is_file():
@@ -198,7 +290,8 @@ def acquire_disney_material(
         )
         optimizer.param_groups[0]["lr"] = learning_rate * lr_scale
         optimizer.zero_grad(set_to_none=True)
-        loss = render_loss(step % n_lights)
+        light_index = int(train_indices[step % len(train_indices)])
+        loss = render_loss(light_index)
         if not bool(torch.isfinite(loss)):
             raise RuntimeError(f"Non-finite end2end loss at iteration {step + 1}")
         loss.backward()
@@ -207,7 +300,7 @@ def acquire_disney_material(
         if step == 0 or (step + 1) % log_every == 0 or step + 1 == steps:
             print(
                 f"[end2end] iteration {step + 1}/{steps} "
-                f"light={step % n_lights} loss={final_loss:.7f} "
+                f"light={light_ids[light_index]} loss={final_loss:.7f} "
                 f"lr={optimizer.param_groups[0]['lr']:.3e}",
                 flush=True,
             )
@@ -216,34 +309,61 @@ def acquire_disney_material(
 
     model.eval()
     with torch.no_grad():
-        final_evaluation_losses = [
-            float(render_loss(int(index)).cpu()) for index in evaluation_indices
-        ]
+        relighting_summary, final_evaluation_losses = _write_relighting_evaluation(
+            render_prediction,
+            target_chw,
+            evaluation_indices,
+            light_ids,
+            frame_ids,
+            foreground,
+            out_dir / "relighting",
+            split=evaluation_split,
+        )
         maps = _material_maps_numpy(model)
-    if start_step >= steps:
-        final_loss = float(final_evaluation_losses[-1])
+        if start_step >= steps:
+            final_loss = float(render_loss(int(train_indices[-1])).cpu())
 
     _write_material_maps(out_dir, maps, foreground)
     state = {name: value.detach().cpu() for name, value in model.state_dict().items()}
     torch.save(state, out_dir / "disney_brdf.pt")
 
     metrics = {
-        "schema": "ictpolarreal.end2end-disney.v1",
+        "schema": "ictpolarreal.end2end-disney.v3",
         "material_acquisition": "end2end",
         "model": "DisneyBRDFSimplifiedMultiLayer",
         "target": "2*cross + 2*max(parallel-cross, 0)",
         "target_percentile": PERCENTILE,
         "lights": int(n_lights),
+        "fit_lights": int(len(train_indices)),
+        "heldout_lights": int(len(heldout_indices)),
         "steps": int(steps),
         "resumed_from_step": int(start_step),
         "learning_rate": float(learning_rate),
         "initial_evaluation_mse": initial_loss,
         "final_iteration_mse": final_loss,
+        "evaluation_split": evaluation_split,
         "evaluation_indices": [int(index) for index in evaluation_indices],
+        "evaluation_light_indices": [int(light_ids[index]) for index in evaluation_indices],
+        "evaluation_frame_ids": [int(frame_ids[index]) for index in evaluation_indices],
         "initial_evaluation_mse_by_light": initial_evaluation_losses,
         "final_evaluation_mse_by_light": final_evaluation_losses,
         "final_evaluation_mse": float(np.mean(final_evaluation_losses)),
         "evaluation_mse_improvement": initial_loss - float(np.mean(final_evaluation_losses)),
+        "light_split": {
+            "requested_heldout_lights": int(eval_lights),
+            "fit_stack_indices": [int(index) for index in train_indices],
+            "fit_light_indices": [int(light_ids[index]) for index in train_indices],
+            "fit_frame_ids": [int(frame_ids[index]) for index in train_indices],
+            "heldout_stack_indices": [int(index) for index in heldout_indices],
+            "heldout_light_indices": [int(light_ids[index]) for index in heldout_indices],
+            "heldout_frame_ids": [int(frame_ids[index]) for index in heldout_indices],
+        },
+        "input_hashes": input_hashes,
+        "scalar_initialization": {
+            "physical_values": DISNEY_PHYSICAL_DEFAULTS,
+            "boundary_epsilon": SCALAR_INIT_EPS,
+        },
+        "relighting": relighting_summary,
         "imaginaire": provenance,
     }
     (out_dir / "acquisition.json").write_text(
@@ -294,6 +414,17 @@ def _normalize_targets(targets: np.ndarray, foreground: np.ndarray) -> np.ndarra
     scales = np.quantile(flat, PERCENTILE / 100.0, axis=1).astype(np.float32)
     scales = np.maximum(scales, 1e-8)
     return np.clip(targets / scales[:, None, None, None], 0.0, 1.0).astype(np.float32)
+
+
+def _normalize_render_foreground(render, mask_chw):
+    """Apply the target's foreground-only p99.5 scale to a rendered HDR tensor."""
+    finite = render.nan_to_num(nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+    valid = mask_chw.expand_as(render) > 0.5
+    values = finite.masked_select(valid)
+    if values.numel() == 0:
+        raise ValueError("cannot normalize a render without finite foreground pixels")
+    scale = values.float().quantile(PERCENTILE / 100.0).to(render.dtype).clamp_min(1e-8)
+    return (finite / scale).clamp_max(1.0) * mask_chw
 
 
 def _normalize_base_color(base_color: np.ndarray, foreground: np.ndarray) -> np.ndarray:
@@ -347,6 +478,139 @@ def _write_material_maps(
         if map_name == "normal":
             image = image * 0.5 + 0.5
         write_image(out_dir / f"{output_name}.png", np.clip(image, 0.0, 1.0) * foreground)
+
+
+def _write_relighting_evaluation(
+    render_prediction,
+    target_chw,
+    evaluation_indices: np.ndarray,
+    light_ids: np.ndarray,
+    frame_ids: np.ndarray,
+    foreground: np.ndarray,
+    relighting_dir: Path,
+    *,
+    split: str,
+) -> tuple[dict[str, Any], list[float]]:
+    if relighting_dir.exists():
+        shutil.rmtree(relighting_dir)
+    relighting_dir.mkdir(parents=True, exist_ok=True)
+    rows = []
+    comparisons = []
+    for stack_index in evaluation_indices:
+        stack_index = int(stack_index)
+        prediction = (
+            render_prediction(stack_index)
+            .detach()
+            .float()
+            .cpu()
+            .permute(1, 2, 0)
+            .numpy()
+        )
+        target = target_chw[stack_index].permute(1, 2, 0).numpy()
+        prediction = np.clip(prediction, 0.0, 1.0)
+        target = np.clip(target, 0.0, 1.0)
+        error = np.abs(prediction - target) * foreground
+
+        frame_id = int(frame_ids[stack_index])
+        light_id = int(light_ids[stack_index])
+        frame_dir = relighting_dir / f"{frame_id:06d}"
+        pred_path = frame_dir / "pred.png"
+        gt_path = frame_dir / "gt.png"
+        error_path = frame_dir / "error.png"
+        comparison_path = frame_dir / "comparison.png"
+        write_image(pred_path, prediction * foreground)
+        write_image(gt_path, target * foreground)
+        write_image(error_path, error)
+        comparison = np.concatenate(
+            [target * foreground, prediction * foreground, np.clip(error * 4.0, 0.0, 1.0)],
+            axis=1,
+        )
+        write_image(comparison_path, comparison)
+        comparisons.append((f"frame {frame_id:06d}", comparison))
+        rows.append(
+            {
+                "split": split,
+                "stack_index": stack_index,
+                "light_index": light_id,
+                "frame_id": frame_id,
+                "mse": mse(prediction, target, foreground),
+                "mae": mae(prediction, target, foreground),
+                "psnr": psnr(prediction, target, foreground),
+                "ssim_global": ssim_global(prediction, target, foreground),
+                "pred_path": str(pred_path),
+                "gt_path": str(gt_path),
+                "error_path": str(error_path),
+            }
+        )
+
+    metrics_path = relighting_dir.parent / "relighting_metrics.csv"
+    with metrics_path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+    metric_names = ("mse", "mae", "psnr", "ssim_global")
+    summary = {
+        "schema": "ictpolarreal.relighting-evaluation.v1",
+        "split": split,
+        "count": len(rows),
+        "normalization": "independent foreground p99.5 linear clipping",
+        "target": "2*cross + 2*max(parallel-cross, 0)",
+        "metrics": {
+            name: float(np.mean([row[name] for row in rows])) for name in metric_names
+        },
+        "frame_ids": [row["frame_id"] for row in rows],
+        "light_indices": [row["light_index"] for row in rows],
+        "metrics_csv": str(metrics_path),
+        "contact_sheet": str(relighting_dir.parent / "relighting_contact_sheet.png"),
+        "panels": ["ground_truth", "prediction", "absolute_error_x4"],
+    }
+    summary_path = relighting_dir.parent / "relighting_summary.json"
+    summary_path.write_text(
+        json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    _write_relighting_contact_sheet(
+        comparisons, relighting_dir.parent / "relighting_contact_sheet.png"
+    )
+    print(
+        f"[end2end] {split} relighting: count={len(rows)} "
+        f"PSNR={summary['metrics']['psnr']:.3f} "
+        f"SSIM-global={summary['metrics']['ssim_global']:.4f}",
+        flush=True,
+    )
+    return summary, [float(row["mse"]) for row in rows]
+
+
+def _write_relighting_contact_sheet(
+    comparisons: list[tuple[str, np.ndarray]], path: Path
+) -> None:
+    from PIL import Image, ImageDraw
+
+    thumbnails = []
+    for label, comparison in comparisons:
+        array = (np.clip(comparison, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+        image = Image.fromarray(array)
+        target_width = 720
+        target_height = max(1, round(image.height * target_width / image.width))
+        image = image.resize((target_width, target_height), Image.Resampling.BILINEAR)
+        header_height = 38
+        tile = Image.new("RGB", (target_width, target_height + header_height), color="black")
+        tile.paste(image, (0, header_height))
+        draw = ImageDraw.Draw(tile)
+        draw.text((6, 3), label, fill="white")
+        panel_width = target_width // 3
+        draw.text((6, 20), "ground truth", fill="white")
+        draw.text((panel_width + 6, 20), "prediction", fill="white")
+        draw.text((2 * panel_width + 6, 20), "absolute error x4", fill="white")
+        thumbnails.append(tile)
+
+    columns = 2
+    rows = math.ceil(len(thumbnails) / columns)
+    tile_width = max(image.width for image in thumbnails)
+    tile_height = max(image.height for image in thumbnails)
+    sheet = Image.new("RGB", (columns * tile_width, rows * tile_height), color="black")
+    for index, image in enumerate(thumbnails):
+        sheet.paste(image, ((index % columns) * tile_width, (index // columns) * tile_height))
+    sheet.save(path)
 
 
 def _imaginaire_provenance(root: Path, source_path: Path) -> dict[str, Any]:

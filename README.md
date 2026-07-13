@@ -75,8 +75,8 @@ directions. `run.sh process` also accepts normalized 346-frame sequences.
 Default outputs are written to `outputs/`:
 
 - `outputs/material_acquisition/`: decomposed material PNG maps under `<object>/<camera>/brdf/`.
-- `outputs/material_acquisition_end2end/`: Disney BRDF maps when
-  `--material-acquisition end2end` is selected.
+- `outputs/material_acquisition_end2end/`: Disney BRDF maps and held-out OLAT
+  relighting evaluation when `--material-acquisition end2end` is selected.
 - `outputs/train/inverse/`: prompt-conditioned RGB-to-PBR/polarization LoRA and predictions.
 - `outputs/train/forward/gbuffer/`: PBR G-buffer-to-RGB LoRA and relighting predictions.
 - `outputs/train/forward/polarization/`: cross/parallel-to-RGB LoRA and relighting predictions.
@@ -92,7 +92,7 @@ running on a different machine or dataset:
 bash run.sh check-data
 bash run.sh process --data-root /path/to/data --output-root /path/to/out
 bash run.sh process --slurm --backend torch --device cuda --slurm-account ACCOUNT --slurm-partition PARTITION
-bash run.sh process --material-acquisition end2end --slurm --backend torch --device cuda
+bash run.sh process --material-acquisition end2end --end2end-eval-lights 16 --slurm --backend torch --device cuda
 bash run.sh train --data-root /path/to/data --train-stage inverse
 bash run.sh train --data-root /path/to/data --train-stage forward --forward-mode gbuffer
 bash run.sh evaluate --data-root /path/to/data --pred-root /path/to/predictions
@@ -109,6 +109,11 @@ Useful options:
   `end2end`. The default is the sibling folder `../imaginaire`.
 - `--end2end-steps N` and `--end2end-learning-rate FLOAT`: control the Disney
   optimization. Defaults are 33,000 steps and a learning rate of `1e-3`.
+- `--end2end-eval-lights N`: reserve up to `N` calibrated OLATs from fitting and
+  use them only for end-to-end relighting evaluation. The default is 16, so a
+  full 346-light capture fits 330 lights and evaluates the other 16. At least
+  four fit lights are always retained; `0` reports fitted-light reconstruction
+  instead of a held-out result.
 - `--torch-variant cpu --device cpu`: use CPU for diagnostics; diffusion training is slow without CUDA.
 - `--max-lights N`: use a sphere-wide subset for a quick diagnostic; the default
   346-light fit is recommended for material quality.
@@ -139,6 +144,16 @@ automatically for comparison: `default` writes to
 `outputs/material_acquisition`, while `end2end` writes to
 `outputs/material_acquisition_end2end`. An explicit `--material-root` overrides
 these defaults when a different comparison layout is needed.
+
+For a full 346-light end-to-end run, the deterministic split is strictly 330
+fit lights and 16 held-out lights. Each camera's `brdf/` folder includes
+per-light ground truth, Disney prediction, absolute-error and comparison PNGs
+under `relighting/`, plus `relighting_metrics.csv`,
+`relighting_summary.json`, and `relighting_contact_sheet.png`. The CSV reports
+foreground-masked MSE, MAE, PSNR, and `ssim_global` for the held-out lights.
+These values compare independently 99.5th-percentile-normalized, clipped LDR
+images. They are scale-normalized appearance metrics, not radiometric HDR
+accuracy measurements.
 
 Objaverse-style evaluation uses `configs/eval_objaverse_samples.json`; see
 `samples/objaverse/README.md` for the expected sample layout.

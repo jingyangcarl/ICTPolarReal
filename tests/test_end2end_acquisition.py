@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import csv
 import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -10,8 +12,144 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from ictpolarreal.processing import end2end_acquisition, prepare_materials
+from ictpolarreal.data.dataset import CameraSample
+from ictpolarreal.processing import (
+    end2end_acquisition,
+    material_decomposition,
+    prepare_materials,
+)
 from ictpolarreal.utils.io import read_image
+
+
+def test_split_light_indices_reserves_sphere_spread_holdout():
+    train, heldout = end2end_acquisition.split_light_indices(346, 16)
+
+    np.testing.assert_array_equal(heldout, np.arange(0, 346, 23))
+    assert train.dtype == np.int64
+    assert heldout.dtype == np.int64
+    assert len(train) == 330
+    assert len(heldout) == 16
+    assert not np.intersect1d(train, heldout).size
+    np.testing.assert_array_equal(
+        np.sort(np.concatenate([train, heldout])), np.arange(346)
+    )
+
+
+def test_split_light_indices_keeps_minimum_training_set():
+    train, heldout = end2end_acquisition.split_light_indices(4, 16)
+
+    np.testing.assert_array_equal(train, np.arange(4))
+    assert heldout.dtype == np.int64
+    assert heldout.size == 0
+
+
+def test_end2end_initialization_and_optimizer_exclude_same_heldout_lights(
+    monkeypatch, tmp_path
+):
+    camera_dir = tmp_path / "object" / "cam00"
+    for kind in ("cross", "parallel"):
+        directory = camera_dir / kind
+        directory.mkdir(parents=True)
+        for frame_id in range(6):
+            (directory / f"{frame_id:06d}.png").touch()
+    sample = CameraSample("object", "cam00", camera_dir)
+
+    def fake_read(path, **_kwargs):
+        return np.full((2, 2, 3), int(Path(path).stem), dtype=np.float32)
+
+    def fake_lights(_root, indices, **_kwargs):
+        indices = np.asarray(indices, dtype=np.float32)
+        return np.stack([indices, np.zeros_like(indices), np.ones_like(indices)], axis=-1)
+
+    initialization = {}
+
+    def fake_decompose(cross, parallel, lights, **_kwargs):
+        initialization["cross"] = cross.copy()
+        initialization["parallel"] = parallel.copy()
+        initialization["lights"] = lights.copy()
+        image = np.zeros((2, 2, 3), dtype=np.float32)
+        image[..., 2] = 1.0
+        return SimpleNamespace(diffuse_albedo=image, diffuse_normal=image)
+
+    acquisition = {}
+
+    def fake_acquire(cross, parallel, lights, **kwargs):
+        acquisition["cross"] = cross.copy()
+        acquisition["parallel"] = parallel.copy()
+        acquisition["lights"] = lights.copy()
+        acquisition.update(kwargs)
+
+    monkeypatch.setattr(material_decomposition, "read_image", fake_read)
+    monkeypatch.setattr(material_decomposition, "load_light_directions", fake_lights)
+    monkeypatch.setattr(
+        material_decomposition,
+        "load_view_directions",
+        lambda _root, _sample, hw: np.broadcast_to(
+            np.asarray([0.0, 0.0, 1.0], dtype=np.float32), hw + (3,)
+        ).copy(),
+    )
+    monkeypatch.setattr(
+        material_decomposition, "decompose_polarized_olat", fake_decompose
+    )
+    monkeypatch.setattr(end2end_acquisition, "validate_end2end_runtime", lambda *_args: None)
+    monkeypatch.setattr(end2end_acquisition, "acquire_disney_material", fake_acquire)
+
+    used = material_decomposition.decompose_camera_sample(
+        sample,
+        data_root=tmp_path,
+        out_root=tmp_path / "out",
+        light_start=0,
+        max_lights=None,
+        light_root=None,
+        backend="torch",
+        device="cuda",
+        noise=0.0,
+        material_acquisition="end2end",
+        imaginaire_root=tmp_path,
+        end2end_steps=1,
+        end2end_eval_lights=2,
+    )
+
+    assert used == 6
+    np.testing.assert_array_equal(initialization["cross"][:, 0, 0, 0], [1, 2, 3, 4])
+    np.testing.assert_array_equal(initialization["parallel"][:, 0, 0, 0], [1, 2, 3, 4])
+    np.testing.assert_array_equal(acquisition["cross"][:, 0, 0, 0], np.arange(6))
+    np.testing.assert_array_equal(acquisition["light_ids"], np.arange(6))
+    np.testing.assert_array_equal(acquisition["frame_ids"], np.arange(6))
+    assert acquisition["eval_lights"] == 2
+
+
+def test_render_normalization_uses_foreground_and_masks_background():
+    torch = pytest.importorskip("torch")
+    render = torch.zeros((3, 2, 2), dtype=torch.float32)
+    render[:, 0, 0] = 2.0
+    render[:, 1, 1] = 1000.0
+    mask = torch.tensor([[[1.0, 0.0], [0.0, 0.0]]])
+
+    normalized = end2end_acquisition._normalize_render_foreground(render, mask)
+
+    assert torch.allclose(normalized[:, 0, 0], torch.ones(3))
+    assert torch.count_nonzero(normalized[:, 1, 1]) == 0
+
+
+def test_disney_scalar_defaults_are_initialized_in_physical_space():
+    torch = pytest.importorskip("torch")
+    model = SimpleNamespace(
+        **{
+            f"{name}_un": torch.nn.Parameter(torch.zeros(1))
+            for name in end2end_acquisition.DISNEY_PHYSICAL_DEFAULTS
+        }
+    )
+
+    end2end_acquisition._initialize_disney_scalars(torch, model)
+
+    for name, physical_value in end2end_acquisition.DISNEY_PHYSICAL_DEFAULTS.items():
+        expected = min(
+            max(physical_value, end2end_acquisition.SCALAR_INIT_EPS),
+            1.0 - end2end_acquisition.SCALAR_INIT_EPS,
+        )
+        actual = float(torch.sigmoid(getattr(model, f"{name}_un")).item())
+        assert actual == pytest.approx(expected, abs=1e-7)
 
 
 def test_read_image_scales_integer_images_but_preserves_float_hdr(monkeypatch):
@@ -100,6 +238,73 @@ def test_end2end_material_map_outputs_include_legacy_and_disney_aliases(
     np.testing.assert_allclose(written["normal.png"][:, 1], 0.0)
 
 
+def test_write_relighting_evaluation_writes_heldout_artifacts_and_metrics(tmp_path):
+    torch = pytest.importorskip("torch")
+    target_chw = torch.stack(
+        [torch.full((3, 2, 2), value) for value in (0.2, 0.3, 0.4)]
+    )
+    evaluation_indices = np.asarray([0, 2], dtype=np.int64)
+    light_ids = np.asarray([10, 11, 12], dtype=np.int64)
+    frame_ids = np.asarray([2, 3, 4], dtype=np.int64)
+    foreground = np.asarray(
+        [[[1.0], [1.0]], [[1.0], [0.0]]], dtype=np.float32
+    )
+    rendered = []
+
+    def fake_renderer(stack_index):
+        rendered.append(stack_index)
+        return target_chw[stack_index] + 0.1
+
+    relighting_dir = tmp_path / "brdf" / "relighting"
+    stale_dir = relighting_dir / "999999"
+    stale_dir.mkdir(parents=True)
+    (stale_dir / "stale.png").touch()
+    summary, losses = end2end_acquisition._write_relighting_evaluation(
+        fake_renderer,
+        target_chw,
+        evaluation_indices,
+        light_ids,
+        frame_ids,
+        foreground,
+        relighting_dir,
+        split="heldout_olat",
+    )
+
+    assert rendered == [0, 2]
+    assert not stale_dir.exists()
+    np.testing.assert_allclose(losses, [0.01, 0.01], rtol=1e-5)
+    assert summary["split"] == "heldout_olat"
+    assert summary["count"] == 2
+    assert summary["frame_ids"] == [2, 4]
+    assert summary["light_indices"] == [10, 12]
+    assert summary["metrics"]["mse"] == pytest.approx(0.01)
+    assert summary["metrics"]["mae"] == pytest.approx(0.1)
+    assert summary["metrics"]["psnr"] == pytest.approx(20.0)
+    assert 0.0 < summary["metrics"]["ssim_global"] < 1.0
+
+    for frame_id in (2, 4):
+        frame_dir = relighting_dir / f"{frame_id:06d}"
+        assert {path.name for path in frame_dir.iterdir()} == {
+            "pred.png",
+            "gt.png",
+            "error.png",
+            "comparison.png",
+        }
+    assert (tmp_path / "brdf" / "relighting_contact_sheet.png").is_file()
+
+    metrics_path = tmp_path / "brdf" / "relighting_metrics.csv"
+    summary_path = tmp_path / "brdf" / "relighting_summary.json"
+    assert metrics_path.is_file()
+    assert summary_path.is_file()
+    with metrics_path.open(newline="", encoding="utf-8") as stream:
+        rows = list(csv.DictReader(stream))
+    assert [row["split"] for row in rows] == ["heldout_olat", "heldout_olat"]
+    assert [int(row["frame_id"]) for row in rows] == [2, 4]
+    assert [float(row["mse"]) for row in rows] == pytest.approx([0.01, 0.01])
+    on_disk_summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert on_disk_summary == summary
+
+
 def test_end2end_provenance_records_git_state_and_exact_source_hash(
     monkeypatch, tmp_path
 ):
@@ -127,9 +332,15 @@ def test_end2end_provenance_records_git_state_and_exact_source_hash(
 
 
 @pytest.mark.parametrize(
-    ("extra_args", "expected_mode", "expected_backend", "expected_steps"),
+    (
+        "extra_args",
+        "expected_mode",
+        "expected_backend",
+        "expected_steps",
+        "expected_eval_lights",
+    ),
     [
-        ([], "default", "auto", 33000),
+        ([], "default", "auto", 33000, 16),
         (
             [
                 "--material-acquisition",
@@ -140,10 +351,13 @@ def test_end2end_provenance_records_git_state_and_exact_source_hash(
                 "17",
                 "--end2end-learning-rate",
                 "0.002",
+                "--end2end-eval-lights",
+                "7",
             ],
             "end2end",
             "torch",
             17,
+            7,
         ),
     ],
 )
@@ -154,6 +368,7 @@ def test_prepare_materials_dispatches_acquisition_mode(
     expected_mode,
     expected_backend,
     expected_steps,
+    expected_eval_lights,
 ):
     sample = object()
     calls = []
@@ -185,6 +400,7 @@ def test_prepare_materials_dispatches_acquisition_mode(
     assert calls[0]["material_acquisition"] == expected_mode
     assert calls[0]["backend"] == expected_backend
     assert calls[0]["end2end_steps"] == expected_steps
+    assert calls[0]["end2end_eval_lights"] == expected_eval_lights
     assert calls[0]["end2end_learning_rate"] == pytest.approx(
         0.002 if expected_mode == "end2end" else 1e-3
     )
@@ -224,6 +440,8 @@ def test_slurm_dry_run_propagates_end2end_selector_and_options(tmp_path):
             "17",
             "--end2end-learning-rate",
             "0.002",
+            "--end2end-eval-lights",
+            "7",
             "--max-lights",
             "4",
             "--min-lights",
@@ -250,4 +468,5 @@ def test_slurm_dry_run_propagates_end2end_selector_and_options(tmp_path):
     assert f"--imaginaire-root {imaginaire_root}" in result.stdout
     assert "--end2end-steps 17" in result.stdout
     assert "--end2end-learning-rate 0.002" in result.stdout
+    assert "--end2end-eval-lights 7" in result.stdout
     assert "--gpus-per-node=1" in result.stdout

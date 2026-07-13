@@ -39,6 +39,28 @@ additional `baseColor`, `metallic`, `specularTint`, `subsurface`,
 also records `disney_brdf.pt` and `acquisition.json`. An explicit
 `--material-root` overrides either mode-specific root.
 
+With the default `--end2end-eval-lights 16`, a full 346-light camera is split
+deterministically into 330 fit lights and 16 held-out relighting lights. The
+held-out predictions use the original capture frame IDs:
+
+```text
+outputs/material_acquisition_end2end/object_name/camXX/brdf/
+  relighting_metrics.csv
+  relighting_summary.json
+  relighting_contact_sheet.png
+  relighting/000002/gt.png
+  relighting/000002/pred.png
+  relighting/000002/error.png
+  relighting/000002/comparison.png
+```
+
+Only frames selected for the deterministic holdout are present below
+`relighting/`; `relighting_summary.json` records their frame IDs, calibrated
+light indices, normalization, and aggregate metrics. The images are clipped
+LDR visualizations. Prediction and target are independently scale-normalized,
+and metrics are foreground-masked, so these files do not preserve or evaluate
+absolute radiometric HDR scale.
+
 The RGB2X training loader pairs the processed albedo, normal, and specular maps
 with static and calibrated OLAT observations. Inverse training predicts PBR or
 cross/parallel targets from RGB. Forward training conditions on either the PBR

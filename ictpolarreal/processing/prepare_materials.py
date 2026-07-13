@@ -38,6 +38,12 @@ def main() -> None:
     )
     parser.add_argument("--end2end-steps", type=int, default=33000)
     parser.add_argument("--end2end-learning-rate", type=float, default=1e-3)
+    parser.add_argument(
+        "--end2end-eval-lights",
+        type=int,
+        default=16,
+        help="OLATs held out from end2end initialization/fitting for relighting evaluation.",
+    )
     args = parser.parse_args()
 
     out_root = Path(args.out_root)
@@ -64,6 +70,7 @@ def main() -> None:
             imaginaire_root=args.imaginaire_root,
             end2end_steps=args.end2end_steps,
             end2end_learning_rate=args.end2end_learning_rate,
+            end2end_eval_lights=args.end2end_eval_lights,
         )
         if used:
             processed += 1

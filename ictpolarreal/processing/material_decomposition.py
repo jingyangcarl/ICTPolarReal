@@ -115,6 +115,7 @@ def decompose_camera_sample(
     imaginaire_root: str | Path | None = None,
     end2end_steps: int = 33000,
     end2end_learning_rate: float = 1e-3,
+    end2end_eval_lights: int = 16,
 ) -> int:
     if material_acquisition not in {"default", "end2end"}:
         raise ValueError("material_acquisition must be default or end2end")
@@ -139,6 +140,7 @@ def decompose_camera_sample(
     cross_images = []
     parallel_images = []
     light_indices = []
+    frame_ids = []
     for cross_frame, parallel_frame in pairs:
         cross_path = sample.light_path("cross", cross_frame.frame_id)
         parallel_path = sample.light_path("parallel", parallel_frame.frame_id)
@@ -147,6 +149,7 @@ def decompose_camera_sample(
         cross_images.append(read_image(cross_path))
         parallel_images.append(read_image(parallel_path))
         light_indices.append(cross_frame.light_index)
+        frame_ids.append(cross_frame.frame_id)
 
     print(
         f"[process] {sample.object_name}/{sample.camera}: optimizing {len(cross_images)} "
@@ -158,10 +161,18 @@ def decompose_camera_sample(
     mask_path = sample.image_path("mask")
     mask = read_image(mask_path, channels=1) if mask_path else None
     view_dirs = load_view_directions(data_root, sample, cross_stack.shape[1:3])
+
+    initialization_indices = np.arange(len(cross_stack), dtype=np.int64)
+    if material_acquisition == "end2end":
+        from ictpolarreal.processing.end2end_acquisition import split_light_indices
+
+        initialization_indices, _ = split_light_indices(
+            len(cross_stack), end2end_eval_lights
+        )
     maps = decompose_polarized_olat(
-        cross_stack,
-        parallel_stack,
-        light_dirs,
+        cross_stack[initialization_indices],
+        parallel_stack[initialization_indices],
+        light_dirs[initialization_indices],
         mask=mask,
         view_dirs=view_dirs,
         backend=backend,
@@ -181,6 +192,8 @@ def decompose_camera_sample(
             cross_stack,
             parallel_stack,
             light_dirs,
+            light_ids=np.asarray(light_indices, dtype=np.int64),
+            frame_ids=np.asarray(frame_ids, dtype=np.int64),
             base_color=maps.diffuse_albedo,
             normal=maps.diffuse_normal,
             mask=mask,
@@ -190,6 +203,7 @@ def decompose_camera_sample(
             device=device,
             steps=end2end_steps,
             learning_rate=end2end_learning_rate,
+            eval_lights=end2end_eval_lights,
         )
     return len(cross_images)
 

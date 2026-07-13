@@ -22,6 +22,7 @@ fi
 IMAGINAIRE_ROOT="${IMAGINAIRE_ROOT:-${REPO_ROOT}/../imaginaire}"
 END2END_STEPS="${END2END_STEPS:-33000}"
 END2END_LEARNING_RATE="${END2END_LEARNING_RATE:-1e-3}"
+END2END_EVAL_LIGHTS="${END2END_EVAL_LIGHTS:-16}"
 TRAIN_STAGE="${TRAIN_STAGE:-both}"
 INVERSE_WORKFLOW="${INVERSE_WORKFLOW:-both}"
 FORWARD_MODE="${FORWARD_MODE:-both}"
@@ -105,6 +106,7 @@ Options:
   --end2end-steps N         Disney BRDF optimization steps. Default: ${END2END_STEPS}
   --end2end-learning-rate FLOAT
                             Disney BRDF learning rate. Default: ${END2END_LEARNING_RATE}
+  --end2end-eval-lights N  OLATs held out for relighting evaluation. Default: ${END2END_EVAL_LIGHTS}
   --env-name NAME           Conda/micromamba env name. Default: ${ENV_NAME}
   --train-stage STAGE       inverse, forward, or both. Default: ${TRAIN_STAGE}
   --inverse-workflow MODE   pbr, polarization, or both. Default: ${INVERSE_WORKFLOW}
@@ -181,6 +183,7 @@ parse_args() {
       --imaginaire-root) IMAGINAIRE_ROOT="$2"; shift 2 ;;
       --end2end-steps) END2END_STEPS="$2"; shift 2 ;;
       --end2end-learning-rate) END2END_LEARNING_RATE="$2"; shift 2 ;;
+      --end2end-eval-lights) END2END_EVAL_LIGHTS="$2"; shift 2 ;;
       --env-name) ENV_NAME="$2"; shift 2 ;;
       --train-stage) TRAIN_STAGE="$2"; shift 2 ;;
       --inverse-workflow) INVERSE_WORKFLOW="$2"; shift 2 ;;
@@ -244,6 +247,10 @@ parse_args() {
     default|end2end) ;;
     *) echo "Unknown --material-acquisition: ${MATERIAL_ACQUISITION}; expected default or end2end." >&2; exit 2 ;;
   esac
+  if ! [[ "${END2END_EVAL_LIGHTS}" =~ ^[0-9]+$ ]]; then
+    echo "--end2end-eval-lights must be a non-negative integer; got: ${END2END_EVAL_LIGHTS}" >&2
+    exit 2
+  fi
   if [[ "${MATERIAL_ACQUISITION}" == "end2end" ]]; then
     if [[ ! -d "${IMAGINAIRE_ROOT}" ]]; then
       echo "Missing --imaginaire-root directory: ${IMAGINAIRE_ROOT}" >&2
@@ -591,6 +598,7 @@ process_materials() {
     --imaginaire-root "${IMAGINAIRE_ROOT}" \
     --end2end-steps "${END2END_STEPS}" \
     --end2end-learning-rate "${END2END_LEARNING_RATE}" \
+    --end2end-eval-lights "${END2END_EVAL_LIGHTS}" \
     --max-lights "${MAX_LIGHTS}" \
     --light-start "${LIGHT_START}" \
     --frame-layout "${FRAME_LAYOUT}" \
@@ -666,6 +674,7 @@ submit_process_slurm() {
     --imaginaire-root "${IMAGINAIRE_ROOT}"
     --end2end-steps "${END2END_STEPS}"
     --end2end-learning-rate "${END2END_LEARNING_RATE}"
+    --end2end-eval-lights "${END2END_EVAL_LIGHTS}"
     --env-name "${ENV_NAME}"
     --max-lights "${MAX_LIGHTS}"
     --min-lights "${MIN_DECOMP_LIGHTS}"
