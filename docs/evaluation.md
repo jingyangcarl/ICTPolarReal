@@ -69,69 +69,80 @@ and four held-out identities, with four yaw rotations each. Every rotation of a
 held-out identity remains out of the HDRI and mixed fit pools. Generated
 white/red/green/blue calibration environments and their rotations are fit-only.
 
-HDRI target images are synthesized from measured ICTPolarReal
+HDRI reference images are synthesized from measured ICTPolarReal
 parallel-polarized OLATs using spherical-Voronoi solid-angle weights. They are
-not separately captured environment-lit ground truth. For the held-out HDRI
+not separately captured environment-lit photographs. For the held-out HDRI
 suite, synthesis and rendering use the nine held-out visible OLATs as well as
 held-out environment identities. Voronoi cells are recomputed on the held-out
 direction basis rather than dropping cells assigned to fit lights, so the
 coarse held-out composite still covers the full sphere. The lighting and camera
 manifests record this target origin.
 
-Each profile writes evaluation artifacts under:
+Evaluation is organized by test lighting, not by the profile used for fitting:
 
 ```text
 outputs/material_acquisition_end2end/<object>/<camera>/
-  evaluation/<profile>/
+  material/
+    overview.png
+    <profile>/maps/...
+  evaluation/
+    overview.png
     metrics.csv
     summary.json
     olat/
-      metrics.csv
-      summary.json
-      contact_sheet.png
+      comparison.png
       cases/<frame_id>/
-        gt.png
-        pred.png
-        error.png
+        reference.png
+        predictions/<profile>.png
+        errors/<profile>.png
         comparison.png
     hdri/
-      metrics.csv
-      summary.json
-      contact_sheet.png
+      comparison.png
       cases/<condition_id>/
         lighting.png
-        gt.png
-        pred.png
-        error.png
+        reference.png
+        predictions/<profile>.png
+        errors/<profile>.png
         comparison.png
+    assets/
+      conditions.json
+      weights.npz
 ```
 
-The combined profile-level `evaluation/<profile>/metrics.csv` has one aggregate
-OLAT row and one aggregate HDRI row. The nested tables retain per-case details:
+`evaluation/metrics.csv` has one aggregate row for every training profile and
+evaluation lighting pair. The default `olat`, `hdri`, and `mix` fits therefore
+produce six rows. Rows include the split, count, MSE, MAE, PSNR,
+`ssim_global`, appearance diagnostics, and the profile and lighting labels.
+`evaluation/summary.json` records the same matrix, the representative case
+selection, target origin, and artifact paths.
 
-- OLAT rows include split, stack index, calibrated light index, original frame
-  ID, MSE, MAE, PSNR, `ssim_global`, appearance diagnostics, and artifact
-  paths.
-- HDRI rows include split, condition/source identity, rotation, the same
-  metrics, and lighting/artifact paths.
-- OLAT comparison panels contain ground truth, prediction, and 4x absolute
-  error. HDRI panels add the environment-map preview.
+OLAT case names retain original capture frame IDs. HDRI case names use the
+condition IDs from the lighting manifest. A case stores its measured or
+synthesized reference once, then keeps each fit's render and error under
+`predictions/<profile>.png` and `errors/<profile>.png`. HDRI cases additionally
+store one shared `lighting.png`. Each case's `comparison.png` provides a
+readable side-by-side detail; the larger `comparison.png` at each suite root
+collects those cases without repeating source files in the directory tree.
+Error images use mean absolute RGB error on one fixed `0.00` to `0.25` scale,
+so their colors are comparable across profiles and cases rather than being
+independently stretched.
 
-Shared lighting provenance is under `evaluation/lighting/conditions.json` and
-`evaluation/lighting/weights.npz`. There is no separate preview dump; each HDRI
-case stores only the lighting thumbnail needed by that case and the reports.
-The per-case appearance diagnostics are `gt_mean_intensity`,
+Shared lighting provenance is under `evaluation/assets/conditions.json` and
+`evaluation/assets/weights.npz`. There is no separate preview dump; each HDRI
+case stores only the lighting thumbnail needed by that case and the report.
+The aggregate appearance diagnostics are `gt_mean_intensity`,
 `pred_mean_intensity`, `mean_intensity_ratio`, and `luminance_correlation`;
 they make a systematically dark or structurally mismatched reconstruction
 obvious even when aggregate exposure-normalized metrics look less severe.
 
-At camera level, `evaluation/report/overview.png` presents all trained profiles
-as rows using the same representative OLAT and HDRI cases. It also shows base
-color, normal, roughness, specular, aggregate OLAT/HDRI metrics, predictions,
-and errors. `evaluation/report/metrics.csv` and
-`evaluation/report/summary.json` contain the aligned matrix, while
-`manifest.json` links the report and profile acquisitions. Material maps live
-separately under `material/<profile>/maps`.
+At camera level, `material/overview.png` is a compact profile-by-map grid for
+base color, normal, roughness, and specular. `evaluation/overview.png` is the
+primary relighting dashboard: it presents the aggregate metric matrix and the
+same representative OLAT and HDRI cases for every fit. Detailed errors remain
+in the suite comparisons rather than crowding the main dashboard.
+`manifest.json` links both overviews, the root evaluation tables, and the
+profile acquisitions. There is no `evaluation/report/` directory and no
+training-profile-first `evaluation/<profile>/<lighting>/` hierarchy.
 
 These are validity-masked, scale-normalized LDR metrics. The capture mask is
 intersected with the `n dot v > 0` front-facing gate; invalid pixels are zeroed

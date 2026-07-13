@@ -45,6 +45,7 @@ outputs/material_acquisition_end2end/
   object_name/camXX/
     manifest.json
     material/
+      overview.png
       olat/
         acquisition.json
         disney_brdf.pt
@@ -63,26 +64,25 @@ outputs/material_acquisition_end2end/
       hdri/...
       mix/...
     evaluation/
+      overview.png
+      metrics.csv
+      summary.json
       olat/
-        metrics.csv
-        summary.json
-        olat/
-          metrics.csv
-          summary.json
-          contact_sheet.png
-          cases/<frame_id>/{gt,pred,error,comparison}.png
-        hdri/
-          metrics.csv
-          summary.json
-          contact_sheet.png
-          cases/<condition_id>/{lighting,gt,pred,error,comparison}.png
-      hdri/...
-      mix/...
-      report/
-        overview.png
-        metrics.csv
-        summary.json
-      lighting/
+        comparison.png
+        cases/<frame_id>/
+          reference.png
+          predictions/{olat,hdri,mix}.png
+          errors/{olat,hdri,mix}.png
+          comparison.png
+      hdri/
+        comparison.png
+        cases/<condition_id>/
+          lighting.png
+          reference.png
+          predictions/{olat,hdri,mix}.png
+          errors/{olat,hdri,mix}.png
+          comparison.png
+      assets/
         conditions.json
         weights.npz
 ```
@@ -96,14 +96,14 @@ exposed downstream without copying or flattening files. Legacy roots without a
 manifest still use the `brdf/`, `material_properties/`, and camera-root
 fallbacks.
 
-`evaluation/lighting/conditions.json` records the ranked natural HDRI
+`evaluation/assets/conditions.json` records the ranked natural HDRI
 identities, strict fit/held-out identity split, rotations, generated `w/r/g/b`
 calibration conditions, and source hashes. `weights.npz` contains their
 spherical-Voronoi weights on the calibrated ICT light basis. The lighting
-directory intentionally contains only these two provenance files; the HDRI
-thumbnail used by a report is stored with that evaluation case. HDRI targets
-are weighted combinations of measured parallel-polarized OLAT images, not
-independently captured environment-lit frames.
+assets directory intentionally contains only these two provenance files; the
+HDRI thumbnail used by a report is stored with that evaluation case. HDRI
+targets are weighted combinations of measured parallel-polarized OLAT images,
+not independently captured environment-lit frames.
 
 For a complete LSX capture, end-to-end acquisition uses a SuperDimension-style
 164-light selection adapted to the ICTPolarReal rig: it considers visible
@@ -116,16 +116,21 @@ four held-out identities, each with four rotations; all rotations of one HDRI
 identity remain in the same split. Every requested profile is evaluated on the
 same OLAT and HDRI suites. OLAT case folders retain original capture frame IDs,
 while HDRI case folders use the condition IDs recorded in
-`evaluation/lighting/conditions.json`.
+`evaluation/assets/conditions.json`.
 
-`evaluation/report/overview.png` aligns one representative OLAT and HDRI case
-across the profile rows and shows selected material maps and aggregate metrics.
-`evaluation/report/summary.json` and `evaluation/report/metrics.csv` are its
-machine-readable companions. Invalid/background pixels are masked before the
-same renderer-native whole-image 99.5th-percentile linear scaling and clipping
-used by the Imaginaire flow. The images do not preserve absolute radiometric
-HDR scale and should not be treated as evidence of numerical parity with
-another dataset.
+`material/overview.png` is a profile-by-map grid for base color, normal,
+roughness, and specular. `evaluation/overview.png` aligns one representative
+OLAT and HDRI case across all profile predictions; suite-level
+`comparison.png` files provide the larger lighting-specific views.
+`evaluation/summary.json` describes the shared cases and
+`evaluation/metrics.csv` contains one aggregate row per training profile and
+evaluation lighting type. With all default profiles this is a six-row table.
+References and lighting thumbnails are stored once per case, while predictions
+and errors are keyed by training profile. Invalid/background pixels are masked
+before the same renderer-native whole-image 99.5th-percentile linear scaling
+and clipping used by the Imaginaire flow. The images do not preserve absolute
+radiometric HDR scale and should not be treated as evidence of numerical
+parity with another dataset.
 
 An explicit `--material-root` overrides either mode-specific output root.
 

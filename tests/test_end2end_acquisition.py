@@ -661,7 +661,7 @@ def test_end2end_material_map_outputs_include_legacy_and_disney_aliases(
     np.testing.assert_allclose(written["normal.png"][:, 1], 0.0)
 
 
-def test_write_olat_evaluation_writes_profile_scoped_artifacts_and_metrics(tmp_path):
+def test_write_olat_evaluation_writes_private_profile_staging_artifacts(tmp_path):
     torch = pytest.importorskip("torch")
     target_chw = torch.stack(
         [torch.full((3, 2, 2), value) for value in (0.2, 0.3, 0.4)]
@@ -678,7 +678,7 @@ def test_write_olat_evaluation_writes_profile_scoped_artifacts_and_metrics(tmp_p
         rendered.append(stack_index)
         return target_chw[stack_index] + 0.1
 
-    evaluation_dir = tmp_path / "evaluation" / "olat" / "olat"
+    evaluation_dir = tmp_path / "evaluation" / ".profiles" / "olat" / "olat"
     cases_dir = evaluation_dir / "cases"
     stale_dir = cases_dir / "999999"
     stale_dir.mkdir(parents=True)
@@ -736,32 +736,57 @@ def test_write_olat_evaluation_writes_profile_scoped_artifacts_and_metrics(tmp_p
     assert summary["representative"]["gt_path"].startswith("cases/")
 
 
-def test_camera_report_writes_three_by_two_profile_evaluation_matrix(tmp_path):
+@pytest.mark.parametrize("source_layout", ["staging", "legacy"])
+def test_camera_report_consolidates_clean_lighting_first_contract(
+    tmp_path, source_layout
+):
     profiles = ("olat", "hdri", "mix")
     profile_results = {}
     image = np.full((6, 10, 3), 0.4, dtype=np.float32)
     metric_names = {"mse": 0.01, "mae": 0.1, "psnr": 20.0, "ssim_global": 0.8}
 
     for profile_index, profile in enumerate(profiles):
+        material_dir = tmp_path / "material" / profile
         maps_dir = tmp_path / "material" / profile / "maps"
-        for name in ("baseColor", "normal", "roughness", "specular"):
+        for name in (
+            "albedo",
+            "anisotropic",
+            "baseColor",
+            "clearcoat",
+            "clearcoatGloss",
+            "metallic",
+            "normal",
+            "roughness",
+            "specular",
+            "specularTint",
+            "subsurface",
+        ):
             write_image(maps_dir / f"{name}.png", image + profile_index * 0.05)
+        (material_dir / "disney_brdf.pt").touch()
 
-        olat_case = tmp_path / "evaluation" / profile / "olat" / "cases" / "000002"
+        if source_layout == "staging":
+            profile_evaluation = tmp_path / "evaluation" / ".profiles" / profile
+        else:
+            profile_evaluation = tmp_path / "evaluation" / profile
+
+        olat_case = profile_evaluation / "olat" / "cases" / "000002"
         for name in ("gt", "pred", "error"):
-            write_image(olat_case / f"{name}.png", image)
-        hdri_case = (
-            tmp_path
-            / "evaluation"
-            / profile
-            / "hdri"
-            / "cases"
-            / "studio_rot000"
+            value = image if name == "gt" else image + profile_index * 0.05
+            write_image(olat_case / f"{name}.png", value)
+        end2end_acquisition._write_metric_rows(
+            profile_evaluation / "olat" / "metrics.csv", [{"frame_id": 2}]
         )
+        hdri_case = profile_evaluation / "hdri" / "cases" / "studio_rot000"
         for name in ("lighting", "gt", "pred", "error"):
-            write_image(hdri_case / f"{name}.png", image)
+            value = image if name in {"lighting", "gt"} else image + profile_index * 0.05
+            write_image(hdri_case / f"{name}.png", value)
+        end2end_acquisition._write_metric_rows(
+            profile_evaluation / "hdri" / "metrics.csv",
+            [{"condition_id": "studio_rot000"}],
+        )
 
         profile_results[profile] = {
+            "lighting_profile": profile,
             "fit_conditions": {
                 "olat": 8 if profile in {"olat", "mix"} else 0,
                 "hdri": 24 if profile in {"hdri", "mix"} else 0,
@@ -769,6 +794,8 @@ def test_camera_report_writes_three_by_two_profile_evaluation_matrix(tmp_path):
             "evaluation": {
                 "evaluations": {
                     "olat": {
+                        "split": "heldout_olat",
+                        "count": 1,
                         "metrics": dict(metric_names),
                         "representative": {
                             "frame_id": 2,
@@ -778,6 +805,9 @@ def test_camera_report_writes_three_by_two_profile_evaluation_matrix(tmp_path):
                         },
                     },
                     "hdri": {
+                        "split": "heldout_hdri",
+                        "count": 1,
+                        "olat_support_split": "heldout_olat",
                         "metrics": dict(metric_names),
                         "representative": {
                             "condition_id": "studio_rot000",
@@ -791,27 +821,137 @@ def test_camera_report_writes_three_by_two_profile_evaluation_matrix(tmp_path):
             }
         }
 
+    evaluation_root = tmp_path / "evaluation"
+    provenance_dir = (
+        evaluation_root / "lighting"
+        if source_layout == "legacy"
+        else evaluation_root / "assets"
+    )
+    provenance_dir.mkdir(parents=True, exist_ok=True)
+    (provenance_dir / "conditions.json").write_text("{}\n", encoding="utf-8")
+    np.savez(provenance_dir / "weights.npz", weights=np.ones((1,), dtype=np.float32))
+    stale_report = evaluation_root / "report"
+    stale_report.mkdir(parents=True)
+    (stale_report / "obsolete.png").touch()
+
     artifacts = end2end_acquisition._write_camera_report(
         tmp_path, profiles, profile_results
     )
 
-    assert artifacts == {
-        "overview": "evaluation/report/overview.png",
-        "summary": "evaluation/report/summary.json",
-        "metrics": "evaluation/report/metrics.csv",
+    assert artifacts["material_overview"] == "material/overview.png"
+    assert artifacts["overview"] == "evaluation/overview.png"
+    assert artifacts["summary"] == "evaluation/summary.json"
+    assert artifacts["metrics"] == "evaluation/metrics.csv"
+    assert artifacts["suites"] == {
+        "olat": {"comparison": "evaluation/olat/comparison.png"},
+        "hdri": {"comparison": "evaluation/hdri/comparison.png"},
     }
-    for relative_path in artifacts.values():
+    assert artifacts["assets"] == {
+        "conditions": "evaluation/assets/conditions.json",
+        "weights": "evaluation/assets/weights.npz",
+    }
+    artifact_paths = [
+        artifacts["material_overview"],
+        artifacts["overview"],
+        artifacts["summary"],
+        artifacts["metrics"],
+        *(entry["comparison"] for entry in artifacts["suites"].values()),
+        *artifacts["assets"].values(),
+    ]
+    for relative_path in artifact_paths:
         assert (tmp_path / relative_path).is_file()
-    summary = json.loads((tmp_path / artifacts["summary"]).read_text())
+    material_overview = read_image(tmp_path / artifacts["material_overview"])
+    evaluation_overview = read_image(tmp_path / artifacts["overview"])
+    assert material_overview.shape[0] >= 1200
+    assert material_overview.shape[1] >= 1200
+    assert evaluation_overview.shape[0] >= 1600
+    assert evaluation_overview.shape[1] >= 1600
+
+    assert {path.name for path in (tmp_path / "material").iterdir()} == {
+        "overview.png",
+        *profiles,
+    }
+    assert {path.name for path in evaluation_root.iterdir()} == {
+        "assets",
+        "hdri",
+        "metrics.csv",
+        "olat",
+        "overview.png",
+        "summary.json",
+    }
+    assert {path.name for path in (evaluation_root / "assets").iterdir()} == {
+        "conditions.json",
+        "weights.npz",
+    }
+    assert not (evaluation_root / ".profiles").exists()
+    assert not (evaluation_root / "report").exists()
+    assert not (evaluation_root / "mix").exists()
+    assert not (evaluation_root / "lighting").exists()
+
+    for lighting, case_id, shared_files in (
+        ("olat", "000002", {"reference.png"}),
+        ("hdri", "studio_rot000", {"lighting.png", "reference.png"}),
+    ):
+        suite_dir = evaluation_root / lighting
+        assert {path.name for path in suite_dir.iterdir()} == {
+            "cases",
+            "comparison.png",
+        }
+        case_dir = suite_dir / "cases" / case_id
+        assert {path.name for path in case_dir.iterdir()} == {
+            *shared_files,
+            "comparison.png",
+            "errors",
+            "predictions",
+        }
+        assert {path.name for path in (case_dir / "predictions").iterdir()} == {
+            f"{profile}.png" for profile in profiles
+        }
+        assert {path.name for path in (case_dir / "errors").iterdir()} == {
+            f"{profile}.png" for profile in profiles
+        }
+        assert read_image(case_dir / "errors" / "mix.png").mean() > read_image(
+            case_dir / "errors" / "olat.png"
+        ).mean()
+        for obsolete in ("gt.png", "pred.png", "error.png"):
+            assert not (case_dir / obsolete).exists()
+
+    summary = json.loads((evaluation_root / "summary.json").read_text())
     assert summary["profiles"] == list(profiles)
     assert [row["training_profile"] for row in summary["rows"]] == list(profiles)
     assert all({"olat", "hdri"}.issubset(row) for row in summary["rows"])
-    with (tmp_path / artifacts["metrics"]).open(newline="", encoding="utf-8") as stream:
+    with (evaluation_root / "metrics.csv").open(
+        newline="", encoding="utf-8"
+    ) as stream:
         rows = list(csv.DictReader(stream))
     assert len(rows) == 6
+    assert {row["split"] for row in rows} == {"heldout_olat", "heldout_hdri"}
+    assert {int(row["count"]) for row in rows} == {1}
     assert {
         (row["training_profile"], row["evaluation_lighting"]) for row in rows
     } == {(profile, lighting) for profile in profiles for lighting in ("olat", "hdri")}
+
+    # Report-only presentation changes can recompose the canonical tree without
+    # restoring profile-first artifacts or invoking the CUDA fitter.
+    assert end2end_acquisition._write_camera_report(
+        tmp_path, profiles, profile_results
+    ) == artifacts
+
+    for profile in profiles:
+        assert end2end_acquisition._profile_outputs_complete(
+            tmp_path / "material" / profile,
+            evaluation_root / ".profiles" / profile,
+            profile_results[profile],
+        )
+    missing_prediction = (
+        evaluation_root / "olat" / "cases" / "000002" / "predictions" / "mix.png"
+    )
+    missing_prediction.unlink()
+    assert not end2end_acquisition._profile_outputs_complete(
+        tmp_path / "material" / "mix",
+        evaluation_root / ".profiles" / "mix",
+        profile_results["mix"],
+    )
 
 
 def test_end2end_provenance_records_git_state_and_exact_source_hash(
@@ -838,6 +978,33 @@ def test_end2end_provenance_records_git_state_and_exact_source_hash(
         "dirty": True,
         "disney_brdf_sha256": hashlib.sha256(source_bytes).hexdigest(),
     }
+
+
+def test_checkpoint_signature_allows_presentation_only_source_hash_change():
+    old = {
+        "profile": "olat",
+        "fit_indices": [0, 1, 2],
+        "adapter": {
+            "schema": "ictpolarreal.profile-acquisition-adapter.v2",
+            "algorithm_version": "superdimension-parity-v2",
+            "end2end_acquisition_sha256": "old-source-hash",
+            "lighting_profiles_sha256": "lighting-hash",
+        },
+    }
+    current = json.loads(json.dumps(old))
+    current["adapter"]["end2end_acquisition_sha256"] = "report-only-source-hash"
+
+    assert end2end_acquisition._checkpoint_signatures_match(old, current)
+
+    changed_algorithm = json.loads(json.dumps(current))
+    changed_algorithm["adapter"]["algorithm_version"] = "new-acquisition-algorithm"
+    assert not end2end_acquisition._checkpoint_signatures_match(
+        old, changed_algorithm
+    )
+
+    changed_fit = json.loads(json.dumps(current))
+    changed_fit["fit_indices"] = [0, 2]
+    assert not end2end_acquisition._checkpoint_signatures_match(old, changed_fit)
 
 
 def test_imaginaire_disney_import_treats_torchvision_as_debug_only(

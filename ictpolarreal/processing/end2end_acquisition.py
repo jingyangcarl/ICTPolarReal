@@ -46,6 +46,8 @@ DISNEY_SCALAR_NAMES = (
     "clearcoat",
     "clearcoatGloss",
 )
+REPORT_PROFILES = ("olat", "hdri", "mix")
+ERROR_HEATMAP_MAX = 0.25
 
 
 def _array_sha256(array: np.ndarray) -> str:
@@ -401,7 +403,7 @@ def acquire_disney_material(
     camera_dir.mkdir(parents=True, exist_ok=True)
     material_root = camera_dir / "material"
     evaluation_root = camera_dir / "evaluation"
-    lighting_dir = evaluation_root / "lighting"
+    lighting_dir = evaluation_root / "assets"
     print(
         f"[end2end] preparing {hdri_count} fit and {eval_hdris} held-out HDRIs "
         f"with {hdri_rotations} rotations",
@@ -463,7 +465,10 @@ def acquire_disney_material(
     profile_results = {}
     for profile in profiles:
         material_dir = material_root / profile
-        evaluation_dir = evaluation_root / profile
+        # The renderer writes one self-contained profile at a time.  Keep those
+        # destructive writers in a private staging area, then consolidate them
+        # into the public lighting-first tree in one atomic report transaction.
+        evaluation_dir = evaluation_root / ".profiles" / profile
         print(
             f"[end2end] fitting lighting profile {profile} -> {material_dir}",
             flush=True,
@@ -507,7 +512,7 @@ def acquire_disney_material(
         )
 
     manifest = {
-        "schema": "ictpolarreal.material-profiles.v2",
+        "schema": "ictpolarreal.material-profiles.v3",
         "material_acquisition": "end2end",
         "model": MODEL_NAME,
         "profiles": list(profiles),
@@ -515,8 +520,8 @@ def acquire_disney_material(
         "primary_material_dir": f"material/{primary_profile}/maps",
         "olat_selection": light_selection,
         "lighting": {
-            "conditions": "evaluation/lighting/conditions.json",
-            "weights": "evaluation/lighting/weights.npz",
+            "conditions": "evaluation/assets/conditions.json",
+            "weights": "evaluation/assets/weights.npz",
             "fit_hdri_conditions": len(environments.train),
             "fit_natural_hdri_identities": int(hdri_count),
             "fit_calibration_conditions": int(4 * hdri_rotations),
@@ -526,13 +531,11 @@ def acquire_disney_material(
         },
         "evaluation_matrix": "each profile evaluated on the same OLAT and HDRI suites",
         "surface_validity": surface_validity,
-        "report": {"status": "pending"},
+        "material": {"overview": "material/overview.png"},
+        "evaluation": {"status": "pending"},
         "adapter": adapter_provenance,
         "profile_acquisitions": {
             profile: f"material/{profile}/acquisition.json" for profile in profiles
-        },
-        "profile_evaluations": {
-            profile: f"evaluation/{profile}/summary.json" for profile in profiles
         },
     }
     manifest_path = camera_dir / "manifest.json"
@@ -540,13 +543,14 @@ def acquire_disney_material(
     try:
         report = _write_camera_report(camera_dir, profiles, profile_results)
     except Exception as exc:
-        manifest["report"] = {
+        manifest["evaluation"] = {
             "status": "failed",
             "error": f"{type(exc).__name__}: {exc}",
         }
         _write_json_atomic(manifest_path, manifest)
         raise
-    manifest["report"] = {"status": "complete", **report}
+    manifest["material"] = {"overview": report.pop("material_overview")}
+    manifest["evaluation"] = {"status": "complete", **report}
     _write_json_atomic(manifest_path, manifest)
     if provenance["dirty"]:
         print(
@@ -709,7 +713,9 @@ def _fit_disney_profile(
             completed = None
         if (
             completed is not None
-            and completed.get("checkpoint_signature") == signature
+            and _checkpoint_signatures_match(
+                completed.get("checkpoint_signature"), signature
+            )
             and _profile_outputs_complete(material_dir, evaluation_dir, completed)
         ):
             print(
@@ -722,7 +728,7 @@ def _fit_disney_profile(
     initial_evaluation_losses = None
     if checkpoint_path.is_file():
         checkpoint = torch.load(checkpoint_path, map_location=device)
-        if checkpoint.get("signature") != signature:
+        if not _checkpoint_signatures_match(checkpoint.get("signature"), signature):
             raise RuntimeError(
                 f"Existing checkpoint {checkpoint_path} does not match this "
                 f"{profile} acquisition. "
@@ -863,7 +869,7 @@ def _fit_disney_profile(
     _write_combined_evaluation_csv(evaluation_dir, profile, olat_summary, hdri_summary)
 
     metrics = {
-        "schema": "ictpolarreal.end2end-disney.v6",
+        "schema": "ictpolarreal.end2end-disney.v7",
         "material_acquisition": "end2end",
         "lighting_profile": profile,
         "model": MODEL_NAME,
@@ -920,7 +926,11 @@ def _fit_disney_profile(
         "paths": {
             "material_maps": _relative_path(maps_dir, camera_dir),
             "model": _relative_path(material_dir / "disney_brdf.pt", camera_dir),
-            "evaluation": _relative_path(evaluation_dir, camera_dir),
+            "evaluation": "evaluation",
+            "evaluation_suites": {
+                "olat": "evaluation/olat",
+                "hdri": "evaluation/hdri",
+            },
         },
         "input_hashes": input_hashes,
         "hdri_condition_weights_sha256": environment_hash,
@@ -1110,11 +1120,7 @@ def _profile_outputs_complete(
     acquisition: dict[str, Any],
 ) -> bool:
     maps_dir = material_dir / "maps"
-    required = [
-        material_dir / "disney_brdf.pt",
-        evaluation_dir / "summary.json",
-        evaluation_dir / "metrics.csv",
-    ]
+    required = [material_dir / "disney_brdf.pt"]
     required.extend(
         maps_dir / f"{name}.png"
         for name in (
@@ -1131,11 +1137,15 @@ def _profile_outputs_complete(
             "clearcoatGloss",
         )
     )
+    if not all(path.is_file() for path in required):
+        return False
+
+    staged_required = [evaluation_dir / "summary.json", evaluation_dir / "metrics.csv"]
     try:
         evaluations = acquisition["evaluation"]["evaluations"]
         for lighting in ("olat", "hdri"):
             suite_dir = evaluation_dir / lighting
-            required.extend(
+            staged_required.extend(
                 [
                     suite_dir / "summary.json",
                     suite_dir / "metrics.csv",
@@ -1143,14 +1153,38 @@ def _profile_outputs_complete(
                 ]
             )
             representative = evaluations[lighting]["representative"]
-            required.extend(
+            staged_required.extend(
                 suite_dir / value
                 for key, value in representative.items()
                 if key.endswith("_path")
             )
     except (KeyError, TypeError):
         return False
-    return all(path.is_file() for path in required)
+    if all(path.is_file() for path in staged_required):
+        return True
+
+    evaluation_root = (
+        evaluation_dir.parent.parent
+        if evaluation_dir.parent.name == ".profiles"
+        else evaluation_dir.parent
+    )
+    profile = str(acquisition.get("lighting_profile", evaluation_dir.name))
+    public_required = [
+        evaluation_root / "overview.png",
+        evaluation_root / "summary.json",
+        evaluation_root / "metrics.csv",
+    ]
+    for lighting in ("olat", "hdri"):
+        suite_dir = evaluation_root / lighting
+        public_required.append(suite_dir / "comparison.png")
+        expected = int(evaluations[lighting].get("count", 0))
+        predictions = list(
+            (suite_dir / "cases").glob(f"*/predictions/{profile}.png")
+        )
+        errors = list((suite_dir / "cases").glob(f"*/errors/{profile}.png"))
+        if expected <= 0 or len(predictions) != expected or len(errors) != expected:
+            return False
+    return all(path.is_file() for path in public_required)
 
 
 def _write_camera_report(
@@ -1158,179 +1192,886 @@ def _write_camera_report(
     profiles: Sequence[str],
     profile_results: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
+    """Compose the public lighting-first report from private profile outputs.
+
+    The whole evaluation tree is built as a sibling and swapped only after
+    validation.  This keeps a failed presentation pass from damaging a
+    completed material fit and also makes v2 report migration GPU-free.
+    """
+    camera_dir = Path(camera_dir)
+    profiles = tuple(profiles)
+    if not profiles or len(set(profiles)) != len(profiles):
+        raise ValueError("report profiles must be a non-empty unique sequence")
+    missing = [profile for profile in profiles if profile not in profile_results]
+    if missing:
+        raise KeyError(f"missing profile results for: {', '.join(missing)}")
+
+    evaluation_root = camera_dir / "evaluation"
+    artifacts = _camera_report_artifacts()
+    sources = {
+        profile: _profile_evaluation_source(evaluation_root, profile)
+        for profile in profiles
+    }
+    if all(source is None for source in sources.values()):
+        if not _clean_camera_report_complete(camera_dir, profiles, profile_results):
+            raise FileNotFoundError(
+                "No private or legacy profile evaluations were found, and the clean "
+                "lighting-first report is incomplete."
+            )
+
+    stage = camera_dir / ".evaluation.clean.tmp"
+    backup = camera_dir / ".evaluation.previous.tmp"
+    material_tmp = camera_dir / ".material-overview.tmp.png"
+    for stale in (stage, backup):
+        if stale.exists():
+            shutil.rmtree(stale)
+    material_tmp.unlink(missing_ok=True)
+    stage.mkdir(parents=True)
+    try:
+        asset_source = (
+            evaluation_root / "assets"
+            if (evaluation_root / "assets").is_dir()
+            else evaluation_root / "lighting"
+        )
+        if not asset_source.is_dir():
+            raise FileNotFoundError(
+                f"missing evaluation lighting assets under {evaluation_root}"
+            )
+        shutil.copytree(asset_source, stage / "assets")
+
+        suite_reports = {
+            lighting: _consolidate_evaluation_suite(
+                evaluation_root,
+                stage,
+                lighting,
+                profiles,
+                sources,
+                profile_results,
+            )
+            for lighting in ("olat", "hdri")
+        }
+        report_rows = []
+        for profile in profiles:
+            row = {"training_profile": profile}
+            for lighting in ("olat", "hdri"):
+                metrics = profile_results[profile]["evaluation"]["evaluations"][
+                    lighting
+                ]["metrics"]
+                row[lighting] = {
+                    name: metrics[name]
+                    for name in (
+                        "psnr",
+                        "ssim_global",
+                        "mean_intensity_ratio",
+                        "luminance_correlation",
+                    )
+                    if name in metrics
+                }
+            report_rows.append(row)
+        metric_rows = [
+            {
+                "training_profile": row["training_profile"],
+                "evaluation_lighting": lighting,
+                "split": profile_results[row["training_profile"]]["evaluation"][
+                    "evaluations"
+                ][lighting].get("split", "unspecified"),
+                "count": profile_results[row["training_profile"]]["evaluation"][
+                    "evaluations"
+                ][lighting].get("count", 0),
+                **profile_results[row["training_profile"]]["evaluation"][
+                    "evaluations"
+                ][lighting]["metrics"],
+            }
+            for row in report_rows
+            for lighting in ("olat", "hdri")
+        ]
+        _write_metric_rows(stage / "metrics.csv", metric_rows)
+        summary = {
+            "schema": "ictpolarreal.material-profile-report.v2",
+            "profiles": list(profiles),
+            "evaluation_matrix": (
+                "rows are training-light profiles; columns are common OLAT and "
+                "HDRI test-light suites"
+            ),
+            "hdri_target_origin": "synthesized_from_measured_olat",
+            "representative_policy": (
+                f"shared cases selected from {profiles[0]}-trained predictions "
+                "nearest median PSNR"
+            ),
+            "rows": report_rows,
+            "overview": "overview.png",
+            "metrics_csv": "metrics.csv",
+            "suites": {
+                lighting: {
+                    "comparison": f"{lighting}/comparison.png",
+                    "representative_case": suite_reports[lighting][
+                        "representative_case"
+                    ],
+                }
+                for lighting in ("olat", "hdri")
+            },
+        }
+        _write_json_atomic(stage / "summary.json", summary)
+        _write_evaluation_overview(
+            stage,
+            profiles,
+            profile_results,
+            suite_reports["olat"]["representative_case"],
+            suite_reports["hdri"]["representative_case"],
+        )
+        _write_material_overview(camera_dir, profiles, material_tmp)
+        _validate_clean_report_tree(stage, profiles, suite_reports)
+
+        if evaluation_root.exists():
+            evaluation_root.replace(backup)
+        try:
+            stage.replace(evaluation_root)
+        except Exception:
+            if backup.exists() and not evaluation_root.exists():
+                backup.replace(evaluation_root)
+            raise
+        if backup.exists():
+            shutil.rmtree(backup)
+        material_overview = camera_dir / "material" / "overview.png"
+        material_overview.parent.mkdir(parents=True, exist_ok=True)
+        material_tmp.replace(material_overview)
+        _update_profile_acquisition_reports(
+            camera_dir, profiles, profile_results, suite_reports
+        )
+    except Exception:
+        if stage.exists():
+            shutil.rmtree(stage)
+        material_tmp.unlink(missing_ok=True)
+        raise
+    return artifacts
+
+
+def reorganize_end2end_camera(camera_dir: str | Path) -> dict[str, Any]:
+    """Migrate a completed v2 camera report without importing PyTorch."""
+    camera_dir = Path(camera_dir)
+    manifest_path = camera_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    profiles = tuple(manifest.get("profiles", REPORT_PROFILES))
+    profile_results = {
+        profile: json.loads(
+            (camera_dir / "material" / profile / "acquisition.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        for profile in profiles
+    }
+    report = _write_camera_report(camera_dir, profiles, profile_results)
+    manifest["schema"] = "ictpolarreal.material-profiles.v3"
+    manifest["lighting"]["conditions"] = "evaluation/assets/conditions.json"
+    manifest["lighting"]["weights"] = "evaluation/assets/weights.npz"
+    manifest["material"] = {"overview": report.pop("material_overview")}
+    manifest["evaluation"] = {"status": "complete", **report}
+    manifest["adapter"] = _adapter_provenance()
+    manifest.pop("report", None)
+    manifest.pop("profile_evaluations", None)
+    _write_json_atomic(manifest_path, manifest)
+    return manifest
+
+
+def _camera_report_artifacts() -> dict[str, Any]:
+    return {
+        "material_overview": "material/overview.png",
+        "overview": "evaluation/overview.png",
+        "summary": "evaluation/summary.json",
+        "metrics": "evaluation/metrics.csv",
+        "suites": {
+            lighting: {
+                "comparison": f"evaluation/{lighting}/comparison.png",
+            }
+            for lighting in ("olat", "hdri")
+        },
+        "assets": {
+            "conditions": "evaluation/assets/conditions.json",
+            "weights": "evaluation/assets/weights.npz",
+        },
+    }
+
+
+def _profile_evaluation_source(evaluation_root: Path, profile: str) -> Path | None:
+    staged = evaluation_root / ".profiles" / profile
+    if (staged / "olat" / "cases").is_dir() and (staged / "hdri" / "cases").is_dir():
+        return staged
+    legacy = evaluation_root / profile
+    if (legacy / "olat" / "cases").is_dir() and (legacy / "hdri" / "cases").is_dir():
+        return legacy
+    return None
+
+
+def _clean_camera_report_complete(
+    camera_dir: Path,
+    profiles: Sequence[str],
+    profile_results: dict[str, dict[str, Any]],
+) -> bool:
+    artifacts = _camera_report_artifacts()
+    required = [
+        camera_dir / artifacts["material_overview"],
+        camera_dir / artifacts["overview"],
+        camera_dir / artifacts["summary"],
+        camera_dir / artifacts["metrics"],
+        camera_dir / artifacts["assets"]["conditions"],
+        camera_dir / artifacts["assets"]["weights"],
+    ]
+    for lighting in ("olat", "hdri"):
+        required.extend(
+            camera_dir / value
+            for value in artifacts["suites"][lighting].values()
+        )
+        cases_dir = camera_dir / "evaluation" / lighting / "cases"
+        for profile in profiles:
+            expected = int(
+                profile_results[profile]["evaluation"]["evaluations"][lighting][
+                    "count"
+                ]
+            )
+            if len(list(cases_dir.glob(f"*/predictions/{profile}.png"))) != expected:
+                return False
+            if len(list(cases_dir.glob(f"*/errors/{profile}.png"))) != expected:
+                return False
+    return all(path.is_file() for path in required)
+
+
+def _consolidate_evaluation_suite(
+    evaluation_root: Path,
+    stage: Path,
+    lighting: str,
+    profiles: Sequence[str],
+    sources: dict[str, Path | None],
+    profile_results: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    suite_dir = stage / lighting
+    cases_dir = suite_dir / "cases"
+    cases_dir.mkdir(parents=True)
+    case_ids_by_profile: dict[str, list[str]] = {}
+    for profile in profiles:
+        source = sources[profile]
+        if source is not None:
+            rows = _read_csv_rows(source / lighting / "metrics.csv")
+        else:
+            rows = [
+                row
+                for row in _read_csv_rows(evaluation_root / "metrics.csv")
+                if row.get("training_profile") == profile
+                and row.get("evaluation_lighting") == lighting
+            ]
+            # A clean tree has aggregate metrics only.  Its case identifiers
+            # come directly from the canonical case folders.
+            if rows:
+                case_ids_by_profile[profile] = sorted(
+                    path.name for path in (evaluation_root / lighting / "cases").iterdir()
+                    if path.is_dir()
+                )
+                continue
+        if not rows:
+            raise ValueError(f"no {lighting} metric rows for profile {profile}")
+        case_ids_by_profile[profile] = [
+            _metric_case_id(lighting, row) for row in rows
+        ]
+
+    reference_ids = case_ids_by_profile[profiles[0]]
+    if not reference_ids or len(reference_ids) != len(set(reference_ids)):
+        raise ValueError(f"invalid or duplicate {lighting} case identifiers")
+    for profile in profiles[1:]:
+        if set(case_ids_by_profile[profile]) != set(reference_ids):
+            raise ValueError(
+                f"{lighting} cases differ between {profiles[0]} and {profile}"
+            )
+
+    for case_id in reference_ids:
+        reference_sources = []
+        lighting_sources = []
+        predictions = {}
+        for profile in profiles:
+            source = sources[profile]
+            if source is not None:
+                source_case = source / lighting / "cases" / case_id
+                reference_sources.append(source_case / "gt.png")
+                predictions[profile] = source_case / "pred.png"
+                if lighting == "hdri":
+                    lighting_sources.append(source_case / "lighting.png")
+            else:
+                source_case = evaluation_root / lighting / "cases" / case_id
+                reference_sources.append(source_case / "reference.png")
+                predictions[profile] = source_case / "predictions" / f"{profile}.png"
+                if lighting == "hdri":
+                    lighting_sources.append(source_case / "lighting.png")
+        _assert_identical_files(reference_sources, f"{lighting}/{case_id} reference")
+        if lighting_sources:
+            _assert_identical_files(lighting_sources, f"{lighting}/{case_id} lighting")
+
+        output_case = cases_dir / case_id
+        output_case.mkdir(parents=True)
+        shutil.copy2(reference_sources[0], output_case / "reference.png")
+        if lighting_sources:
+            shutil.copy2(lighting_sources[0], output_case / "lighting.png")
+        for profile, prediction in predictions.items():
+            prediction_path = output_case / "predictions" / f"{profile}.png"
+            prediction_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(prediction, prediction_path)
+            _write_scalar_error_heatmap(
+                prediction_path,
+                output_case / "reference.png",
+                output_case / "errors" / f"{profile}.png",
+            )
+        _write_case_comparison(output_case, lighting, profiles, case_id)
+
+    first_summary = profile_results[profiles[0]]["evaluation"]["evaluations"][
+        lighting
+    ]
+    representative = first_summary.get("representative", {})
+    representative_case = (
+        f"{int(representative['frame_id']):06d}"
+        if lighting == "olat" and "frame_id" in representative
+        else str(representative.get("condition_id", reference_ids[0]))
+    )
+    if representative_case not in reference_ids:
+        representative_case = reference_ids[len(reference_ids) // 2]
+    _write_suite_comparison(
+        [cases_dir / case_id / "comparison.png" for case_id in reference_ids],
+        suite_dir / "comparison.png",
+        f"{lighting.upper()} relighting · shared references · models side by side",
+    )
+    return {"case_ids": reference_ids, "representative_case": representative_case}
+
+
+def _read_csv_rows(path: Path) -> list[dict[str, str]]:
+    with path.open(newline="", encoding="utf-8") as stream:
+        return list(csv.DictReader(stream))
+
+
+def _metric_case_id(lighting: str, row: dict[str, Any]) -> str:
+    if lighting == "olat":
+        return f"{int(row['frame_id']):06d}"
+    return str(row["condition_id"])
+
+
+def _assert_identical_files(paths: Sequence[Path], label: str) -> None:
+    if not paths or any(not path.is_file() for path in paths):
+        missing = [str(path) for path in paths if not path.is_file()]
+        raise FileNotFoundError(f"missing {label} inputs: {missing}")
+    digests = {hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
+    if len(digests) != 1:
+        raise ValueError(
+            f"cannot deduplicate {label}: profile copies are not byte-identical"
+        )
+
+
+def _write_scalar_error_heatmap(
+    prediction_path: Path, reference_path: Path, output_path: Path
+) -> None:
+    prediction = np.clip(read_image(prediction_path), 0.0, 1.0)
+    reference = np.clip(read_image(reference_path), 0.0, 1.0)
+    if prediction.shape != reference.shape:
+        raise ValueError(
+            f"error inputs differ in shape: {prediction.shape} vs {reference.shape}"
+        )
+    error = np.mean(np.abs(prediction[..., :3] - reference[..., :3]), axis=-1)
+    normalized = np.clip(error / ERROR_HEATMAP_MAX, 0.0, 1.0)
+    positions = np.asarray([0.0, 0.25, 0.5, 0.75, 1.0], dtype=np.float32)
+    colors = np.asarray(
+        [
+            [0, 0, 0],
+            [15, 32, 110],
+            [0, 180, 220],
+            [255, 220, 35],
+            [220, 25, 25],
+        ],
+        dtype=np.float32,
+    ) / 255.0
+    heatmap = np.stack(
+        [np.interp(normalized, positions, colors[:, channel]) for channel in range(3)],
+        axis=-1,
+    ).astype(np.float32)
+    write_image(output_path, heatmap)
+
+
+def _report_font(size: int, *, bold: bool = False):
+    from PIL import ImageFont
+
+    names = (
+        (
+            "DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        )
+        if bold
+        else (
+            "DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        )
+    )
+    for name in names:
+        try:
+            return ImageFont.truetype(name, size=size)
+        except OSError:
+            pass
+    return ImageFont.load_default()
+
+
+def _fit_pil_path(path: Path, width: int, height: int):
+    from PIL import Image
+
+    with Image.open(path) as source_file:
+        source = source_file.convert("RGB")
+        scale = min(width / source.width, height / source.height)
+        resized = source.resize(
+            (max(1, round(source.width * scale)), max(1, round(source.height * scale))),
+            Image.Resampling.LANCZOS,
+        )
+    tile = Image.new("RGB", (width, height), (12, 12, 14))
+    tile.paste(resized, ((width - resized.width) // 2, (height - resized.height) // 2))
+    return tile
+
+
+def _centered_text(draw, bounds: tuple[int, int, int, int], text: str, font, fill) -> None:
+    left, top, right, bottom = bounds
+    box = draw.textbbox((0, 0), text, font=font)
+    width, height = box[2] - box[0], box[3] - box[1]
+    draw.text(
+        (left + (right - left - width) / 2, top + (bottom - top - height) / 2),
+        text,
+        font=font,
+        fill=fill,
+    )
+
+
+def _write_case_comparison(
+    case_dir: Path, lighting: str, profiles: Sequence[str], case_id: str
+) -> None:
     from PIL import Image, ImageDraw
 
-    report_dir = camera_dir / "evaluation" / "report"
-    report_dir.mkdir(parents=True, exist_ok=True)
+    panel_width, panel_height = 260, 390
+    gap, margin = 16, 36
+    header_height, label_height = 90, 44
+    leading = []
+    if lighting == "hdri":
+        leading.append(("Lighting", case_dir / "lighting.png"))
+    leading.append(("Reference", case_dir / "reference.png"))
     columns = [
-        "profile / metrics",
-        "baseColor",
-        "normal",
-        "roughness",
-        "specular",
-        "OLAT ground truth",
-        "OLAT prediction",
-        "OLAT error x4",
-        "HDRI lighting",
-        "HDRI ground truth",
-        "HDRI prediction",
-        "HDRI error x4",
+        *leading,
+        *[
+            (f"{profile.upper()}-trained", case_dir / "predictions" / f"{profile}.png")
+            for profile in profiles
+        ],
     ]
-    label_width = 300
-    cell_width, cell_height = 240, 136
-    header_height = 70
-    row_height = 196
+    width = 2 * margin + len(columns) * panel_width + (len(columns) - 1) * gap
+    height = header_height + 2 * (label_height + panel_height) + 42 + margin
+    canvas = Image.new("RGB", (width, height), (10, 10, 12))
+    draw = ImageDraw.Draw(canvas)
+    title_font = _report_font(30, bold=True)
+    label_font = _report_font(22, bold=True)
+    note_font = _report_font(19)
+    draw.text((margin, 18), f"{lighting.upper()} · {case_id}", font=title_font, fill="white")
+    draw.text(
+        (margin, 56),
+        "Top: relighting result  ·  Bottom: fixed-scale mean absolute RGB error",
+        font=note_font,
+        fill=(176, 181, 190),
+    )
+    top_y = header_height
+    for index, (label, path) in enumerate(columns):
+        x = margin + index * (panel_width + gap)
+        _centered_text(
+            draw,
+            (x, top_y, x + panel_width, top_y + label_height),
+            label,
+            label_font,
+            (235, 238, 242),
+        )
+        canvas.paste(
+            _fit_pil_path(path, panel_width, panel_height),
+            (x, top_y + label_height),
+        )
+    error_y = top_y + label_height + panel_height + 42
+    model_offset = len(leading)
+    draw.multiline_text(
+        (margin, error_y + label_height + panel_height // 2 - 22),
+        f"Error scale\n0 to {ERROR_HEATMAP_MAX:g}",
+        font=note_font,
+        fill=(176, 181, 190),
+        spacing=8,
+    )
+    for profile_index, profile in enumerate(profiles):
+        index = model_offset + profile_index
+        x = margin + index * (panel_width + gap)
+        _centered_text(
+            draw,
+            (x, error_y, x + panel_width, error_y + label_height),
+            f"{profile.upper()} error",
+            label_font,
+            (235, 238, 242),
+        )
+        canvas.paste(
+            _fit_pil_path(
+                case_dir / "errors" / f"{profile}.png", panel_width, panel_height
+            ),
+            (x, error_y + label_height),
+        )
+    canvas.save(case_dir / "comparison.png")
+
+
+def _write_suite_comparison(case_paths: Sequence[Path], output: Path, title: str) -> None:
+    from PIL import Image, ImageDraw
+
+    thumbnails = []
+    for path in case_paths:
+        with Image.open(path) as source_file:
+            source = source_file.convert("RGB")
+            target_width = 860
+            target_height = max(1, round(source.height * target_width / source.width))
+            thumbnails.append(
+                source.resize((target_width, target_height), Image.Resampling.LANCZOS)
+            )
+    columns = 2 if len(thumbnails) > 1 else 1
+    rows = math.ceil(len(thumbnails) / columns)
+    gap, margin, header = 24, 40, 90
+    tile_width = max(tile.width for tile in thumbnails)
+    tile_height = max(tile.height for tile in thumbnails)
     canvas = Image.new(
         "RGB",
         (
-            label_width + (len(columns) - 1) * cell_width,
-            header_height + len(profiles) * row_height,
+            2 * margin + columns * tile_width + (columns - 1) * gap,
+            header + margin + rows * tile_height + (rows - 1) * gap,
         ),
-        color=(12, 12, 12),
+        (8, 8, 10),
     )
     draw = ImageDraw.Draw(canvas)
-    draw.text((8, 16), columns[0], fill="white")
-    for index, label in enumerate(columns[1:]):
-        draw.text((label_width + index * cell_width + 6, 16), label, fill="white")
-    reference_evaluations = profile_results[profiles[0]]["evaluation"]["evaluations"]
-    shared_olat = reference_evaluations["olat"]["representative"]
-    shared_hdri = reference_evaluations["hdri"]["representative"]
-    shared_frame_id = int(shared_olat["frame_id"])
-    shared_condition_id = str(shared_hdri["condition_id"])
-    hdri_support_split = reference_evaluations["hdri"].get(
-        "olat_support_split",
-        "unspecified_olat",
+    draw.text((margin, 24), title, font=_report_font(30, bold=True), fill="white")
+    for index, tile in enumerate(thumbnails):
+        x = margin + (index % columns) * (tile_width + gap)
+        y = header + (index // columns) * (tile_height + gap)
+        canvas.paste(tile, (x, y))
+    output.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(output)
+
+
+def _write_material_overview(
+    camera_dir: Path, profiles: Sequence[str], output: Path
+) -> None:
+    from PIL import Image, ImageDraw
+
+    map_names = ("baseColor", "normal", "roughness", "specular")
+    panel_width, panel_height = 270, 440
+    label_width, margin, gap = 190, 44, 18
+    header = 108
+    width = 2 * margin + label_width + len(map_names) * panel_width + 3 * gap
+    height = header + len(profiles) * panel_height + (len(profiles) - 1) * gap + margin
+    canvas = Image.new("RGB", (width, height), (10, 10, 12))
+    draw = ImageDraw.Draw(canvas)
+    draw.text(
+        (margin, 17),
+        "Disney BRDF material maps",
+        font=_report_font(34, bold=True),
+        fill="white",
     )
     draw.text(
-        (8, 32),
-        f"shared OLAT frame {shared_frame_id:06d} / HDRI {shared_condition_id}",
-        fill=(190, 190, 190),
+        (margin, 60),
+        "Rows: acquisition lighting profile  ·  Columns: fitted material parameter",
+        font=_report_font(20),
+        fill=(176, 181, 190),
     )
-    draw.text(
-        (8, 49),
-        f"HDRI ground truth is synthesized from {hdri_support_split} support",
-        fill=(190, 190, 190),
-    )
-    report_rows = []
-    for row_index, profile in enumerate(profiles):
-        result = profile_results[profile]
-        y = header_height + row_index * row_height
-        evaluations = result["evaluation"]["evaluations"]
-        olat_summary = evaluations["olat"]
-        hdri_summary = evaluations["hdri"]
-        olat_metrics = olat_summary["metrics"]
-        hdri_metrics = hdri_summary["metrics"]
-        fit_conditions = result.get("fit_conditions", {})
-        draw.text((8, y + 8), f"{profile.upper()}-trained", fill=(255, 220, 80))
-        draw.text(
-            (8, y + 30),
-            f"OLAT  PSNR {olat_metrics['psnr']:.2f}  "
-            f"SSIM {olat_metrics['ssim_global']:.3f}",
-            fill="white",
+    for index, name in enumerate(map_names):
+        x = margin + label_width + index * (panel_width + gap)
+        _centered_text(
+            draw,
+            (x, 62, x + panel_width, header),
+            name,
+            _report_font(22, bold=True),
+            (235, 238, 242),
         )
-        draw.text(
-            (8, y + 48),
-            f"HDRI  PSNR {hdri_metrics['psnr']:.2f}  "
-            f"SSIM {hdri_metrics['ssim_global']:.3f}",
-            fill="white",
-        )
-        draw.text(
-            (8, y + 68),
-            f"brightness pred/GT: OLAT "
-            f"{olat_metrics.get('mean_intensity_ratio', float('nan')):.2f} / HDRI "
-            f"{hdri_metrics.get('mean_intensity_ratio', float('nan')):.2f}",
-            fill=(190, 190, 190),
-        )
-        draw.text(
-            (8, y + 88),
-            f"luma corr: OLAT "
-            f"{olat_metrics.get('luminance_correlation', float('nan')):.2f} / HDRI "
-            f"{hdri_metrics.get('luminance_correlation', float('nan')):.2f}",
-            fill=(190, 190, 190),
-        )
-        draw.text(
-            (8, y + 108),
-            f"fit: {fit_conditions.get('olat', 0)} OLAT / "
-            f"{fit_conditions.get('hdri', 0)} HDRI",
-            fill=(190, 190, 190),
+    for row, profile in enumerate(profiles):
+        y = header + row * (panel_height + gap)
+        _centered_text(
+            draw,
+            (margin, y, margin + label_width - gap, y + panel_height),
+            f"{profile.upper()}-trained",
+            _report_font(24, bold=True),
+            (255, 216, 90),
         )
         maps_dir = camera_dir / "material" / profile / "maps"
-        image_specs = [
-            (maps_dir / "baseColor.png", 1.0),
-            (maps_dir / "normal.png", 1.0),
-            (maps_dir / "roughness.png", 1.0),
-            (maps_dir / "specular.png", 1.0),
-        ]
-        olat_root = camera_dir / "evaluation" / profile / "olat"
-        hdri_root = camera_dir / "evaluation" / profile / "hdri"
-        olat_case = olat_root / "cases" / f"{shared_frame_id:06d}"
-        hdri_case = hdri_root / "cases" / shared_condition_id
-        image_specs.extend(
-            [
-                (olat_case / "gt.png", 1.0),
-                (olat_case / "pred.png", 1.0),
-                (olat_case / "error.png", 4.0),
-                (hdri_case / "lighting.png", 1.0),
-                (hdri_case / "gt.png", 1.0),
-                (hdri_case / "pred.png", 1.0),
-                (hdri_case / "error.png", 4.0),
-            ]
-        )
-        for column_index, (path, scale) in enumerate(image_specs):
-            image = np.clip(read_image(path) * scale, 0.0, 1.0)
-            tile = _pil_fit_image(image, cell_width, cell_height)
-            x = label_width + column_index * cell_width
-            canvas.paste(tile, (x, y))
-        report_rows.append(
-            {
-                "training_profile": profile,
-                "olat": olat_summary["metrics"],
-                "hdri": hdri_summary["metrics"],
-                "representative_olat": {
-                    "frame_id": shared_frame_id,
-                    "case": _relative_path(olat_case, camera_dir),
-                },
-                "representative_hdri": {
-                    "condition_id": shared_condition_id,
-                    "case": _relative_path(hdri_case, camera_dir),
-                },
-            }
-        )
-    overview_path = report_dir / "overview.png"
-    canvas.save(overview_path)
-    summary = {
-        "schema": "ictpolarreal.material-profile-report.v1",
-        "profiles": list(profiles),
-        "evaluation_matrix": (
-            "one model per training profile, evaluated on common OLAT and HDRI suites"
-        ),
-        "hdri_target_origin": "synthesized_from_measured_olat",
-        "representative_policy": (
-            f"shared cases selected from {profiles[0]} profile nearest median PSNR"
-        ),
-        "panels": columns,
-        "rows": report_rows,
-        "overview": "overview.png",
-    }
-    (report_dir / "summary.json").write_text(
-        json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
-    metric_rows = []
-    for row in report_rows:
-        for lighting in ("olat", "hdri"):
-            metric_rows.append(
-                {
-                    "training_profile": row["training_profile"],
-                    "evaluation_lighting": lighting,
-                    **row[lighting],
-                }
+        for column, name in enumerate(map_names):
+            x = margin + label_width + column * (panel_width + gap)
+            canvas.paste(
+                _fit_pil_path(
+                    maps_dir / f"{name}.png", panel_width, panel_height
+                ),
+                (x, y),
             )
-    _write_metric_rows(report_dir / "metrics.csv", metric_rows)
-    return {
-        "overview": "evaluation/report/overview.png",
-        "summary": "evaluation/report/summary.json",
-        "metrics": "evaluation/report/metrics.csv",
+    output.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(output)
+
+
+def _write_evaluation_overview(
+    stage: Path,
+    profiles: Sequence[str],
+    profile_results: dict[str, dict[str, Any]],
+    olat_case_id: str,
+    hdri_case_id: str,
+) -> None:
+    from PIL import Image, ImageDraw
+
+    width, margin = 1800, 58
+    matrix_top, matrix_header, metric_height = 125, 64, 138
+    matrix_left, metric_width = 300, 690
+    hero_panel_width, hero_panel_height, hero_label = 290, 410, 44
+    olat_top = matrix_top + matrix_header + len(profiles) * metric_height + 80
+    hdri_top = olat_top + 70 + hero_label + hero_panel_height + 70
+    height = hdri_top + 70 + hero_label + hero_panel_height + 70
+    canvas = Image.new("RGB", (width, height), (9, 9, 11))
+    draw = ImageDraw.Draw(canvas)
+    title_font = _report_font(40, bold=True)
+    section_font = _report_font(28, bold=True)
+    label_font = _report_font(22, bold=True)
+    metric_font = _report_font(28, bold=True)
+    note_font = _report_font(19)
+    draw.text(
+        (margin, 25),
+        "Material acquisition · relighting evaluation",
+        font=title_font,
+        fill="white",
+    )
+    draw.text(
+        (margin, 78),
+        "Rows are training-light profiles; columns are test-light suites. Higher PSNR / SSIM is better.",
+        font=note_font,
+        fill=(176, 181, 190),
+    )
+    draw.text(
+        (margin, matrix_top + 17),
+        "TRAINED ON",
+        font=label_font,
+        fill=(160, 166, 176),
+    )
+    for column, lighting in enumerate(("OLAT test", "HDRI test")):
+        x = matrix_left + column * metric_width
+        _centered_text(
+            draw,
+            (x, matrix_top, x + metric_width, matrix_top + matrix_header),
+            lighting,
+            label_font,
+            (235, 238, 242),
+        )
+    best = {
+        lighting: max(
+            float(
+                profile_results[profile]["evaluation"]["evaluations"][lighting][
+                    "metrics"
+                ]["psnr"]
+            )
+            for profile in profiles
+        )
+        for lighting in ("olat", "hdri")
     }
+    for row, profile in enumerate(profiles):
+        y = matrix_top + matrix_header + row * metric_height
+        _centered_text(
+            draw,
+            (margin, y, matrix_left - 16, y + metric_height),
+            f"{profile.upper()}-trained",
+            label_font,
+            (255, 216, 90),
+        )
+        for column, lighting in enumerate(("olat", "hdri")):
+            metrics = profile_results[profile]["evaluation"]["evaluations"][lighting][
+                "metrics"
+            ]
+            x = matrix_left + column * metric_width
+            is_best = float(metrics["psnr"]) == best[lighting]
+            fill = (18, 52, 55) if is_best else (22, 22, 26)
+            outline = (70, 215, 190) if is_best else (56, 56, 64)
+            draw.rounded_rectangle(
+                (x + 8, y + 8, x + metric_width - 8, y + metric_height - 8),
+                radius=14,
+                fill=fill,
+                outline=outline,
+                width=3 if is_best else 1,
+            )
+            draw.text(
+                (x + 28, y + 22),
+                f"{float(metrics['psnr']):.2f} dB   ·   {float(metrics['ssim_global']):.3f} SSIM",
+                font=metric_font,
+                fill="white",
+            )
+            ratio = float(metrics.get("mean_intensity_ratio", float("nan")))
+            corr = float(metrics.get("luminance_correlation", float("nan")))
+            draw.text(
+                (x + 28, y + 78),
+                f"brightness pred/ref {ratio:.3f}    ·    luminance corr {corr:.3f}",
+                font=note_font,
+                fill=(185, 190, 199),
+            )
+    _draw_hero_row(
+        canvas,
+        draw,
+        stage / "olat" / "cases" / olat_case_id,
+        olat_top,
+        "Representative OLAT relighting",
+        [("Reference", "reference.png")]
+        + [
+            (f"{profile.upper()}-trained", f"predictions/{profile}.png")
+            for profile in profiles
+        ],
+        hero_panel_width,
+        hero_panel_height,
+        hero_label,
+        section_font,
+        label_font,
+    )
+    _draw_hero_row(
+        canvas,
+        draw,
+        stage / "hdri" / "cases" / hdri_case_id,
+        hdri_top,
+        "Representative HDRI relighting · reference synthesized from measured OLAT",
+        [("Lighting", "lighting.png"), ("Reference", "reference.png")]
+        + [
+            (f"{profile.upper()}-trained", f"predictions/{profile}.png")
+            for profile in profiles
+        ],
+        hero_panel_width,
+        hero_panel_height,
+        hero_label,
+        section_font,
+        label_font,
+    )
+    canvas.save(stage / "overview.png")
+
+
+def _draw_hero_row(
+    canvas,
+    draw,
+    case_dir: Path,
+    top: int,
+    title: str,
+    panels: Sequence[tuple[str, str]],
+    panel_width: int,
+    panel_height: int,
+    label_height: int,
+    title_font,
+    label_font,
+) -> None:
+    gap = 16
+    total_width = len(panels) * panel_width + (len(panels) - 1) * gap
+    start_x = (canvas.width - total_width) // 2
+    draw.text((start_x, top), title, font=title_font, fill="white")
+    y = top + 58
+    for index, (label, relative_path) in enumerate(panels):
+        x = start_x + index * (panel_width + gap)
+        _centered_text(
+            draw,
+            (x, y, x + panel_width, y + label_height),
+            label,
+            label_font,
+            (235, 238, 242),
+        )
+        canvas.paste(
+            _fit_pil_path(case_dir / relative_path, panel_width, panel_height),
+            (x, y + label_height),
+        )
+
+
+def _validate_clean_report_tree(
+    stage: Path, profiles: Sequence[str], suite_reports: dict[str, dict[str, Any]]
+) -> None:
+    required = [
+        stage / "overview.png",
+        stage / "summary.json",
+        stage / "metrics.csv",
+        stage / "assets" / "conditions.json",
+        stage / "assets" / "weights.npz",
+    ]
+    for lighting, report in suite_reports.items():
+        suite = stage / lighting
+        required.append(suite / "comparison.png")
+        for case_id in report["case_ids"]:
+            case = suite / "cases" / case_id
+            required.extend([case / "reference.png", case / "comparison.png"])
+            if lighting == "hdri":
+                required.append(case / "lighting.png")
+            for profile in profiles:
+                required.extend(
+                    [
+                        case / "predictions" / f"{profile}.png",
+                        case / "errors" / f"{profile}.png",
+                    ]
+                )
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        raise RuntimeError(f"clean report validation failed; missing: {missing[:8]}")
+    unexpected = [name for name in ("report", ".profiles") if (stage / name).exists()]
+    if unexpected:
+        raise RuntimeError(f"clean report contains private/legacy directories: {unexpected}")
+
+
+def _update_profile_acquisition_reports(
+    camera_dir: Path,
+    profiles: Sequence[str],
+    profile_results: dict[str, dict[str, Any]],
+    suite_reports: dict[str, dict[str, Any]],
+) -> None:
+    adapter = _adapter_provenance()
+    for profile in profiles:
+        result = profile_results[profile]
+        evaluations = result["evaluation"]["evaluations"]
+        clean_evaluations = {}
+        for lighting in ("olat", "hdri"):
+            old = evaluations[lighting]
+            case_id = suite_reports[lighting]["representative_case"]
+            representative = {
+                "reference_path": f"evaluation/{lighting}/cases/{case_id}/reference.png",
+                "prediction_path": f"evaluation/{lighting}/cases/{case_id}/predictions/{profile}.png",
+                "error_path": f"evaluation/{lighting}/cases/{case_id}/errors/{profile}.png",
+                "comparison_path": f"evaluation/{lighting}/cases/{case_id}/comparison.png",
+            }
+            if lighting == "olat":
+                representative["frame_id"] = int(case_id)
+            else:
+                representative["condition_id"] = case_id
+                representative["lighting_path"] = (
+                    f"evaluation/hdri/cases/{case_id}/lighting.png"
+                )
+            clean_evaluations[lighting] = {
+                **{
+                    key: value
+                    for key, value in old.items()
+                    if key
+                    not in {"representative", "metrics_csv", "contact_sheet", "panels"}
+                },
+                "schema": "ictpolarreal.relighting-evaluation.v4",
+                "metrics_csv": "evaluation/metrics.csv",
+                "comparison": f"evaluation/{lighting}/comparison.png",
+                "panels": (
+                    ["reference", f"{profile}-trained", "fixed_scale_error"]
+                    if lighting == "olat"
+                    else [
+                        "lighting",
+                        "OLAT-synthesized reference",
+                        f"{profile}-trained",
+                        "fixed_scale_error",
+                    ]
+                ),
+                "representative": representative,
+            }
+        result["schema"] = "ictpolarreal.end2end-disney.v7"
+        result["evaluation"] = {
+            "schema": "ictpolarreal.profile-evaluation.v2",
+            "profile": profile,
+            "evaluations": clean_evaluations,
+        }
+        result.setdefault("paths", {})["evaluation"] = "evaluation"
+        result["paths"]["evaluation_suites"] = {
+            "olat": "evaluation/olat",
+            "hdri": "evaluation/hdri",
+        }
+        result["adapter"] = adapter
+        if isinstance(result.get("checkpoint_signature"), dict):
+            result["checkpoint_signature"]["adapter"] = adapter
+        acquisition_path = camera_dir / "material" / profile / "acquisition.json"
+        if acquisition_path.is_file():
+            _write_json_atomic(acquisition_path, result)
 
 
 def _evaluation_summary(
@@ -1508,15 +2249,33 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
+def _checkpoint_signatures_match(
+    existing: dict[str, Any] | None, expected: dict[str, Any]
+) -> bool:
+    """Compare numerical-fit provenance while ignoring presentation-only edits.
+
+    Older adapters hashed this entire module, so changing a report label made a
+    valid CUDA fit look stale.  ``algorithm_version`` remains the explicit
+    compatibility boundary; only that obsolete whole-file digest is ignored.
+    """
+    if not isinstance(existing, dict):
+        return False
+
+    def normalized(signature: dict[str, Any]) -> dict[str, Any]:
+        result = json.loads(json.dumps(signature))
+        adapter = result.get("adapter")
+        if isinstance(adapter, dict):
+            adapter.pop("end2end_acquisition_sha256", None)
+        return result
+
+    return normalized(existing) == normalized(expected)
+
+
 def _adapter_provenance() -> dict[str, Any]:
-    acquisition_path = Path(__file__).resolve()
-    lighting_path = acquisition_path.with_name("lighting_profiles.py")
+    lighting_path = Path(__file__).resolve().with_name("lighting_profiles.py")
     return {
         "schema": "ictpolarreal.profile-acquisition-adapter.v2",
         "algorithm_version": "superdimension-parity-v2",
-        "end2end_acquisition_sha256": hashlib.sha256(
-            acquisition_path.read_bytes()
-        ).hexdigest(),
         "lighting_profiles_sha256": hashlib.sha256(
             lighting_path.read_bytes()
         ).hexdigest(),

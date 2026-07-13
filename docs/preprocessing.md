@@ -127,7 +127,7 @@ Generated white, red, green, and blue (`w/r/g/b`) calibration environments are
 also added to the fit conditions, with the same rotations. They are never part
 of the held-out natural-HDRI suite.
 
-HDRI ground truth is therefore synthesized from measured ICTPolarReal parallel
+The HDRI reference is therefore synthesized from measured ICTPolarReal parallel
 OLATs; it is not an independently captured HDRI-lit photograph. The camera
 manifest, lighting condition manifest, and evaluation summaries record this
 target origin. The output demonstrates that the same acquisition
@@ -200,6 +200,7 @@ outputs/material_acquisition_end2end/
   object_name/camXX/
     manifest.json
     material/
+      overview.png
       olat/
         acquisition.json
         disney_brdf.pt
@@ -218,38 +219,38 @@ outputs/material_acquisition_end2end/
       hdri/...
       mix/...
     evaluation/
+      overview.png
+      metrics.csv
+      summary.json
       olat/
-        metrics.csv
-        summary.json
-        olat/
-          metrics.csv
-          summary.json
-          contact_sheet.png
-          cases/<frame_id>/{gt,pred,error,comparison}.png
-        hdri/
-          metrics.csv
-          summary.json
-          contact_sheet.png
-          cases/<condition_id>/{lighting,gt,pred,error,comparison}.png
-      hdri/...
-      mix/...
-      report/
-        overview.png
-        metrics.csv
-        summary.json
-      lighting/
+        comparison.png
+        cases/<frame_id>/
+          reference.png
+          predictions/{olat,hdri,mix}.png
+          errors/{olat,hdri,mix}.png
+          comparison.png
+      hdri/
+        comparison.png
+        cases/<condition_id>/
+          lighting.png
+          reference.png
+          predictions/{olat,hdri,mix}.png
+          errors/{olat,hdri,mix}.png
+          comparison.png
+      assets/
         conditions.json
         weights.npz
 ```
 
-Only requested profiles are created. `evaluation/report/overview.png` uses one
-shared representative OLAT case and one shared representative HDRI case across
-all rows, alongside maps and aggregate metrics, so the profile comparison is
-visually aligned. `evaluation/report/metrics.csv` and
-`evaluation/report/summary.json` provide the same comparison in
-machine-readable form. `evaluation/lighting/` contains only `conditions.json`
-and `weights.npz`; lighting thumbnails live in the HDRI cases that consume
-them, so there is no duplicate preview dump.
+Only requested profiles are created. `material/overview.png` compares their
+maps. `evaluation/overview.png` uses one shared representative OLAT case and
+one shared representative HDRI case, so all profile predictions are visually
+aligned. `evaluation/metrics.csv` and `evaluation/summary.json` provide the
+same evaluation matrix in machine-readable form. The lighting-first
+`evaluation/{olat,hdri}/` tree stores each reference once and keeps profile
+predictions and errors under named subdirectories. `evaluation/assets/`
+contains only `conditions.json` and `weights.npz`; lighting thumbnails live in
+the HDRI cases that consume them, so there is no duplicate preview dump.
 
 During each long fit, the resumable checkpoint is
 `material/<profile>/checkpoints/latest.pt`. Re-running with the

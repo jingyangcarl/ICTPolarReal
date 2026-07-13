@@ -77,10 +77,11 @@ Default outputs are written to `outputs/`:
 - `outputs/material_acquisition/`: the default Ward material maps under
   `<object>/<camera>/brdf/`.
 - `outputs/material_acquisition_end2end/`: independent OLAT-, HDRI-, and
-  mixed-lighting Disney fits. Each camera keeps acquired maps under
-  `material/<profile>/` and all relighting results, shared lighting provenance,
-  and the composed report under `evaluation/`. `run.json` records the complete
-  acquisition run.
+  mixed-lighting Disney fits. Each camera has two entry points:
+  `material/overview.png` compares the acquired maps, while
+  `evaluation/overview.png` compares every fit on shared OLAT and HDRI cases.
+  Detailed results are lighting-first under `evaluation/{olat,hdri}/`, and
+  `run.json` records the complete acquisition run.
 - `outputs/train/inverse/`: prompt-conditioned RGB-to-PBR/polarization LoRA and predictions.
 - `outputs/train/forward/gbuffer/`: PBR G-buffer-to-RGB LoRA and relighting predictions.
 - `outputs/train/forward/polarization/`: cross/parallel-to-RGB LoRA and relighting predictions.
@@ -192,14 +193,16 @@ profile is then evaluated on exactly the same OLAT and HDRI suites, including
 the deterministic OLAT holdout and held-out natural HDRI identities. A camera
 `manifest.json` records all profiles and `primary_material_dir`; downstream
 training follows that field instead of assuming a `brdf/` directory. See
-`evaluation/report/overview.png` for the aligned profile comparison and
-`run.json` at the material root for run status and settings. Shared lighting
-provenance is limited to `evaluation/lighting/conditions.json` and
-`evaluation/lighting/weights.npz`; HDRI case folders carry the thumbnails used
-by the report. The reported validity-masked MSE, MAE, PSNR, and `ssim_global`
-compare clipped renderer-normalized LDR images. They support within-run
-evaluation and do not establish numerical parity with another dataset or
-pipeline.
+`material/overview.png` for the map comparison and `evaluation/overview.png`
+for the aligned relighting comparison. `evaluation/metrics.csv` and
+`evaluation/summary.json` are their machine-readable evaluation companions;
+`run.json` at the material root records run status and settings. Shared
+lighting provenance is limited to `evaluation/assets/conditions.json` and
+`evaluation/assets/weights.npz`; each HDRI case carries the one lighting
+thumbnail used by all profile predictions. The reported validity-masked MSE,
+MAE, PSNR, and `ssim_global` compare clipped renderer-normalized LDR images.
+They support within-run evaluation and do not establish numerical parity with
+another dataset or pipeline.
 
 Objaverse-style evaluation uses `configs/eval_objaverse_samples.json`; see
 `samples/objaverse/README.md` for the expected sample layout.
