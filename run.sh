@@ -8,6 +8,11 @@ SAMPLE_URL="https://drive.google.com/drive/u/1/folders/1J2lfWe8rO1ZXpbeVW68u2RSq
 ENV_NAME="${ENV_NAME:-ictpolarreal}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.10}"
 DATA_ROOT="${DATA_ROOT:-${REPO_ROOT}/data/sample}"
+HDRI_ROOT_EXPLICIT=0
+if [[ -n "${HDRI_ROOT:-}" ]]; then
+  HDRI_ROOT_EXPLICIT=1
+fi
+HDRI_ROOT="${HDRI_ROOT:-${DATA_ROOT}/hdri}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_ROOT}/outputs}"
 MATERIAL_ROOT_EXPLICIT=0
 if [[ -n "${MATERIAL_ROOT:-}" ]]; then
@@ -38,10 +43,13 @@ LEARNING_RATE="${LEARNING_RATE:-3e-5}"
 LORA_RANK="${LORA_RANK:-8}"
 GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
 MIXED_PRECISION="${MIXED_PRECISION:-auto}"
-CHECKPOINTING_STEPS="${CHECKPOINTING_STEPS:-10000}"
+CHECKPOINTING_STEPS="${CHECKPOINTING_STEPS:-50000}"
 RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
 TRAIN_EVAL_STEPS="${TRAIN_EVAL_STEPS:-50000}"
 TRAIN_EVAL_SAMPLES="${TRAIN_EVAL_SAMPLES:-1}"
+FORWARD_EVAL_OLAT_SAMPLES="${FORWARD_EVAL_OLAT_SAMPLES:-20}"
+FORWARD_EVAL_HDRI_SAMPLES="${FORWARD_EVAL_HDRI_SAMPLES:-20}"
+FORWARD_EVAL_HDRI_OLAT_LIGHTS="${FORWARD_EVAL_HDRI_OLAT_LIGHTS:-20}"
 TRAIN_EVAL_METHODS="${TRAIN_EVAL_METHODS:-rgb2x,ours,diffusion_renderer,lotus,dsine}"
 LOG_STEPS="${LOG_STEPS:-10}"
 EVAL_BASELINES=()
@@ -105,6 +113,7 @@ Commands:
 
 Options:
   --data-root PATH          Dataset root. Default: ${DATA_ROOT}
+  --hdri-root PATH          Forward benchmark HDRIs. Default: ${HDRI_ROOT}
   --output-root PATH        Output root. Default: ${OUTPUT_ROOT}
   --material-root PATH      Processed material map root. Default: ${MATERIAL_ROOT}
   --env-name NAME           Conda/micromamba env name. Default: ${ENV_NAME}
@@ -134,7 +143,13 @@ Options:
   --checkpointing-steps N   Save interval; 0 disables periodic saves. Default: ${CHECKPOINTING_STEPS}
   --resume PATH             Resume from a checkpoint path or latest.
   --train-eval-steps N      In-training evaluation interval. Default: ${TRAIN_EVAL_STEPS}
-  --train-eval-samples N    Fixed evaluation samples per method. Default: ${TRAIN_EVAL_SAMPLES}
+  --train-eval-samples N    Fixed evaluation cameras per method. Default: ${TRAIN_EVAL_SAMPLES}
+  --forward-eval-olat-samples N
+                            Fixed OLAT conditions per camera. Default: ${FORWARD_EVAL_OLAT_SAMPLES}
+  --forward-eval-hdri-samples N
+                            Fixed HDRI conditions per camera. Default: ${FORWARD_EVAL_HDRI_SAMPLES}
+  --forward-eval-hdri-olat-lights N
+                            OLAT captures composed per HDRI target. Default: ${FORWARD_EVAL_HDRI_OLAT_LIGHTS}
   --train-eval-methods LIST Methods to compare during training. Default: ${TRAIN_EVAL_METHODS}
   --eval-baseline METHOD=PATH
                             Cached Diffusion Renderer, Lotus, or DSINE predictions; repeat as needed.
@@ -182,6 +197,7 @@ parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --data-root) DATA_ROOT="$2"; shift 2 ;;
+      --hdri-root) HDRI_ROOT="$2"; HDRI_ROOT_EXPLICIT=1; shift 2 ;;
       --output-root) OUTPUT_ROOT="$2"; shift 2 ;;
       --material-root) MATERIAL_ROOT="$2"; MATERIAL_ROOT_EXPLICIT=1; shift 2 ;;
       --env-name) ENV_NAME="$2"; shift 2 ;;
@@ -212,6 +228,9 @@ parse_args() {
       --resume) RESUME_FROM_CHECKPOINT="$2"; shift 2 ;;
       --train-eval-steps) TRAIN_EVAL_STEPS="$2"; shift 2 ;;
       --train-eval-samples) TRAIN_EVAL_SAMPLES="$2"; shift 2 ;;
+      --forward-eval-olat-samples) FORWARD_EVAL_OLAT_SAMPLES="$2"; shift 2 ;;
+      --forward-eval-hdri-samples) FORWARD_EVAL_HDRI_SAMPLES="$2"; shift 2 ;;
+      --forward-eval-hdri-olat-lights) FORWARD_EVAL_HDRI_OLAT_LIGHTS="$2"; shift 2 ;;
       --train-eval-methods) TRAIN_EVAL_METHODS="$2"; shift 2 ;;
       --eval-baseline) EVAL_BASELINES+=("$2"); shift 2 ;;
       --baseline-root) BASELINE_ROOT="$2"; BASELINE_ROOT_EXPLICIT=1; shift 2 ;;
@@ -252,6 +271,12 @@ parse_args() {
   fi
   if [[ "${BASELINE_ROOT_EXPLICIT}" != "1" ]]; then
     BASELINE_ROOT="${OUTPUT_ROOT}/train/baseline"
+  fi
+  if [[ "${HDRI_ROOT_EXPLICIT}" != "1" ]]; then
+    HDRI_ROOT="${DATA_ROOT}/hdri"
+    if [[ ! -d "${HDRI_ROOT}" && -d "/home/jyang/data/lightProbe/general/exr/equirectangular" ]]; then
+      HDRI_ROOT="/home/jyang/data/lightProbe/general/exr/equirectangular"
+    fi
   fi
   if (( MAX_LIGHTS > MIN_DECOMP_LIGHTS )); then
     REQUIRED_DECOMP_LIGHTS="${MAX_LIGHTS}"
@@ -642,16 +667,31 @@ prepare_baselines() {
   if [[ "${SKIP_BASELINES}" == "1" || "${TRAIN_EVAL_SAMPLES}" == "0" ]]; then
     return 0
   fi
-  if [[ "${TRAIN_STAGE}" == "forward" || "${INVERSE_WORKFLOW}" == "polarization" ]]; then
-    return 0
+
+  local include_inverse=0
+  local include_forward=0
+  if [[ "${TRAIN_STAGE}" == "inverse" || "${TRAIN_STAGE}" == "both" ]]; then
+    if [[ "${INVERSE_WORKFLOW}" == "pbr" || "${INVERSE_WORKFLOW}" == "both" ]]; then
+      include_inverse=1
+    fi
+  fi
+  if [[ "${TRAIN_STAGE}" == "forward" || "${TRAIN_STAGE}" == "both" ]]; then
+    include_forward=1
   fi
 
   local requested=()
   local method
   while IFS= read -r method; do
     case "${method}" in
-      diffusion_renderer|lotus|dsine)
-        if ! has_eval_baseline "${method}"; then requested+=("${method}"); fi
+      diffusion_renderer)
+        if [[ "${include_inverse}" == "1" || "${include_forward}" == "1" ]] && ! has_eval_baseline "${method}"; then
+          requested+=("${method}")
+        fi
+        ;;
+      lotus|dsine)
+        if [[ "${include_inverse}" == "1" ]] && ! has_eval_baseline "${method}"; then
+          requested+=("${method}")
+        fi
         ;;
     esac
   done < <(printf '%s\n' "${TRAIN_EVAL_METHODS}" | tr ',' '\n')
@@ -672,6 +712,11 @@ prepare_baselines() {
   for method in "${requested[@]}"; do
     methods_csv="${methods_csv}${methods_csv:+,}${method}"
   done
+  local baseline_stages=""
+  if [[ "${include_inverse}" == "1" ]]; then baseline_stages="inverse"; fi
+  if [[ "${include_forward}" == "1" ]]; then
+    baseline_stages="${baseline_stages}${baseline_stages:+,}forward"
+  fi
   local optional_args=()
   if [[ -n "${DSINE_REPO}" ]]; then optional_args+=(--dsine-repo "${DSINE_REPO}"); fi
   if [[ "${LOCAL_FILES_ONLY}" == "1" ]]; then optional_args+=(--local-files-only); fi
@@ -680,6 +725,16 @@ prepare_baselines() {
   python -m ictpolarreal.eval.baselines \
     --data-root "${DATA_ROOT}" \
     --out-root "${BASELINE_ROOT}" \
+    --stages "${baseline_stages}" \
+    --material-root "${MATERIAL_ROOT}" \
+    --hdri-root "${HDRI_ROOT}" \
+    --light-root "${LIGHT_ROOT:-${REPO_ROOT}/metadata}" \
+    --frame-layout "${FRAME_LAYOUT}" \
+    --max-lights "${MAX_LIGHTS}" \
+    --light-start "${LIGHT_START}" \
+    --forward-olat-samples "${FORWARD_EVAL_OLAT_SAMPLES}" \
+    --forward-hdri-samples "${FORWARD_EVAL_HDRI_SAMPLES}" \
+    --forward-hdri-olat-lights "${FORWARD_EVAL_HDRI_OLAT_LIGHTS}" \
     --methods "${methods_csv}" \
     --max-samples "${TRAIN_EVAL_SAMPLES}" \
     --device "${DEVICE}" \
@@ -763,6 +818,10 @@ train_forward_mode() {
     --evaluation-steps "${TRAIN_EVAL_STEPS}" \
     --evaluation-samples "${TRAIN_EVAL_SAMPLES}" \
     --evaluation-methods "${TRAIN_EVAL_METHODS}" \
+    --hdri-root "${HDRI_ROOT}" \
+    --forward-eval-olat-samples "${FORWARD_EVAL_OLAT_SAMPLES}" \
+    --forward-eval-hdri-samples "${FORWARD_EVAL_HDRI_SAMPLES}" \
+    --forward-eval-hdri-olat-lights "${FORWARD_EVAL_HDRI_OLAT_LIGHTS}" \
     --log-steps "${LOG_STEPS}" \
     --preview-samples "${PREVIEW_SAMPLES}" \
     --inference-steps "${INFERENCE_STEPS}" \

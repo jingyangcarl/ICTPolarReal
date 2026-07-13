@@ -180,7 +180,7 @@ def test_release_training_schedule_defaults():
     )
 
     assert args.max_steps == 100000
-    assert args.checkpointing_steps == 10000
+    assert args.checkpointing_steps == 50000
     assert args.evaluation_steps == 50000
     assert args.evaluation_methods == "rgb2x,ours,diffusion_renderer,lotus,dsine"
 
@@ -192,3 +192,26 @@ def test_external_prediction_layouts(tmp_path):
 
     assert _find_external_prediction(tmp_path, sample=sample, task="normal") == normal_path
     assert _find_external_prediction(tmp_path, sample=sample, task="albedo") is None
+
+    forward_path = (
+        tmp_path
+        / "object"
+        / "cam00"
+        / "hdri_studio"
+        / "forward_rgb.png"
+    )
+    write_image(forward_path, np.full((8, 8, 3), 0.25, dtype=np.float32))
+    forward_sample = {
+        "object": "object",
+        "camera": "cam00",
+        "frame_id": -1,
+        "lighting_name": "hdri_studio",
+    }
+    assert (
+        _find_external_prediction(
+            tmp_path,
+            sample=forward_sample,
+            task="forward_gbuffer",
+        )
+        == forward_path
+    )

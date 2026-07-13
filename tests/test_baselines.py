@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -19,10 +20,14 @@ def test_prepare_baseline_manifest_and_cache_contract(tmp_path):
     write_image(camera / "static.png", image)
 
     out_root = tmp_path / "baselines"
-    manifest_path, samples = prepare_manifest(camera.parents[1], out_root, max_samples=1)
+    manifest_path, samples, forward_samples = prepare_manifest(
+        camera.parents[1], out_root, max_samples=1
+    )
 
     payload = json.loads(manifest_path.read_text())
     assert payload["samples"] == samples
+    assert payload["stages"] == ["inverse"]
+    assert payload["forward_samples"] == forward_samples == []
     assert samples[0]["object"] == "object"
     staged = read_image(samples[0]["input"])
     assert staged.shape == image.shape
@@ -36,6 +41,52 @@ def test_prepare_baseline_manifest_and_cache_contract(tmp_path):
         assert _method_complete(out_root, method, samples)
 
 
+def test_forward_cache_contract(tmp_path):
+    samples = [{"object": "object", "camera": "cam00", "input": "static.png"}]
+    forward_samples = [
+        {
+            "object": "object",
+            "camera": "cam00",
+            "lighting_type": "olat",
+            "lighting_name": "olat_000000",
+            "environment": "olat.exr",
+        },
+        {
+            "object": "object",
+            "camera": "cam00",
+            "lighting_type": "hdri",
+            "lighting_name": "hdri_studio",
+            "environment": "studio.exr",
+        },
+    ]
+    root = tmp_path / "baselines"
+
+    assert not _method_complete(
+        root,
+        "diffusion_renderer",
+        samples,
+        stages=("forward",),
+        forward_samples=forward_samples,
+    )
+    for sample in forward_samples:
+        write_image(
+            root
+            / "diffusion_renderer"
+            / sample["object"]
+            / sample["camera"]
+            / sample["lighting_name"]
+            / "forward_rgb.png",
+            np.zeros((4, 4, 3), dtype=np.float32),
+        )
+    assert _method_complete(
+        root,
+        "diffusion_renderer",
+        samples,
+        stages=("forward",),
+        forward_samples=forward_samples,
+    )
+
+
 def test_worker_environment_uses_selected_python_prefix(tmp_path, monkeypatch):
     monkeypatch.delenv("CUDA_HOME", raising=False)
     monkeypatch.delenv("CUDA_PATH", raising=False)
@@ -45,5 +96,6 @@ def test_worker_environment_uses_selected_python_prefix(tmp_path, monkeypatch):
 
     assert environment["CONDA_PREFIX"] == str(tmp_path / "env")
     assert environment["CUDA_HOME"] == str(tmp_path / "env")
+    assert environment["PATH"].split(os.pathsep)[0] == str(python.parent)
     assert str(Path(__file__).resolve().parents[1]) in environment["PYTHONPATH"]
     assert str(repo) in environment["PYTHONPATH"]

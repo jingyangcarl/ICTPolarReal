@@ -9,7 +9,11 @@ max_steps: 100000
 learning_rate: 0.00003
 lora_rank: 8
 log_steps: 10
-checkpointing_steps: 10000
+checkpointing_steps: 50000
 evaluation_steps: 50000
-evaluation_samples: 10
+evaluation_samples: 1
 evaluation_methods: rgb2x,ours,diffusion_renderer,lotus,dsine
+hdri_root: data/hdri
+forward_eval_olat_samples: 20
+forward_eval_hdri_samples: 20
+forward_eval_hdri_olat_lights: 20

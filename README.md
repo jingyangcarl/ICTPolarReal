@@ -45,8 +45,8 @@ same command.
 | 2 | Check Python packages | Verifies imports and reports PyTorch/CUDA availability. |
 | 3 | Prepare sample data | Validates `data/sample`; if needed, downloads one complete 346-light camera view. |
 | 4 | Decompose polarization data | Fits diffuse normals/albedo and specular BRDF parameters, then writes material PNG maps. |
-| 5 | Run benchmark methods | Precomputes Diffusion Renderer, Lotus, and DSINE predictions once, then caches them. |
-| 6 | Train and compare methods | Trains each selected model for 100,000 steps and writes combined evaluations at steps 50,000 and 100,000. |
+| 5 | Run benchmark methods | Precomputes Diffusion Renderer inverse/forward, Lotus, and DSINE predictions once, then caches them. |
+| 6 | Train and compare methods | Trains each selected model for 100,000 steps and writes OLAT/HDRI comparisons at steps 50,000 and 100,000. |
 
 ## Expected Data Layout
 
@@ -63,6 +63,8 @@ data/sample/
       albedo.exr
       cross/000002.exr ... 000347.exr
       parallel/000002.exr ... 000347.exr
+data/hdri/
+  environment_name.exr
 ```
 
 The original 350-frame capture layout reserves frames `000000`, `000001`,
@@ -89,7 +91,7 @@ Default outputs are written to `outputs/`:
 | --- | --- | --- |
 | `rgb2x` | Original RGB2X checkpoint | Runs in the trainer and appears as `RGB2X`. |
 | `ours` | Current ICTPolarReal LoRA | Runs in the trainer and appears as `Ours`. |
-| `diffusion_renderer` | Diffusion Renderer | Runs the Cosmos inverse renderer for albedo, normal, and specular. |
+| `diffusion_renderer` | Diffusion Renderer | Runs the Cosmos inverse renderer and forward renderer under the same OLAT/HDRI conditions. |
 | `lotus` | Lotus | Runs the one-step Lotus normal model. |
 | `dsine` | DSINE | Runs the DSINE surface-normal model. |
 
@@ -109,6 +111,11 @@ The launcher detects `external/lotus`,
 `--diffusion-renderer-python`. These official external environments and model
 weights must be installed once; they are intentionally not mixed into the
 RGB2X training environment. See `docs/training.md` for the cache layout.
+
+Forward evaluation uses 20 fixed OLATs and 20 fixed HDRIs for each selected
+camera. Put evaluation environments under `data/hdri`, or pass `--hdri-root`.
+The CSV records `lighting_type=olat|hdri`, and `summary.json` reports each
+lighting subset separately.
 
 ## Flexible Usage
 
@@ -140,6 +147,9 @@ Useful options:
 - `--resume latest`: continue from the newest checkpoint in each selected stage.
 - `--train-eval-steps N`: run the combined benchmark periodically. The default is 50,000.
 - `--train-eval-samples N`: set the fixed evaluation subset size; `0` disables in-training evaluation.
+- `--hdri-root PATH`: directory of equirectangular HDR/EXR evaluation environments.
+- `--forward-eval-olat-samples N`: fixed OLAT conditions per evaluation camera. Default: 20.
+- `--forward-eval-hdri-samples N`: fixed HDRI conditions per evaluation camera. Default: 20.
 - `--eval-baseline METHOD=PATH`: add cached Diffusion Renderer, Lotus, or DSINE results.
 - `--skip-baselines`: train without generating missing external predictions.
 - `--material-root PATH`: use precomputed material maps from another run.

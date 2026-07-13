@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import sys
 from contextlib import nullcontext
@@ -8,16 +9,29 @@ from pathlib import Path
 
 import numpy as np
 
-from ictpolarreal.utils.io import write_image
+from ictpolarreal.utils.io import read_image, write_image
 
 
-def _load_samples(path: str | Path) -> list[dict[str, str]]:
-    payload = json.loads(Path(path).read_text())
-    return list(payload["samples"])
+def _load_manifest(path: str | Path) -> dict:
+    return json.loads(Path(path).read_text())
 
 
 def _output_path(root: str | Path, sample: dict[str, str], task: str) -> Path:
     return Path(root) / sample["object"] / sample["camera"] / "static" / f"{task}.png"
+
+
+def _gbuffer_path(root: str | Path, sample: dict[str, str], task: str) -> Path:
+    return Path(root) / sample["object"] / sample["camera"] / "_gbuffer" / f"{task}.png"
+
+
+def _forward_output_path(root: str | Path, sample: dict[str, str]) -> Path:
+    return (
+        Path(root)
+        / sample["object"]
+        / sample["camera"]
+        / sample["lighting_name"]
+        / "forward_rgb.png"
+    )
 
 
 def _run_lotus(args: argparse.Namespace, samples: list[dict[str, str]]) -> None:
@@ -119,12 +133,53 @@ def _diffusion_renderer_batch(image_path: str, *, height: int, width: int):
     }
 
 
-def _run_diffusion_renderer(args: argparse.Namespace, samples: list[dict[str, str]]) -> None:
+def _diffusion_renderer_prediction(output, *, output_hw: tuple[int, int]):
     import torch
     import torch.nn.functional as functional
 
+    prediction = torch.as_tensor(output).permute(0, 3, 1, 2).float()
+    prediction = functional.interpolate(
+        prediction,
+        size=output_hw,
+        mode="bilinear",
+        align_corners=False,
+    )[0].permute(1, 2, 0).cpu().numpy()
+    if prediction.max(initial=0.0) > 2.0:
+        prediction = prediction / 255.0
+    return np.clip(prediction[..., :3], 0.0, 1.0)
+
+
+def _diffusion_renderer_forward_batch(
+    sample: dict[str, str],
+    *,
+    out_root: str | Path,
+    height: int,
+    width: int,
+):
+    import torch
+    import torch.nn.functional as functional
+
+    batch = _diffusion_renderer_batch(sample["input"], height=height, width=width)
+    for task in ("basecolor", "normal", "metallic", "roughness", "depth"):
+        image = read_image(_gbuffer_path(out_root, sample, task), channels=3)
+        tensor = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0)
+        tensor = functional.interpolate(
+            tensor,
+            size=(height, width),
+            mode="bilinear",
+            align_corners=False,
+        )
+        batch[task] = (tensor * 2.0 - 1.0).unsqueeze(2)
+    return batch
+
+
+def _run_diffusion_renderer(args: argparse.Namespace, manifest: dict) -> None:
+    import torch
+
     if not args.repo:
         raise ValueError("Diffusion Renderer requires --repo pointing to a Cosmos Diffusion Renderer checkout")
+    if args.device != "cuda" or not torch.cuda.is_available():
+        raise RuntimeError("Diffusion Renderer inverse/forward inference requires a CUDA GPU")
     repo = Path(args.repo).resolve()
     sys.path.insert(0, str(repo))
     from cosmos_predict1.diffusion.inference.diffusion_renderer_pipeline import (
@@ -132,12 +187,99 @@ def _run_diffusion_renderer(args: argparse.Namespace, samples: list[dict[str, st
     )
     from cosmos_predict1.diffusion.inference.diffusion_renderer_utils.rendering_utils import (
         GBUFFER_INDEX_MAPPING,
+        envmap_vec,
+    )
+    from cosmos_predict1.diffusion.inference.diffusion_renderer_utils.utils_env_proj import (
+        process_environment_map,
     )
 
     checkpoint_dir = Path(args.checkpoint_dir or repo / "checkpoints")
-    pipeline = DiffusionRendererPipeline(
+    samples = list(manifest["samples"])
+    forward_samples = list(manifest.get("forward_samples", []))
+    stages = set(manifest.get("stages", ["inverse"]))
+    passes = {
+        "diffuse_albedo": "albedo",
+        "normal": "normal",
+        "specular_albedo": "specular",
+    }
+    required_sources = []
+    if "inverse" in stages:
+        required_sources.extend(passes)
+    if forward_samples:
+        required_sources.extend(("basecolor", "normal", "metallic", "roughness", "depth"))
+    required_sources = list(dict.fromkeys(required_sources))
+
+    inverse_pipeline = None
+    for sample in samples:
+        batch = None
+        original_hw = None
+        for source in required_sources:
+            gbuffer_path = _gbuffer_path(args.out_root, sample, source)
+            if args.force or not gbuffer_path.exists():
+                if inverse_pipeline is None:
+                    inverse_pipeline = DiffusionRendererPipeline(
+                        checkpoint_dir=str(checkpoint_dir),
+                        checkpoint_name="Diffusion_Renderer_Inverse_Cosmos_7B",
+                        offload_network=args.offload,
+                        offload_tokenizer=args.offload,
+                        offload_text_encoder_model=args.offload,
+                        offload_guardrail_models=args.offload,
+                        guidance=0,
+                        num_steps=args.inference_steps,
+                        height=args.height,
+                        width=args.width,
+                        fps=24,
+                        num_video_frames=1,
+                        seed=args.seed,
+                    )
+                if batch is None:
+                    batch = _diffusion_renderer_batch(
+                        sample["input"],
+                        height=args.height,
+                        width=args.width,
+                    )
+                    original_hw = tuple(int(value) for value in batch["in_res"][0])
+                batch.pop("video", None)
+                batch["context_index"].fill_(GBUFFER_INDEX_MAPPING[source])
+                output = inverse_pipeline.generate_video(
+                    data_batch=batch,
+                    normalize_normal=False,
+                )
+                prediction = _diffusion_renderer_prediction(output, output_hw=original_hw)
+                write_image(gbuffer_path, prediction)
+                print(f"[baseline:diffusion_renderer] wrote {gbuffer_path}")
+            else:
+                prediction = read_image(gbuffer_path, channels=3)
+
+            target = passes.get(source)
+            if target is None or "inverse" not in stages:
+                continue
+            output_path = _output_path(args.out_root, sample, target)
+            if output_path.exists() and not args.force:
+                continue
+            display = prediction.copy()
+            if source == "normal":
+                display[..., 0] = 1.0 - display[..., 0]
+            write_image(output_path, display)
+            print(f"[baseline:diffusion_renderer] wrote {output_path}")
+
+    if inverse_pipeline is not None:
+        del inverse_pipeline
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    pending_forward = [
+        sample
+        for sample in forward_samples
+        if args.force or not _forward_output_path(args.out_root, sample).exists()
+    ]
+    if not pending_forward:
+        return
+
+    input_by_camera = {(sample["object"], sample["camera"]): sample for sample in samples}
+    forward_pipeline = DiffusionRendererPipeline(
         checkpoint_dir=str(checkpoint_dir),
-        checkpoint_name="Diffusion_Renderer_Inverse_Cosmos_7B",
+        checkpoint_name="Diffusion_Renderer_Forward_Cosmos_7B",
         offload_network=args.offload,
         offload_tokenizer=args.offload,
         offload_text_encoder_model=args.offload,
@@ -150,43 +292,45 @@ def _run_diffusion_renderer(args: argparse.Namespace, samples: list[dict[str, st
         num_video_frames=1,
         seed=args.seed,
     )
-    passes = {
-        "diffuse_albedo": "albedo",
-        "normal": "normal",
-        "specular_albedo": "specular",
-    }
-
-    for sample in samples:
-        pending = {
-            source: target
-            for source, target in passes.items()
-            if args.force or not _output_path(args.out_root, sample, target).exists()
-        }
-        if not pending:
-            continue
-        batch = _diffusion_renderer_batch(sample["input"], height=args.height, width=args.width)
+    device = torch.device("cuda")
+    for index, forward_sample in enumerate(pending_forward):
+        camera_key = (forward_sample["object"], forward_sample["camera"])
+        if camera_key not in input_by_camera:
+            raise KeyError(f"No staged static input for forward sample {camera_key}")
+        input_sample = input_by_camera[camera_key]
+        batch = _diffusion_renderer_forward_batch(
+            input_sample,
+            out_root=args.out_root,
+            height=args.height,
+            width=args.width,
+        )
+        environment = process_environment_map(
+            forward_sample["environment"],
+            resolution=(args.height, args.width),
+            num_frames=1,
+            fixed_pose=True,
+            rotate_envlight=False,
+            env_format=["proj"],
+            device=device,
+        )
+        batch["env_ldr"] = environment["env_ldr"].unsqueeze(0).permute(0, 4, 1, 2, 3) * 2 - 1
+        batch["env_log"] = environment["env_log"].unsqueeze(0).permute(0, 4, 1, 2, 3) * 2 - 1
+        environment_normal = envmap_vec([args.height, args.width], device=device)
+        batch["env_nrm"] = (
+            environment_normal.unsqueeze(0)
+            .unsqueeze(0)
+            .permute(0, 4, 1, 2, 3)
+            .expand_as(batch["env_ldr"])
+        )
+        output = forward_pipeline.generate_video(
+            data_batch=batch,
+            seed=args.seed + index,
+        )
         original_hw = tuple(int(value) for value in batch["in_res"][0])
-        for source, target in pending.items():
-            batch["context_index"].fill_(GBUFFER_INDEX_MAPPING[source])
-            output = pipeline.generate_video(
-                data_batch=batch,
-                normalize_normal=False,
-            )
-            prediction = torch.as_tensor(output).permute(0, 3, 1, 2).float()
-            prediction = functional.interpolate(
-                prediction,
-                size=original_hw,
-                mode="bilinear",
-                align_corners=False,
-            )[0].permute(1, 2, 0).cpu().numpy()
-            if prediction.max(initial=0.0) > 2.0:
-                prediction = prediction / 255.0
-            prediction = np.clip(prediction, 0.0, 1.0)
-            if source == "normal":
-                prediction[..., 0] = 1.0 - prediction[..., 0]
-            output_path = _output_path(args.out_root, sample, target)
-            write_image(output_path, prediction)
-            print(f"[baseline:diffusion_renderer] wrote {output_path}")
+        prediction = _diffusion_renderer_prediction(output, output_hw=original_hw)
+        output_path = _forward_output_path(args.out_root, forward_sample)
+        write_image(output_path, prediction)
+        print(f"[baseline:diffusion_renderer] wrote {output_path}")
 
 
 def main() -> None:
@@ -207,13 +351,14 @@ def main() -> None:
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
-    samples = _load_samples(args.manifest)
+    manifest = _load_manifest(args.manifest)
+    samples = list(manifest["samples"])
     if args.method == "lotus":
         _run_lotus(args, samples)
     elif args.method == "dsine":
         _run_dsine(args, samples)
     else:
-        _run_diffusion_renderer(args, samples)
+        _run_diffusion_renderer(args, manifest)
 
 
 if __name__ == "__main__":

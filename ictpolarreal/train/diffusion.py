@@ -6,6 +6,7 @@ import json
 import random
 from pathlib import Path
 
+from ictpolarreal.data.forward_evaluation import ICTPolarRealForwardEvaluationDataset
 from ictpolarreal.data.training import ICTPolarRealTrainingDataset
 from ictpolarreal.train.contracts import (
     INVERSE_PROMPTS,
@@ -32,7 +33,9 @@ EVALUATION_METHOD_LABELS = {
     "dsine": "DSINE",
 }
 EXTERNAL_METHOD_TASKS = {
-    "diffusion_renderer": frozenset({"albedo", "normal", "specular", "forward_gbuffer"}),
+    "diffusion_renderer": frozenset(
+        {"albedo", "normal", "specular", "forward_gbuffer", "forward_polarization"}
+    ),
     "lotus": frozenset({"normal"}),
     "dsine": frozenset({"normal"}),
 }
@@ -61,7 +64,7 @@ def add_training_arguments(parser: argparse.ArgumentParser, *, stage: str) -> ar
     parser.add_argument("--mixed-precision", choices=["auto", "no", "fp16", "bf16"], default="auto")
     parser.add_argument("--lora-rank", type=int, default=8)
     parser.add_argument("--full-finetune", action="store_true")
-    parser.add_argument("--checkpointing-steps", type=int, default=10000)
+    parser.add_argument("--checkpointing-steps", type=int, default=50000)
     parser.add_argument("--resume-from-checkpoint", default=None, help="Checkpoint path or 'latest'.")
     parser.add_argument("--evaluation-steps", type=int, default=50000)
     parser.add_argument("--evaluation-samples", type=int, default=4)
@@ -78,6 +81,10 @@ def add_training_arguments(parser: argparse.ArgumentParser, *, stage: str) -> ar
     )
     parser.add_argument("--eval-data-root", default=None)
     parser.add_argument("--eval-material-root", default=None)
+    parser.add_argument("--hdri-root", default=None)
+    parser.add_argument("--forward-eval-olat-samples", type=int, default=20)
+    parser.add_argument("--forward-eval-hdri-samples", type=int, default=20)
+    parser.add_argument("--forward-eval-hdri-olat-lights", type=int, default=20)
     parser.add_argument("--log-steps", type=int, default=10)
     parser.add_argument("--preview-samples", type=int, default=1)
     parser.add_argument("--inference-steps", type=int, default=10)
@@ -123,16 +130,33 @@ def run_diffusion_training(args: argparse.Namespace, *, stage: str) -> None:
     baseline_roots = _parse_evaluation_baselines(args.evaluation_baseline)
     evaluation_dataset = None
     if args.evaluation_samples > 0 and evaluation_methods:
-        evaluation_dataset = ICTPolarRealTrainingDataset(
-            args.eval_data_root or args.data_root,
-            material_root=args.eval_material_root or args.material_root,
-            resolution=args.resolution,
-            max_lights=args.max_lights,
-            light_start=args.light_start,
-            frame_layout=args.frame_layout,
-            light_root=args.light_root,
-            require_polarization_reference=stage == "forward" and args.conditioning == "polarization",
-        )
+        evaluation_data_root = args.eval_data_root or args.data_root
+        evaluation_material_root = args.eval_material_root or args.material_root
+        if stage == "forward":
+            evaluation_dataset = ICTPolarRealForwardEvaluationDataset(
+                evaluation_data_root,
+                material_root=evaluation_material_root,
+                hdri_root=args.hdri_root or Path(evaluation_data_root) / "hdri",
+                resolution=args.resolution,
+                max_lights=args.max_lights,
+                light_start=args.light_start,
+                frame_layout=args.frame_layout,
+                light_root=args.light_root,
+                require_polarization_reference=args.conditioning == "polarization",
+                olat_samples=args.forward_eval_olat_samples,
+                hdri_samples=args.forward_eval_hdri_samples,
+                hdri_olat_lights=args.forward_eval_hdri_olat_lights,
+            )
+        else:
+            evaluation_dataset = ICTPolarRealTrainingDataset(
+                evaluation_data_root,
+                material_root=evaluation_material_root,
+                resolution=args.resolution,
+                max_lights=args.max_lights,
+                light_start=args.light_start,
+                frame_layout=args.frame_layout,
+                light_root=args.light_root,
+            )
         print(f"[eval:{stage}] dataset: {evaluation_dataset.summary()}")
 
     try:
@@ -673,7 +697,7 @@ def _run_periodic_evaluation(
                         target_tensor = inverse_target(batch, task)[0] if stage == "inverse" else batch["rgb"]
                         target = _tensor_image(target_tensor[0])
                         mask = batch["mask"][0].float().cpu().permute(1, 2, 0).numpy()
-                        light = "static" if sample["frame_id"] < 0 else f"{sample['frame_id']:06d}"
+                        light = _sample_light_name(sample)
                         prediction_path = (
                             step_root
                             / method
@@ -768,7 +792,7 @@ def _evaluate_external_method(
             target = _tensor_image(target_tensor[0])
             prediction = _read_prediction(source_path, output_hw=target.shape[:2])
             mask = batch["mask"][0].float().cpu().permute(1, 2, 0).numpy()
-            light = "static" if sample["frame_id"] < 0 else f"{sample['frame_id']:06d}"
+            light = _sample_light_name(sample)
             prediction_path = (
                 step_root
                 / method
@@ -822,7 +846,7 @@ def _evaluate_external_method(
 
 
 def _find_external_prediction(root: Path, *, sample: dict, task: str) -> Path | None:
-    light = "static" if sample["frame_id"] < 0 else f"{sample['frame_id']:06d}"
+    light = _sample_light_name(sample)
     stems = [task, f"pred_{task}"]
     if task == "albedo":
         stems.extend(("basecolor", "base_color"))
@@ -890,6 +914,7 @@ def _evaluation_row(
         "object": sample["object"],
         "camera": sample["camera"],
         "light": light,
+        "lighting_type": _sample_value(sample, "lighting_type", "static"),
         "prediction": str(prediction_path),
         "target": str(target_path),
         "mse": mse(prediction, target, mask),
@@ -908,6 +933,8 @@ def _write_training_evaluation(
     method_status: dict[str, dict[str, object]] | None = None,
 ) -> None:
     step_root.mkdir(parents=True, exist_ok=True)
+    for row in rows:
+        row.setdefault("lighting_type", "static")
     if rows:
         with (step_root / "metrics.csv").open("w", newline="") as file:
             writer = csv.DictWriter(file, fieldnames=list(rows[0]))
@@ -921,13 +948,29 @@ def _write_training_evaluation(
         method_summary = {}
         for task in sorted({row["task"] for row in rows if row["method"] == method}):
             selected = [row for row in rows if row["method"] == method and row["task"] == task]
-            method_summary[task] = {
+            task_summary = {
                 "count": len(selected),
                 **{
                     metric: float(sum(row[metric] for row in selected) / len(selected))
                     for metric in ("mse", "mae", "psnr", "ssim")
                 },
             }
+            lighting = {}
+            for lighting_type in sorted({row["lighting_type"] for row in selected}):
+                lighting_rows = [
+                    row for row in selected if row["lighting_type"] == lighting_type
+                ]
+                lighting[lighting_type] = {
+                    "count": len(lighting_rows),
+                    **{
+                        metric: float(
+                            sum(row[metric] for row in lighting_rows) / len(lighting_rows)
+                        )
+                        for metric in ("mse", "mae", "psnr", "ssim")
+                    },
+                }
+            task_summary["lighting"] = lighting
+            method_summary[task] = task_summary
         summary["methods"][method] = {
             "label": EVALUATION_METHOD_LABELS.get(method, method),
             **(method_status or {}).get(method, {"status": "evaluated"}),
@@ -948,6 +991,13 @@ def _write_training_evaluation(
                 f"[eval:training] {method}/{task}: "
                 f"PSNR={metrics['psnr']:.3f} SSIM={metrics['ssim']:.4f} n={metrics['count']}"
             )
+            for lighting_type, lighting_metrics in metrics["lighting"].items():
+                print(
+                    f"[eval:training] {method}/{task}/{lighting_type}: "
+                    f"PSNR={lighting_metrics['psnr']:.3f} "
+                    f"SSIM={lighting_metrics['ssim']:.4f} "
+                    f"n={lighting_metrics['count']}"
+                )
     print(f"[eval:training] step={step} wrote {step_root}")
 
 
@@ -992,7 +1042,9 @@ def _write_comparison_panels(rows: list[dict], *, step_root: Path) -> None:
         comparison.save(comparison_path)
 
 
-def _evaluation_indices(dataset: ICTPolarRealTrainingDataset, *, stage: str, count: int) -> list[int]:
+def _evaluation_indices(dataset, *, stage: str, count: int) -> list[int]:
+    if hasattr(dataset, "evaluation_indices"):
+        return dataset.evaluation_indices(count)
     indices = []
     for index, record in enumerate(dataset.records):
         if stage == "forward" and record.light_index is None:
@@ -1001,6 +1053,21 @@ def _evaluation_indices(dataset: ICTPolarRealTrainingDataset, *, stage: str, cou
         if len(indices) >= count:
             break
     return indices
+
+
+def _sample_value(sample: dict, key: str, default):
+    value = sample.get(key, default)
+    if isinstance(value, (list, tuple)) and len(value) == 1:
+        return value[0]
+    return value
+
+
+def _sample_light_name(sample: dict) -> str:
+    lighting_name = _sample_value(sample, "lighting_name", "")
+    if lighting_name:
+        return str(lighting_name)
+    frame_id = _sample_value(sample, "frame_id", -1)
+    return "static" if frame_id < 0 else f"{frame_id:06d}"
 
 
 def _sample_to_batch(sample: dict, *, device, torch_module) -> dict:

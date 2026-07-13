@@ -9,6 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
+from ictpolarreal.data.forward_evaluation import ICTPolarRealForwardEvaluationDataset
 from ictpolarreal.data.dataset import iter_camera_samples
 from ictpolarreal.utils.io import read_image, write_image
 
@@ -36,7 +37,17 @@ def prepare_manifest(
     out_root: str | Path,
     *,
     max_samples: int,
-) -> tuple[Path, list[dict[str, str]]]:
+    stages: tuple[str, ...] = ("inverse",),
+    material_root: str | Path | None = None,
+    hdri_root: str | Path | None = None,
+    light_root: str | Path | None = None,
+    frame_layout: str = "auto",
+    max_lights: int | None = None,
+    light_start: int = 0,
+    forward_olat_samples: int = 20,
+    forward_hdri_samples: int = 20,
+    forward_hdri_olat_lights: int = 20,
+) -> tuple[Path, list[dict[str, str]], list[dict[str, str]]]:
     out_root = Path(out_root)
     samples = []
     for camera in iter_camera_samples(data_root):
@@ -56,18 +67,81 @@ def prepare_manifest(
             break
     if not samples:
         raise FileNotFoundError(f"No camera with a static image was found under {data_root}")
+    forward_samples = []
+    if "forward" in stages:
+        if material_root is None:
+            raise ValueError("Forward baselines require --material-root")
+        if hdri_root is None:
+            raise ValueError("Forward baselines require --hdri-root")
+        dataset = ICTPolarRealForwardEvaluationDataset(
+            data_root,
+            material_root=material_root,
+            hdri_root=hdri_root,
+            max_lights=max_lights,
+            light_start=light_start,
+            frame_layout=frame_layout,
+            light_root=light_root,
+            olat_samples=forward_olat_samples,
+            hdri_samples=forward_hdri_samples,
+            hdri_olat_lights=forward_hdri_olat_lights,
+        )
+        for index in dataset.evaluation_indices(max_samples):
+            record = dataset.records[index]
+            forward_samples.append(
+                {
+                    "object": record.camera_key[0],
+                    "camera": record.camera_key[1],
+                    "lighting_type": record.lighting_type,
+                    "lighting_name": record.lighting_name,
+                    "environment": str(dataset.export_environment(index, out_root).resolve()),
+                }
+            )
+
     manifest_path = out_root / "baseline_manifest.json"
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest_path.write_text(json.dumps({"samples": samples}, indent=2) + "\n")
-    return manifest_path.resolve(), samples
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "stages": list(stages),
+                "samples": samples,
+                "forward_samples": forward_samples,
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    return manifest_path.resolve(), samples, forward_samples
 
 
-def _method_complete(root: Path, method: str, samples: list[dict[str, str]]) -> bool:
-    return all(
+def _method_complete(
+    root: Path,
+    method: str,
+    samples: list[dict[str, str]],
+    *,
+    stages: tuple[str, ...] = ("inverse",),
+    forward_samples: list[dict[str, str]] | None = None,
+) -> bool:
+    inverse_complete = "inverse" not in stages or all(
         (root / method / sample["object"] / sample["camera"] / "static" / f"{task}.png").is_file()
         for sample in samples
         for task in BASELINE_TASKS[method]
     )
+    forward_complete = (
+        "forward" not in stages
+        or method != "diffusion_renderer"
+        or all(
+            (
+                root
+                / method
+                / sample["object"]
+                / sample["camera"]
+                / sample["lighting_name"]
+                / "forward_rgb.png"
+            ).is_file()
+            for sample in forward_samples or []
+        )
+    )
+    return inverse_complete and forward_complete
 
 
 def _worker_environment(repo: Path | None, python: str) -> dict[str, str]:
@@ -84,6 +158,9 @@ def _worker_environment(repo: Path | None, python: str) -> dict[str, str]:
     if python_path.parent.name == "bin":
         environment_prefix = python_path.parent.parent
         environment["CONDA_PREFIX"] = str(environment_prefix)
+        environment["PATH"] = os.pathsep.join(
+            (str(python_path.parent), environment.get("PATH", ""))
+        )
         environment.setdefault("CUDA_HOME", str(environment_prefix))
         environment.setdefault("CUDA_PATH", str(environment_prefix))
         library_paths = [str(environment_prefix / "lib")]
@@ -155,8 +232,26 @@ def run(args: argparse.Namespace) -> dict[str, str]:
     unknown = set(methods) - set(BASELINE_TASKS)
     if unknown:
         raise ValueError(f"Unknown baseline method(s): {', '.join(sorted(unknown))}")
+    stages = tuple(dict.fromkeys(item.strip() for item in args.stages.split(",") if item.strip()))
+    unknown_stages = set(stages) - {"inverse", "forward"}
+    if unknown_stages or not stages:
+        raise ValueError("--stages must contain inverse, forward, or both")
     out_root = Path(args.out_root).expanduser().resolve()
-    manifest, samples = prepare_manifest(args.data_root, out_root, max_samples=args.max_samples)
+    manifest, samples, forward_samples = prepare_manifest(
+        args.data_root,
+        out_root,
+        max_samples=args.max_samples,
+        stages=stages,
+        material_root=args.material_root,
+        hdri_root=args.hdri_root,
+        light_root=args.light_root,
+        frame_layout=args.frame_layout,
+        max_lights=args.max_lights,
+        light_start=args.light_start,
+        forward_olat_samples=args.forward_olat_samples,
+        forward_hdri_samples=args.forward_hdri_samples,
+        forward_hdri_olat_lights=args.forward_hdri_olat_lights,
+    )
     settings = {
         "lotus": (args.lotus_python, args.lotus_repo),
         "dsine": (args.dsine_python, args.dsine_repo),
@@ -168,7 +263,13 @@ def run(args: argparse.Namespace) -> dict[str, str]:
     roots = {}
     for method in methods:
         roots[method] = str(out_root / method)
-        if _method_complete(out_root, method, samples) and not args.force:
+        if _method_complete(
+            out_root,
+            method,
+            samples,
+            stages=stages,
+            forward_samples=forward_samples,
+        ) and not args.force:
             print(f"[baselines] using cached {method} predictions under {out_root / method}")
             continue
         python, repo = settings[method]
@@ -180,7 +281,13 @@ def run(args: argparse.Namespace) -> dict[str, str]:
             out_root=out_root,
             args=args,
         )
-        if not _method_complete(out_root, method, samples):
+        if not _method_complete(
+            out_root,
+            method,
+            samples,
+            stages=stages,
+            forward_samples=forward_samples,
+        ):
             raise RuntimeError(f"{method} finished without writing every expected prediction")
     roots_path = out_root / "roots.json"
     if roots_path.exists():
@@ -194,6 +301,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Precompute ICTPolarReal benchmark methods.")
     parser.add_argument("--data-root", required=True)
     parser.add_argument("--out-root", required=True)
+    parser.add_argument("--stages", default="inverse")
+    parser.add_argument("--material-root", default=None)
+    parser.add_argument("--hdri-root", default=None)
+    parser.add_argument("--light-root", default=None)
+    parser.add_argument("--frame-layout", choices=["auto", "raw", "normalized"], default="auto")
+    parser.add_argument("--max-lights", type=int, default=None)
+    parser.add_argument("--light-start", type=int, default=0)
+    parser.add_argument("--forward-olat-samples", type=int, default=20)
+    parser.add_argument("--forward-hdri-samples", type=int, default=20)
+    parser.add_argument("--forward-hdri-olat-lights", type=int, default=20)
     parser.add_argument("--methods", default="diffusion_renderer,lotus,dsine")
     parser.add_argument("--max-samples", type=int, default=4)
     parser.add_argument("--device", default="cuda")

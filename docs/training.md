@@ -29,17 +29,20 @@ and 100,000 with explicit method identities:
 | --- | --- | --- |
 | `rgb2x` (`RGB2X`) | All selected inverse/forward tasks | Frozen base checkpoint in the active process. |
 | `ours` (`Ours`) | All selected inverse/forward tasks | Current LoRA checkpoint in the active process. |
-| `diffusion_renderer` | Inverse albedo, normal, and specular | Cosmos 7B inverse renderer, precomputed once. |
+| `diffusion_renderer` | Inverse albedo/normal/specular and forward relighting | Cosmos 7B inverse and forward renderers, precomputed once. |
 | `lotus` | Inverse normal | Lotus normal model, precomputed once. |
 | `dsine` | Inverse normal | DSINE normal model, precomputed once. |
 
-Before inverse training, `run.sh` executes missing external methods on the same
-fixed sample subset. Their model processes exit before RGB2X training starts,
+Before training, `run.sh` executes missing external methods on the same fixed
+sample subset. Forward evaluation contains 20 sphere-wide OLATs and 20 fixed
+HDRIs per selected camera. External model processes exit before RGB2X training starts,
 so the GPU memory and dependency environments remain isolated. Results are
 cached as
 `outputs/train/baseline/<method>/<object>/<camera>/static/<task>.png`. This
 directory stores predictions only. Metrics and comparison panels are always
 written under the selected training stage's `eval/step-NNNNNN/` directory.
+Diffusion Renderer relighting predictions use
+`<camera>/<lighting_name>/forward_rgb.png` in the same cache.
 
 ```bash
 bash run.sh baselines
@@ -47,8 +50,8 @@ bash run.sh train --train-stage inverse
 ```
 
 Lotus and DSINE use the compatible `lotus` Python environment. Diffusion
-Renderer uses its official `cosmos-predict1` environment and 7B inverse
-checkpoint. The launcher finds standard Micromamba environments and source
+Renderer uses its official `cosmos-predict1` environment and 7B inverse and
+forward checkpoints. The launcher finds standard Micromamba environments and source
 checkouts under `external/` or the parent directory. Use the corresponding
 `--*-python` and `--*-repo` options for other layouts. Manual prediction roots
 remain supported with repeatable `--eval-baseline METHOD=PATH` options.
@@ -56,7 +59,8 @@ remain supported with repeatable `--eval-baseline METHOD=PATH` options.
 A final comparison runs when training ends. Each `step-NNNNNN` folder contains
 metrics, normalized predictions, targets, and labeled panels under
 `comparisons/`; `eval/history.jsonl` tracks all runs. Unsupported task/method
-pairs are explicitly recorded as `skipped` in `summary.json`.
+pairs are explicitly recorded as `skipped` in `summary.json`. Forward rows
+include `lighting_type`, and summaries contain separate OLAT and HDRI metrics.
 
 ## Selective Runs
 
@@ -73,7 +77,7 @@ bash run.sh train --train-stage forward --forward-mode gbuffer
 ```
 
 The launcher runs 100,000 steps per selected model, prints loss every 10 steps,
-evaluates every 50,000 steps, and saves every 10,000 steps. It also writes
+evaluates every 50,000 steps, and saves checkpoints at 50,000 and 100,000. It also writes
 every update to `training_history.csv`. For full experiments, set `--train-steps`,
 `--batch-size`, `--grad-accum-steps`, and `--checkpointing-steps`; the YAML
 files under `configs/` record the same 100,000-step defaults. Use `--train-dry-run`

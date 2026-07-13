@@ -22,6 +22,7 @@ def read_image(path: str | Path, *, channels: int | None = 3) -> np.ndarray:
 
         arr = np.asarray(Image.open(path))
     arr = np.asarray(arr)
+    source_dtype = arr.dtype
     if arr.ndim == 2:
         arr = arr[..., None]
     if channels is not None:
@@ -30,8 +31,8 @@ def read_image(path: str | Path, *, channels: int | None = 3) -> np.ndarray:
         elif arr.shape[-1] == 1 and channels == 3:
             arr = np.repeat(arr, 3, axis=-1)
     arr = arr.astype(np.float32)
-    if arr.max(initial=0) > 2.0:
-        arr = arr / 255.0
+    if np.issubdtype(source_dtype, np.integer):
+        arr = arr / np.iinfo(source_dtype).max
     return arr
 
 
