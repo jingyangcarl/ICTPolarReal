@@ -35,25 +35,18 @@ outputs/material_acquisition/object_name/camXX/brdf/specular.png
 Its root also contains `run.json`, which records settings, processed cameras,
 timestamps, and completion status.
 
-With `--material-acquisition end2end`, each requested lighting profile has its
-own clean subtree instead of sharing a `brdf/` directory:
+With `--material-acquisition end2end`, each camera has one material subtree and
+one evaluation subtree. Lighting profiles are rows inside those two functions,
+rather than top-level model directories:
 
 ```text
 outputs/material_acquisition_end2end/
   run.json
   object_name/camXX/
     manifest.json
-    lighting/
-      conditions.json
-      weights.npz
-      previews/<condition_id>.png
-    report/
-      overview.png
-      metrics.csv
-      summary.json
-    olat/simplified-multilayer/
-      acquisition.json
-      material/
+    material/
+      olat/
+        acquisition.json
         disney_brdf.pt
         maps/
           albedo.png
@@ -67,7 +60,10 @@ outputs/material_acquisition_end2end/
           anisotropic.png
           clearcoat.png
           clearcoatGloss.png
-      evaluation/
+      hdri/...
+      mix/...
+    evaluation/
+      olat/
         metrics.csv
         summary.json
         olat/
@@ -80,41 +76,56 @@ outputs/material_acquisition_end2end/
           summary.json
           contact_sheet.png
           cases/<condition_id>/{lighting,gt,pred,error,comparison}.png
-    hdri/simplified-multilayer/...
-    mix/simplified-multilayer/...
+      hdri/...
+      mix/...
+      report/
+        overview.png
+        metrics.csv
+        summary.json
+      lighting/
+        conditions.json
+        weights.npz
 ```
 
 The default `--end2end-profiles olat,hdri,mix` creates all three profile
 subtrees as independent fits. A subset creates only the requested directories.
 The camera `manifest.json` lists the available profiles and contains
-`primary_material_dir`, for example
-`olat/simplified-multilayer/material/maps`. The RGB2X loaders resolve this field
-first, so `--end2end-primary-profile` selects the maps exposed downstream
-without copying or flattening files. Legacy roots without a manifest still use
-the `brdf/`, `material_properties/`, and camera-root fallbacks.
+`primary_material_dir`, for example `material/olat/maps`. The RGB2X loaders
+resolve this field first, so `--end2end-primary-profile` selects the maps
+exposed downstream without copying or flattening files. Legacy roots without a
+manifest still use the `brdf/`, `material_properties/`, and camera-root
+fallbacks.
 
-`lighting/conditions.json` records the ranked natural HDRI identities, strict
-fit/held-out identity split, rotations, generated `w/r/g/b` calibration
-conditions, source hashes, and preview paths. `weights.npz` contains their
-spherical-Voronoi weights on the calibrated ICT light basis. HDRI targets are
-weighted combinations of the measured polarized OLAT images, not independently
-captured environment-lit frames.
+`evaluation/lighting/conditions.json` records the ranked natural HDRI
+identities, strict fit/held-out identity split, rotations, generated `w/r/g/b`
+calibration conditions, and source hashes. `weights.npz` contains their
+spherical-Voronoi weights on the calibrated ICT light basis. The lighting
+directory intentionally contains only these two provenance files; the HDRI
+thumbnail used by a report is stored with that evaluation case. HDRI targets
+are weighted combinations of measured parallel-polarized OLAT images, not
+independently captured environment-lit frames.
 
-With the defaults, a full 346-light camera has 330 OLAT fit measurements and 16
-strictly held-out measurements. It also has 100 natural HDRI fit identities and
+For a complete LSX capture, end-to-end acquisition uses a SuperDimension-style
+164-light selection adapted to the ICTPolarReal rig: it considers visible
+calibrated light indices `0..172`, fits 164 evenly sampled indices, and uses the
+nine omitted visible indices as the OLAT evaluation set. Indices `173..345` are
+rear or unused for this flow and are excluded rather than normalized into noisy
+targets. The default `--end2end-eval-lights 16` therefore requests all nine
+available visible holdouts. It also has 100 natural HDRI fit identities and
 four held-out identities, each with four rotations; all rotations of one HDRI
 identity remain in the same split. Every requested profile is evaluated on the
 same OLAT and HDRI suites. OLAT case folders retain original capture frame IDs,
 while HDRI case folders use the condition IDs recorded in
-`lighting/conditions.json`.
+`evaluation/lighting/conditions.json`.
 
-`report/overview.png` aligns one representative OLAT and HDRI case across the
-profile rows and shows selected material maps and aggregate metrics.
-`report/summary.json` and `report/metrics.csv` are its machine-readable
-companions. The images and metrics use independent foreground 99.5th-percentile
-normalization and clipping. They do not preserve absolute radiometric HDR scale
-and should not be treated as evidence of numerical parity with another
-dataset.
+`evaluation/report/overview.png` aligns one representative OLAT and HDRI case
+across the profile rows and shows selected material maps and aggregate metrics.
+`evaluation/report/summary.json` and `evaluation/report/metrics.csv` are its
+machine-readable companions. Invalid/background pixels are masked before the
+same renderer-native whole-image 99.5th-percentile linear scaling and clipping
+used by the Imaginaire flow. The images do not preserve absolute radiometric
+HDR scale and should not be treated as evidence of numerical parity with
+another dataset.
 
 An explicit `--material-root` overrides either mode-specific output root.
 

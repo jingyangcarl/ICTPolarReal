@@ -45,6 +45,116 @@ def test_split_light_indices_keeps_minimum_training_set():
     assert heldout.size == 0
 
 
+def test_superdimension_selection_fits_164_visible_lights_and_holds_out_nine():
+    train, heldout, excluded = (
+        end2end_acquisition.select_superdimension_light_indices(
+            np.arange(346, dtype=np.int64), eval_lights=16
+        )
+    )
+
+    assert len(train) == 164
+    np.testing.assert_array_equal(
+        train, np.unique(np.linspace(0, 172, 164, dtype=np.int64))
+    )
+    np.testing.assert_array_equal(
+        heldout, np.asarray([19, 38, 57, 76, 95, 114, 133, 152, 171])
+    )
+    assert set(train).isdisjoint(heldout)
+    assert max(train) <= 172
+    assert max(heldout) <= 172
+    np.testing.assert_array_equal(excluded, np.arange(173, 346))
+
+
+@pytest.mark.parametrize(
+    (
+        "eval_lights",
+        "heldout_count",
+        "excluded_count",
+        "excluded_visible_count",
+        "excluded_nonvisible_count",
+    ),
+    [
+        (16, 9, 173, 0, 173),
+        (0, 0, 182, 9, 173),
+    ],
+)
+def test_lsx_selection_metadata_separates_visible_and_nonvisible_exclusions(
+    eval_lights,
+    heldout_count,
+    excluded_count,
+    excluded_visible_count,
+    excluded_nonvisible_count,
+):
+    light_ids = np.arange(346, dtype=np.int64)
+    train, heldout, excluded = (
+        end2end_acquisition.select_superdimension_light_indices(
+            light_ids, eval_lights=eval_lights
+        )
+    )
+
+    metadata = end2end_acquisition._describe_light_selection(
+        light_ids,
+        train,
+        heldout,
+        excluded,
+        requested_heldout_count=eval_lights,
+    )
+
+    assert metadata["mode"] == "lsx_visible_hemisphere_164"
+    assert metadata["fit_count"] == 164
+    assert metadata["heldout_count"] == heldout_count
+    assert metadata["heldout_visible_count"] == heldout_count
+    assert metadata["excluded_count"] == excluded_count
+    assert metadata["excluded_visible_count"] == excluded_visible_count
+    assert metadata["excluded_nonvisible_count"] == excluded_nonvisible_count
+    assert "excluded_rear_or_unused_count" not in metadata
+
+
+def test_reduced_capture_selection_metadata_reports_generic_fallback():
+    light_ids = np.arange(40, dtype=np.int64)
+    train, heldout, excluded = (
+        end2end_acquisition.select_superdimension_light_indices(
+            light_ids, eval_lights=5
+        )
+    )
+
+    metadata = end2end_acquisition._describe_light_selection(
+        light_ids,
+        train,
+        heldout,
+        excluded,
+        requested_heldout_count=5,
+    )
+
+    assert metadata == {
+        "mode": "generic_sphere_spread",
+        "policy": (
+            "generic deterministic sphere-spread holdout over all selected "
+            "calibrated lights"
+        ),
+        "requested_heldout_count": 5,
+        "fit_count": 35,
+        "heldout_count": 5,
+        "excluded_count": 0,
+    }
+
+
+def test_zero_holdout_evaluation_samples_only_fitted_lsx_lights():
+    train, heldout, excluded = (
+        end2end_acquisition.select_superdimension_light_indices(
+            np.arange(346, dtype=np.int64), eval_lights=0
+        )
+    )
+
+    evaluation = end2end_acquisition._select_evaluation_light_indices(
+        train, heldout
+    )
+
+    assert len(evaluation) == 16
+    assert set(evaluation).issubset(set(train))
+    assert set(evaluation).isdisjoint(set(excluded))
+
+
 @pytest.mark.parametrize(
     ("requested", "expected"),
     [
@@ -165,6 +275,8 @@ def test_hdri_sources_remain_grouped_across_rotations_and_project_to_olat_basis(
     assert manifest["projection"]["fit_support_indices"] == [0, 2, 3]
     assert manifest["projection"]["evaluation_support_indices"] == [1]
     assert len(manifest["conditions"]) == 28
+    assert all("preview" not in condition for condition in manifest["conditions"])
+    assert not (tmp_path / "lighting" / "previews").exists()
 
 
 def test_synthesized_hdri_targets_use_rgb_weights_and_requested_olat_support(tmp_path):
@@ -294,6 +406,109 @@ def test_end2end_initialization_and_optimizer_exclude_same_heldout_lights(
     assert acquisition["eval_lights"] == 2
 
 
+def test_end2end_prefers_static_photometric_inputs_and_constant_view(
+    monkeypatch, tmp_path
+):
+    camera_dir = tmp_path / "object" / "cam00"
+    for kind in ("cross", "parallel"):
+        directory = camera_dir / kind
+        directory.mkdir(parents=True)
+        for frame_id in range(4):
+            (directory / f"{frame_id:06d}.png").touch()
+    for name in ("static.png", "normal.png", "mask.png"):
+        (camera_dir / name).touch()
+    sample = CameraSample("object", "cam00", camera_dir)
+
+    static = np.full((2, 3, 3), 0.35, dtype=np.float32)
+    photometric_normal = np.zeros((2, 3, 3), dtype=np.float32)
+    photometric_normal[..., 2] = 1.0
+    optical_axis = np.asarray([0.0, 0.6, 0.8], dtype=np.float32)
+    constant_view = np.broadcast_to(optical_axis, (2, 3, 3)).copy()
+
+    def fake_read(path, **_kwargs):
+        stem = Path(path).stem
+        if stem == "static":
+            return static.copy()
+        if stem == "normal":
+            return photometric_normal.copy()
+        if stem == "mask":
+            return np.ones((2, 3, 1), dtype=np.float32)
+        return np.full((2, 3, 3), int(stem), dtype=np.float32)
+
+    monkeypatch.setattr(material_decomposition, "read_image", fake_read)
+    monkeypatch.setattr(
+        material_decomposition,
+        "load_light_directions",
+        lambda _root, indices, **_kwargs: np.tile(
+            np.asarray([[0.0, 0.0, 1.0]], dtype=np.float32),
+            (len(indices), 1),
+        ),
+    )
+    monkeypatch.setattr(
+        material_decomposition,
+        "load_view_directions",
+        lambda _root, _sample, hw: np.broadcast_to(
+            np.asarray([0.0, 0.0, 1.0], dtype=np.float32), hw + (3,)
+        ).copy(),
+    )
+    monkeypatch.setattr(
+        material_decomposition,
+        "load_end2end_view_directions",
+        lambda _root, _sample, _hw: constant_view.copy(),
+    )
+
+    def unexpected_ward(*_args, **_kwargs):
+        raise AssertionError("dataset static/normal inputs must bypass Ward initialization")
+
+    captured = {}
+
+    def fake_acquire(_cross, _parallel, _lights, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(
+        material_decomposition, "decompose_polarized_olat", unexpected_ward
+    )
+    monkeypatch.setattr(
+        end2end_acquisition, "validate_end2end_runtime", lambda *_args: None
+    )
+    monkeypatch.setattr(end2end_acquisition, "acquire_disney_material", fake_acquire)
+
+    used = material_decomposition.decompose_camera_sample(
+        sample,
+        data_root=tmp_path,
+        out_root=tmp_path / "out",
+        light_start=0,
+        max_lights=None,
+        light_root=None,
+        backend="torch",
+        device="cuda",
+        noise=0.0,
+        material_acquisition="end2end",
+        imaginaire_root=tmp_path,
+        end2end_steps=1,
+    )
+
+    assert used == 4
+    np.testing.assert_array_equal(captured["base_color"], static)
+    np.testing.assert_array_equal(captured["normal"], photometric_normal)
+    np.testing.assert_array_equal(captured["view_dirs"], constant_view)
+    np.testing.assert_array_equal(captured["view_dirs"][0, 0], optical_axis)
+
+
+def test_end2end_view_is_constant_optical_axis(tmp_path):
+    camera_dir = tmp_path / "object" / "cam00"
+    camera_dir.mkdir(parents=True)
+    sample = CameraSample("object", "cam00", camera_dir)
+
+    view = material_decomposition.load_end2end_view_directions(
+        tmp_path, sample, (3, 5)
+    )
+
+    assert view.shape == (3, 5, 3)
+    np.testing.assert_allclose(view, np.broadcast_to(view[0, 0], view.shape))
+    np.testing.assert_allclose(np.linalg.norm(view, axis=-1), 1.0)
+
+
 def test_render_normalization_uses_foreground_and_masks_background():
     torch = pytest.importorskip("torch")
     render = torch.zeros((3, 2, 2), dtype=torch.float32)
@@ -337,24 +552,27 @@ def test_hdri_gpu_preflight_rejects_low_memory_device():
         )
 
 
-def test_disney_scalar_defaults_are_initialized_in_physical_space():
+def test_disney_scalar_defaults_are_recorded_without_rewriting_unconstrained_values():
     torch = pytest.importorskip("torch")
+    raw_defaults = {
+        name: (0.5 if name in {"specular", "roughness", "sheenTint", "clearcoatGloss"} else 0.0)
+        for name in end2end_acquisition.DISNEY_SCALAR_NAMES
+    }
     model = SimpleNamespace(
         **{
-            f"{name}_un": torch.nn.Parameter(torch.zeros(1))
-            for name in end2end_acquisition.DISNEY_PHYSICAL_DEFAULTS
+            f"{name}_un": torch.nn.Parameter(torch.full((1,), value))
+            for name, value in raw_defaults.items()
         }
     )
 
-    end2end_acquisition._initialize_disney_scalars(torch, model)
+    initialization = end2end_acquisition._disney_scalar_initialization(torch, model)
 
-    for name, physical_value in end2end_acquisition.DISNEY_PHYSICAL_DEFAULTS.items():
-        expected = min(
-            max(physical_value, end2end_acquisition.SCALAR_INIT_EPS),
-            1.0 - end2end_acquisition.SCALAR_INIT_EPS,
+    for name, raw_value in raw_defaults.items():
+        assert float(getattr(model, f"{name}_un").item()) == raw_value
+        assert initialization[name]["unconstrained"] == raw_value
+        assert initialization[name]["constrained"] == pytest.approx(
+            float(torch.sigmoid(torch.tensor(raw_value)).item())
         )
-        actual = float(torch.sigmoid(getattr(model, f"{name}_un")).item())
-        assert actual == pytest.approx(expected, abs=1e-7)
 
 
 def test_read_image_scales_integer_images_but_preserves_float_hdr(monkeypatch):
@@ -375,7 +593,7 @@ def test_read_image_scales_integer_images_but_preserves_float_hdr(monkeypatch):
     assert float_result.max() > 1.0
 
 
-def test_end2end_targets_are_normalized_per_light_inside_foreground():
+def test_end2end_targets_mask_background_then_use_whole_image_scale():
     targets = np.array(
         [
             [
@@ -397,8 +615,8 @@ def test_end2end_targets_are_normalized_per_light_inside_foreground():
     assert np.isfinite(normalized).all()
     np.testing.assert_allclose(normalized[:, 0, 0], 0.5)
     np.testing.assert_allclose(normalized[:, 1, 0], 1.0)
-    # The bright background is excluded while estimating each light's scale.
-    np.testing.assert_allclose(normalized[:, :, 1], 1.0)
+    # The bright background is removed before the whole-image renderer scale.
+    np.testing.assert_allclose(normalized[:, :, 1], 0.0)
 
 
 def test_end2end_material_map_outputs_include_legacy_and_disney_aliases(
@@ -460,13 +678,7 @@ def test_write_olat_evaluation_writes_profile_scoped_artifacts_and_metrics(tmp_p
         rendered.append(stack_index)
         return target_chw[stack_index] + 0.1
 
-    evaluation_dir = (
-        tmp_path
-        / "olat"
-        / end2end_acquisition.PROFILE_MODEL
-        / "evaluation"
-        / "olat"
-    )
+    evaluation_dir = tmp_path / "evaluation" / "olat" / "olat"
     cases_dir = evaluation_dir / "cases"
     stale_dir = cases_dir / "999999"
     stale_dir.mkdir(parents=True)
@@ -510,6 +722,12 @@ def test_write_olat_evaluation_writes_profile_scoped_artifacts_and_metrics(tmp_p
     assert summary_path.is_file()
     with metrics_path.open(newline="", encoding="utf-8") as stream:
         rows = list(csv.DictReader(stream))
+    assert {
+        "gt_mean_intensity",
+        "pred_mean_intensity",
+        "mean_intensity_ratio",
+        "luminance_correlation",
+    }.issubset(rows[0])
     assert [row["split"] for row in rows] == ["heldout_olat", "heldout_olat"]
     assert [int(row["frame_id"]) for row in rows] == [2, 4]
     assert [float(row["mse"]) for row in rows] == pytest.approx([0.01, 0.01])
@@ -525,15 +743,21 @@ def test_camera_report_writes_three_by_two_profile_evaluation_matrix(tmp_path):
     metric_names = {"mse": 0.01, "mae": 0.1, "psnr": 20.0, "ssim_global": 0.8}
 
     for profile_index, profile in enumerate(profiles):
-        profile_dir = tmp_path / profile / end2end_acquisition.PROFILE_MODEL
-        maps_dir = profile_dir / "material" / "maps"
+        maps_dir = tmp_path / "material" / profile / "maps"
         for name in ("baseColor", "normal", "roughness", "specular"):
             write_image(maps_dir / f"{name}.png", image + profile_index * 0.05)
 
-        olat_case = profile_dir / "evaluation" / "olat" / "cases" / "000002"
+        olat_case = tmp_path / "evaluation" / profile / "olat" / "cases" / "000002"
         for name in ("gt", "pred", "error"):
             write_image(olat_case / f"{name}.png", image)
-        hdri_case = profile_dir / "evaluation" / "hdri" / "cases" / "studio_rot000"
+        hdri_case = (
+            tmp_path
+            / "evaluation"
+            / profile
+            / "hdri"
+            / "cases"
+            / "studio_rot000"
+        )
         for name in ("lighting", "gt", "pred", "error"):
             write_image(hdri_case / f"{name}.png", image)
 
@@ -572,9 +796,9 @@ def test_camera_report_writes_three_by_two_profile_evaluation_matrix(tmp_path):
     )
 
     assert artifacts == {
-        "overview": "report/overview.png",
-        "summary": "report/summary.json",
-        "metrics": "report/metrics.csv",
+        "overview": "evaluation/report/overview.png",
+        "summary": "evaluation/report/summary.json",
+        "metrics": "evaluation/report/metrics.csv",
     }
     for relative_path in artifacts.values():
         assert (tmp_path / relative_path).is_file()
@@ -614,6 +838,52 @@ def test_end2end_provenance_records_git_state_and_exact_source_hash(
         "dirty": True,
         "disney_brdf_sha256": hashlib.sha256(source_bytes).hexdigest(),
     }
+
+
+def test_imaginaire_disney_import_treats_torchvision_as_debug_only(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    package = tmp_path / "CookTorrance_IBL"
+    package.mkdir()
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    source = package / "disney_brdf.py"
+    source.write_text(
+        "import torchvision\n"
+        "imported_torchvision = torchvision\n"
+        "class DisneyBRDFSimplifiedMultiLayer:\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.delitem(sys.modules, "CookTorrance_IBL.disney_brdf", raising=False)
+    monkeypatch.delitem(sys.modules, "CookTorrance_IBL", raising=False)
+    previous_torchvision = sys.modules.get("torchvision")
+    real_import_module = end2end_acquisition.importlib.import_module
+
+    def import_module(name, package=None):
+        if name == "torchvision":
+            raise ModuleNotFoundError(
+                "No module named 'torchvision'", name="torchvision"
+            )
+        return real_import_module(name, package)
+
+    monkeypatch.setattr(end2end_acquisition.importlib, "import_module", import_module)
+    root, module, imported_source = end2end_acquisition._load_imaginaire_disney(
+        tmp_path
+    )
+
+    assert root == tmp_path.resolve()
+    assert imported_source == source.resolve()
+    assert module.DisneyBRDFSimplifiedMultiLayer.__name__ == (
+        "DisneyBRDFSimplifiedMultiLayer"
+    )
+    with pytest.raises(RuntimeError, match="shadow debug image export"):
+        module.imported_torchvision.utils.save_image(None, tmp_path / "debug.png")
+    if previous_torchvision is None:
+        assert "torchvision" not in sys.modules
+    else:
+        assert sys.modules["torchvision"] is previous_torchvision
 
 
 @pytest.mark.parametrize(

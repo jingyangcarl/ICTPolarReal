@@ -168,42 +168,80 @@ def decompose_camera_sample(
     mask = read_image(mask_path, channels=1) if mask_path else None
     view_dirs = load_view_directions(data_root, sample, cross_stack.shape[1:3])
 
+    static_path = sample.image_path("static")
+    photometric_normal_path = sample.image_path("normal")
     initialization_indices = np.arange(len(cross_stack), dtype=np.int64)
     if material_acquisition == "end2end":
-        from ictpolarreal.processing.end2end_acquisition import split_light_indices
-
-        initialization_indices, _ = split_light_indices(
-            len(cross_stack), end2end_eval_lights
+        from ictpolarreal.processing.end2end_acquisition import (
+            select_superdimension_light_indices,
         )
-    maps = decompose_polarized_olat(
-        cross_stack[initialization_indices],
-        parallel_stack[initialization_indices],
-        light_dirs[initialization_indices],
-        mask=mask,
-        view_dirs=view_dirs,
-        backend=backend,
-        device=device,
-        noise=noise,
-        normal_steps=normal_steps,
-        sigma_steps=sigma_steps,
-        chunk_size=chunk_size,
+
+        initialization_indices, _, _ = select_superdimension_light_indices(
+            np.asarray(light_indices, dtype=np.int64), end2end_eval_lights
+        )
+    needs_ward_initialization = (
+        material_acquisition == "default"
+        or static_path is None
+        or photometric_normal_path is None
     )
+    maps = None
+    if needs_ward_initialization:
+        maps = decompose_polarized_olat(
+            cross_stack[initialization_indices],
+            parallel_stack[initialization_indices],
+            light_dirs[initialization_indices],
+            mask=mask,
+            view_dirs=view_dirs,
+            backend=backend,
+            device=device,
+            noise=noise,
+            normal_steps=normal_steps,
+            sigma_steps=sigma_steps,
+            chunk_size=chunk_size,
+        )
+    else:
+        print(
+            "[end2end] using the dataset static/photometric initialization; "
+            "skipping the unrelated Ward pre-fit",
+            flush=True,
+        )
     if material_acquisition == "default":
+        assert maps is not None
         _write_material_maps(out_root, sample, maps)
     else:
         from ictpolarreal.processing.end2end_acquisition import acquire_disney_material
 
         material_dir = Path(out_root) / sample.object_name / sample.camera
+        disney_base_color = (
+            read_image(static_path)
+            if static_path is not None
+            else maps.diffuse_albedo
+        )
+        disney_normal = (
+            read_image(photometric_normal_path)
+            if photometric_normal_path is not None
+            else maps.diffuse_normal
+        )
+        disney_view_dirs = load_end2end_view_directions(
+            data_root, sample, cross_stack.shape[1:3]
+        )
+        print(
+            "[end2end] SuperDimension-parity initialization: "
+            f"baseColor={'static capture' if static_path else 'Ward diffuse fallback'}, "
+            f"normal={'photometric normal' if photometric_normal_path else 'Ward normal fallback'}, "
+            "view=constant camera optical axis",
+            flush=True,
+        )
         acquire_disney_material(
             cross_stack,
             parallel_stack,
             light_dirs,
             light_ids=np.asarray(light_indices, dtype=np.int64),
             frame_ids=np.asarray(frame_ids, dtype=np.int64),
-            base_color=maps.diffuse_albedo,
-            normal=maps.diffuse_normal,
+            base_color=disney_base_color,
+            normal=disney_normal,
             mask=mask,
-            view_dirs=view_dirs,
+            view_dirs=disney_view_dirs,
             out_dir=material_dir,
             imaginaire_root=imaginaire_root,
             device=device,
@@ -230,6 +268,28 @@ def load_view_directions(data_root: str | Path, sample: CameraSample, hw: tuple[
     except (IndexError, TypeError, ValueError):
         view = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
         return np.broadcast_to(view, hw + (3,)).copy()
+
+
+def load_end2end_view_directions(
+    data_root: str | Path,
+    sample: CameraSample,
+    hw: tuple[int, int],
+) -> np.ndarray:
+    """Return SuperDimension's constant +Z camera view in world coordinates."""
+    camera_path = _find_camera_file(data_root, sample)
+    if camera_path is None:
+        view = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
+    else:
+        try:
+            text = camera_path.read_text().splitlines()
+            rotation = np.asarray(
+                [line.split() for line in text[12:15]], dtype=np.float32
+            )[:, :3]
+            view = np.asarray([0.0, 0.0, 1.0], dtype=np.float32) @ rotation.T
+            view = view / max(float(np.linalg.norm(view)), EPS)
+        except (IndexError, TypeError, ValueError):
+            view = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
+    return np.broadcast_to(view, hw + (3,)).copy()
 
 
 def _decompose_numpy(

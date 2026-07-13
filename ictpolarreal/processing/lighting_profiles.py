@@ -10,7 +10,7 @@ from typing import Sequence
 
 import numpy as np
 
-from ictpolarreal.utils.io import read_image, write_image
+from ictpolarreal.utils.io import read_image
 
 
 LIGHTING_PROFILES = ("olat", "hdri", "mix")
@@ -152,7 +152,11 @@ def prepare_environment_conditions(
         "evaluation",
     )
     paths = discover_environment_maps(root)
-    ranked = rank_environment_maps(paths, light_dirs, train_count + eval_count)
+    ranked = rank_environment_maps(
+        paths,
+        np.asarray(light_dirs)[fit_support],
+        train_count + eval_count,
+    )
     train_files, eval_files = split_ranked_environments(ranked, train_count, eval_count)
     projection_width = projection_height * 2
     fit_assignment, fit_solid_angles = build_voronoi_projection(
@@ -168,10 +172,11 @@ def prepare_environment_conditions(
             projection_width,
         )
     output = Path(out_dir)
-    preview_dir = output / "previews"
-    if preview_dir.exists():
-        shutil.rmtree(preview_dir)
-    preview_dir.mkdir(parents=True, exist_ok=True)
+    # Evaluation cases already embed the lighting thumbnail they use.  Hundreds
+    # of duplicate fit-condition PNGs made the material output hard to inspect.
+    stale_preview_dir = output / "previews"
+    if stale_preview_dir.exists():
+        shutil.rmtree(stale_preview_dir)
 
     def make_conditions(
         entries: Sequence[tuple[Path, float]], split: str
@@ -209,8 +214,6 @@ def prepare_environment_conditions(
                 condition_id = (
                     f"{source_stem}_{source_hash[:8]}_rot{rotation_degrees:03d}"
                 )
-                preview_path = preview_dir / f"{condition_id}.png"
-                write_image(preview_path, preview)
                 conditions.append(
                     EnvironmentCondition(
                         condition_id=condition_id,
@@ -244,8 +247,6 @@ def prepare_environment_conditions(
             for rotation_index in range(rotations):
                 rotation_degrees = int(round(rotation_index * 360.0 / rotations))
                 condition_id = f"calibration_{name}_rot{rotation_degrees:03d}"
-                preview_path = preview_dir / f"{condition_id}.png"
-                write_image(preview_path, environment)
                 conditions.append(
                     EnvironmentCondition(
                         condition_id=condition_id,
@@ -344,7 +345,6 @@ def write_environment_manifest(
                 "source_sha256": condition.source_sha256,
                 "rotation_degrees": condition.rotation_degrees,
                 "variance_score": condition.variance_score,
-                "preview": f"previews/{condition.condition_id}.png",
             }
             for condition in all_conditions
         ],

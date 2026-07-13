@@ -77,8 +77,10 @@ Default outputs are written to `outputs/`:
 - `outputs/material_acquisition/`: the default Ward material maps under
   `<object>/<camera>/brdf/`.
 - `outputs/material_acquisition_end2end/`: independent OLAT-, HDRI-, and
-  mixed-lighting Disney fits, their common evaluation suites, and a per-camera
-  comparison report. `run.json` records the complete acquisition run.
+  mixed-lighting Disney fits. Each camera keeps acquired maps under
+  `material/<profile>/` and all relighting results, shared lighting provenance,
+  and the composed report under `evaluation/`. `run.json` records the complete
+  acquisition run.
 - `outputs/train/inverse/`: prompt-conditioned RGB-to-PBR/polarization LoRA and predictions.
 - `outputs/train/forward/gbuffer/`: PBR G-buffer-to-RGB LoRA and relighting predictions.
 - `outputs/train/forward/polarization/`: cross/parallel-to-RGB LoRA and relighting predictions.
@@ -118,10 +120,12 @@ Useful options:
   exposed to downstream loaders by each camera's `manifest.json`. The default
   is `olat`.
 - `--end2end-eval-lights N`: reserve up to `N` calibrated OLATs from fitting and
-  use them only for end-to-end relighting evaluation. The default is 16, so a
-  full 346-light capture fits 330 lights and evaluates the other 16. At least
-  four fit lights are always retained; `0` reports fitted-light reconstruction
-  instead of a held-out result.
+  use them only for end-to-end relighting evaluation. On a complete LSX capture,
+  the SuperDimension-style LSX adaptation fits 164 evenly sampled visible
+  indices from `0..172` and has nine omitted visible holdouts; the default 16
+  requests all nine. Rear/unused indices `173..345` are excluded. At least four
+  fit lights are retained for reduced or non-LSX inputs; `0` reports fitted-light
+  reconstruction instead of a held-out result.
 - `--end2end-hdri-root PATH`: folder of HDR/EXR environment maps. It must be
   visible on the worker; the repository default points at the Maxine cluster
   HDRI collection.
@@ -130,8 +134,8 @@ Useful options:
   held-out identities, and yaw rotations. Defaults are 100, 4, and 4. Generated
   white/red/green/blue calibration environments are added to the fit suite.
 - `--torch-variant cpu --device cpu`: use CPU for diagnostics; diffusion training is slow without CUDA.
-- `--max-lights N`: use a sphere-wide subset for a quick diagnostic; the default
-  346-light fit is recommended for material quality.
+- `--max-lights N`: use a sphere-wide subset for a quick diagnostic; keep the
+  default 346-light input to reproduce the exact 164-fit/9-holdout selection.
 - `--backend torch --device cuda`: explicitly select the PyTorch optimizer.
 - `--slurm`: submit material acquisition to Slurm instead of running it in the
   current shell. Resource options include `--slurm-account`, `--slurm-partition`,
@@ -163,12 +167,21 @@ acquisition modes write to separate roots automatically: `default` uses
 `outputs/material_acquisition_end2end`. An explicit `--material-root` overrides
 the selected root.
 
+End-to-end acquisition follows the working SuperDimension/Imaginaire contract:
+the OLAT target is the measured parallel-polarized image; initialization uses
+the dataset static image, photometric normal, and a constant optical-axis view;
+pixels failing the `n dot v > 0` validity gate are excluded; and Disney scalar
+maps retain the renderer's raw unconstrained defaults. Invalid/background
+pixels are masked before renderer-native whole-image 99.5th-percentile linear
+scaling. This avoids the earlier synthetic polarization target, per-pixel view,
+and double-logit initialization mismatches.
+
 End-to-end HDRI targets are not separately photographed environment-light
-captures. They are synthesized from the measured ICTPolarReal polarized OLAT
+captures. They are synthesized from the measured ICTPolarReal parallel OLAT
 stack by projecting each environment map onto the calibrated light basis with
 spherical-Voronoi solid-angle weights. Fit and evaluation Voronoi cells are
-recomputed on their respective light bases, keeping both composites
-full-sphere while preserving the strict split. Natural environment maps are ranked by
+recomputed on their respective light bases, keeping both composites full-sphere
+while preserving the strict split. Natural environment maps are ranked by
 sampled-light variance. The requested top set is divided by HDRI identity, so
 all rotations of each held-out identity stay out of fitting; `w/r/g/b`
 calibration environments and their rotations are fit-only conditions.
@@ -179,11 +192,14 @@ profile is then evaluated on exactly the same OLAT and HDRI suites, including
 the deterministic OLAT holdout and held-out natural HDRI identities. A camera
 `manifest.json` records all profiles and `primary_material_dir`; downstream
 training follows that field instead of assuming a `brdf/` directory. See
-`report/overview.png` for the aligned profile comparison and `run.json` at the
-material root for run status and settings. The reported foreground-masked MSE,
-MAE, PSNR, and `ssim_global` compare independently normalized, clipped LDR
-images. They support within-run evaluation and do not establish numerical
-parity with another dataset or pipeline.
+`evaluation/report/overview.png` for the aligned profile comparison and
+`run.json` at the material root for run status and settings. Shared lighting
+provenance is limited to `evaluation/lighting/conditions.json` and
+`evaluation/lighting/weights.npz`; HDRI case folders carry the thumbnails used
+by the report. The reported validity-masked MSE, MAE, PSNR, and `ssim_global`
+compare clipped renderer-normalized LDR images. They support within-run
+evaluation and do not establish numerical parity with another dataset or
+pipeline.
 
 Objaverse-style evaluation uses `configs/eval_objaverse_samples.json`; see
 `samples/objaverse/README.md` for the expected sample layout.

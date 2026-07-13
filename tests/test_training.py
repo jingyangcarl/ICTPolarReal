@@ -75,9 +75,7 @@ def test_training_dataset_resolves_primary_material_directory_from_manifest(tmp_
     torch = pytest.importorskip("torch")
     data_root, material_root = _training_fixture(tmp_path)
     camera_root = material_root / "object" / "cam00"
-    profile_maps = (
-        camera_root / "mix" / "simplified-multilayer" / "material" / "maps"
-    )
+    profile_maps = camera_root / "material" / "mix" / "maps"
     profile_maps.mkdir(parents=True)
     profile_albedo = np.full((8, 16, 3), 0.8, dtype=np.float32)
     write_image(profile_maps / "albedo.png", profile_albedo)
@@ -98,9 +96,9 @@ def test_training_dataset_resolves_primary_material_directory_from_manifest(tmp_
     (camera_root / "manifest.json").write_text(
         json.dumps(
             {
-                "schema": "ictpolarreal.material-profiles.v1",
+                "schema": "ictpolarreal.material-profiles.v2",
                 "primary_profile": "mix",
-                "primary_material_dir": "mix/simplified-multilayer/material/maps",
+                "primary_material_dir": "material/mix/maps",
             }
         ),
         encoding="utf-8",

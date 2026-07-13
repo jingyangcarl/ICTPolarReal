@@ -8,6 +8,7 @@ import math
 import shutil
 import subprocess
 import sys
+import types
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -26,23 +27,25 @@ from ictpolarreal.processing.lighting_profiles import (
 PERCENTILE = 99.5
 MIN_LR_RATIO = 0.01
 MIN_TRAIN_LIGHTS = 4
-SCALAR_INIT_EPS = 1e-4
+MIN_N_DOT_V = 1e-4
+LSX_VISIBLE_HEMISPHERE_LIGHTS = 173
+SUPERDIMENSION_FIT_LIGHTS = 164
 MAX_QUANTILE_ELEMENTS = 1 << 23
 HDRI_AUTOGRAD_BYTES_PER_LIGHT_PIXEL = 216
 MIN_HDRI_GPU_MEMORY_BYTES = 40 * (1 << 30)
-PROFILE_MODEL = "simplified-multilayer"
-DISNEY_PHYSICAL_DEFAULTS = {
-    "metallic": 0.0,
-    "subsurface": 0.0,
-    "specular": 0.5,
-    "roughness": 0.5,
-    "specularTint": 0.0,
-    "anisotropic": 0.0,
-    "sheen": 0.0,
-    "sheenTint": 0.5,
-    "clearcoat": 0.0,
-    "clearcoatGloss": 0.5,
-}
+MODEL_NAME = "DisneyBRDFSimplifiedMultiLayer"
+DISNEY_SCALAR_NAMES = (
+    "metallic",
+    "subsurface",
+    "specular",
+    "roughness",
+    "specularTint",
+    "anisotropic",
+    "sheen",
+    "sheenTint",
+    "clearcoat",
+    "clearcoatGloss",
+)
 
 
 def _array_sha256(array: np.ndarray) -> str:
@@ -50,13 +53,23 @@ def _array_sha256(array: np.ndarray) -> str:
     return hashlib.sha256(memoryview(values).cast("B")).hexdigest()
 
 
-def _initialize_disney_scalars(torch, model) -> None:
-    """Initialize physical scalar defaults in the model's sigmoid-logit space."""
+def _disney_scalar_initialization(torch, model) -> dict[str, dict[str, float]]:
+    """Record, without rewriting, Imaginaire's unconstrained scalar defaults.
+
+    ``DisneyParamConfig`` values are copied directly into ``*_un`` parameters by
+    Imaginaire and constrained with sigmoid only when rendering.  Treating those
+    config values as physical values and applying logit a second time pins all
+    zero-valued defaults close to zero, which is not the SuperDimension flow.
+    """
+    initialization = {}
     with torch.no_grad():
-        for name, physical_value in DISNEY_PHYSICAL_DEFAULTS.items():
-            value = min(max(float(physical_value), SCALAR_INIT_EPS), 1.0 - SCALAR_INIT_EPS)
-            unconstrained = math.log(value / (1.0 - value))
-            getattr(model, f"{name}_un").fill_(unconstrained)
+        for name in DISNEY_SCALAR_NAMES:
+            raw = getattr(model, f"{name}_un").detach().float()
+            initialization[name] = {
+                "unconstrained": float(raw.mean().cpu()),
+                "constrained": float(torch.sigmoid(raw).mean().cpu()),
+            }
+    return initialization
 
 
 def split_light_indices(
@@ -75,6 +88,121 @@ def split_light_indices(
     heldout = np.unique(heldout)
     train = np.setdiff1d(np.arange(n_lights, dtype=np.int64), heldout)
     return train, heldout
+
+
+def select_superdimension_light_indices(
+    light_ids: np.ndarray,
+    eval_lights: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Select Imaginaire's 164 OLATs from LSX's visible 173-light hemisphere.
+
+    The nine visible lights omitted by the evenly spaced 164-light fit become a
+    natural held-out set.  Rear-hemisphere captures are excluded because their
+    independently normalized near-black observations otherwise become
+    full-strength noise targets.  Non-LSX or incomplete inputs use the generic
+    sphere-spread split.
+    """
+    ids = np.asarray(light_ids, dtype=np.int64)
+    if ids.ndim != 1 or len(np.unique(ids)) != len(ids):
+        raise ValueError("light ids must be a one-dimensional unique array")
+    if eval_lights < 0:
+        raise ValueError("end2end evaluation light count must be non-negative")
+    lookup = {int(light_id): index for index, light_id in enumerate(ids)}
+    visible_ids = np.arange(LSX_VISIBLE_HEMISPHERE_LIGHTS, dtype=np.int64)
+    if _has_complete_lsx_visible_hemisphere(ids):
+        fit_ids = np.linspace(
+            0,
+            LSX_VISIBLE_HEMISPHERE_LIGHTS - 1,
+            SUPERDIMENSION_FIT_LIGHTS,
+            dtype=np.int64,
+        )
+        fit_ids = np.unique(fit_ids)
+        heldout_ids = np.setdiff1d(visible_ids, fit_ids)
+        if eval_lights < len(heldout_ids):
+            if eval_lights == 0:
+                heldout_ids = np.zeros((0,), dtype=np.int64)
+            else:
+                positions = np.linspace(
+                    0, len(heldout_ids) - 1, eval_lights, dtype=np.int64
+                )
+                heldout_ids = heldout_ids[positions]
+        train = np.asarray([lookup[int(light_id)] for light_id in fit_ids], dtype=np.int64)
+        heldout = np.asarray(
+            [lookup[int(light_id)] for light_id in heldout_ids], dtype=np.int64
+        )
+        used = np.concatenate([train, heldout])
+        excluded = np.setdiff1d(np.arange(len(ids), dtype=np.int64), used)
+        return train, heldout, excluded
+
+    train, heldout = split_light_indices(len(ids), eval_lights)
+    return train, heldout, np.zeros((0,), dtype=np.int64)
+
+
+def _has_complete_lsx_visible_hemisphere(light_ids: np.ndarray) -> bool:
+    available = {int(light_id) for light_id in np.asarray(light_ids).reshape(-1)}
+    return all(
+        light_id in available for light_id in range(LSX_VISIBLE_HEMISPHERE_LIGHTS)
+    )
+
+
+def _describe_light_selection(
+    light_ids: np.ndarray,
+    train_indices: np.ndarray,
+    heldout_indices: np.ndarray,
+    excluded_indices: np.ndarray,
+    *,
+    requested_heldout_count: int,
+) -> dict[str, Any]:
+    """Return truthful, machine-readable provenance for either split policy."""
+    ids = np.asarray(light_ids, dtype=np.int64)
+    description: dict[str, Any] = {
+        "requested_heldout_count": int(requested_heldout_count),
+        "fit_count": int(len(train_indices)),
+        "heldout_count": int(len(heldout_indices)),
+        "excluded_count": int(len(excluded_indices)),
+    }
+    if not _has_complete_lsx_visible_hemisphere(ids):
+        return {
+            "mode": "generic_sphere_spread",
+            "policy": (
+                "generic deterministic sphere-spread holdout over all selected "
+                "calibrated lights"
+            ),
+            **description,
+        }
+
+    visible = (ids >= 0) & (ids < LSX_VISIBLE_HEMISPHERE_LIGHTS)
+    heldout_visible_count = int(np.count_nonzero(visible[heldout_indices]))
+    excluded_visible_count = int(np.count_nonzero(visible[excluded_indices]))
+    return {
+        "mode": "lsx_visible_hemisphere_164",
+        "policy": (
+            "fit 164 evenly spaced LSX visible indices 0..172; select requested "
+            "holdouts from the nine omitted visible indices; exclude unselected "
+            "omitted-visible and non-visible inputs"
+        ),
+        **description,
+        "heldout_visible_count": heldout_visible_count,
+        "excluded_visible_count": excluded_visible_count,
+        "excluded_nonvisible_count": int(len(excluded_indices))
+        - excluded_visible_count,
+    }
+
+
+def _select_evaluation_light_indices(
+    train_indices: np.ndarray,
+    heldout_indices: np.ndarray,
+    max_cases: int = 16,
+) -> np.ndarray:
+    if len(heldout_indices):
+        return heldout_indices
+    positions = np.linspace(
+        0,
+        len(train_indices) - 1,
+        min(len(train_indices), max_cases),
+        dtype=np.int64,
+    )
+    return train_indices[positions]
 
 
 def validate_end2end_runtime(imaginaire_root: str | Path, device: str = "cuda") -> None:
@@ -177,7 +305,16 @@ def acquire_disney_material(
     frame_ids = np.asarray(frame_ids, dtype=np.int64)
     if frame_ids.shape != (n_lights,) or len(np.unique(frame_ids)) != n_lights:
         raise ValueError(f"frame ids must be unique with shape ({n_lights},)")
-    train_indices, heldout_indices = split_light_indices(n_lights, eval_lights)
+    train_indices, heldout_indices, excluded_indices = (
+        select_superdimension_light_indices(light_ids, eval_lights)
+    )
+    light_selection = _describe_light_selection(
+        light_ids,
+        train_indices,
+        heldout_indices,
+        excluded_indices,
+        requested_heldout_count=eval_lights,
+    )
     if any(profile in {"hdri", "mix"} for profile in profiles):
         _validate_hdri_gpu_memory(
             torch,
@@ -186,34 +323,71 @@ def acquire_disney_material(
             height,
             width,
         )
-    evaluation_indices = (
-        heldout_indices
-        if len(heldout_indices)
-        else np.linspace(0, n_lights - 1, min(n_lights, 16), dtype=np.int64)
+    evaluation_indices = _select_evaluation_light_indices(
+        train_indices, heldout_indices
     )
     evaluation_split = "heldout_olat" if len(heldout_indices) else "fitted_olat"
-    print(
-        f"[end2end] light split: {len(train_indices)} fit, "
-        f"{len(heldout_indices)} held out for relighting evaluation",
-        flush=True,
-    )
-    foreground = _foreground_mask(mask, height, width)
-    if not np.any(foreground > 0.5):
+    if light_selection["mode"] == "lsx_visible_hemisphere_164":
+        print(
+            "[end2end] light split (LSX visible-hemisphere adaptation): "
+            f"{light_selection['fit_count']} fit, "
+            f"{light_selection['heldout_visible_count']} visible held out, "
+            f"{light_selection['excluded_visible_count']} omitted visible excluded, "
+            f"{light_selection['excluded_nonvisible_count']} non-visible excluded",
+            flush=True,
+        )
+    else:
+        print(
+            "[end2end] light split (generic sphere-spread): "
+            f"{light_selection['fit_count']} fit, "
+            f"{light_selection['heldout_count']} held out, "
+            f"{light_selection['excluded_count']} excluded",
+            flush=True,
+        )
+    capture_foreground = _foreground_mask(mask, height, width)
+    if not np.any(capture_foreground > 0.5):
         raise ValueError("end2end acquisition requires a non-empty foreground mask")
-    raw_target_stack = np.maximum(
-        2.0 * cross + 2.0 * np.maximum(parallel - cross, 0.0), 0.0
-    ).astype(np.float32)
-    target_stack = _normalize_targets(raw_target_stack, foreground)
-    base_color = _normalize_base_color(base_color, foreground)
+    # SuperDimension optimizes the measured OLAT photograph directly.  For the
+    # polarized ICT capture, the parallel branch is the corresponding full
+    # reflection observation (diffuse + specular).  Do not collapse the two
+    # polarization branches into a synthetic target: that changes the fitting
+    # objective and amplifies polarization noise where cross > parallel.
     normal = _normalize_vectors(normal)
     view_dirs = _normalize_vectors(view_dirs)
+    n_dot_v = np.sum(normal * view_dirs, axis=-1, keepdims=True)
+    front_facing = (n_dot_v > MIN_N_DOT_V).astype(np.float32)
+    foreground = capture_foreground * front_facing
+    capture_pixels = int(np.count_nonzero(capture_foreground > 0.5))
+    valid_pixels = int(np.count_nonzero(foreground > 0.5))
+    if valid_pixels == 0:
+        raise ValueError(
+            "end2end acquisition has no front-facing foreground pixels; check "
+            "the normal/view coordinate convention"
+        )
+    surface_validity = {
+        "minimum_n_dot_v": MIN_N_DOT_V,
+        "capture_foreground_pixels": capture_pixels,
+        "front_facing_pixels": valid_pixels,
+        "excluded_back_facing_pixels": capture_pixels - valid_pixels,
+        "excluded_fraction": float((capture_pixels - valid_pixels) / capture_pixels),
+    }
+    print(
+        "[end2end] surface validity: "
+        f"{valid_pixels}/{capture_pixels} foreground pixels are front-facing "
+        f"({100.0 * surface_validity['excluded_fraction']:.2f}% excluded)",
+        flush=True,
+    )
+    raw_target_stack = np.maximum(parallel, 0.0).astype(np.float32)
+    target_stack = _normalize_targets(raw_target_stack, foreground)
+    base_color = _normalize_base_color(base_color, capture_foreground)
     input_hashes = {
         "normalized_targets_sha256": _array_sha256(target_stack),
+        "capture_foreground_sha256": _array_sha256(capture_foreground),
         "foreground_sha256": _array_sha256(foreground),
         "base_color_sha256": _array_sha256(base_color),
         "normal_sha256": _array_sha256(normal),
         "view_directions_sha256": _array_sha256(view_dirs),
-        "raw_polarized_targets_sha256": _array_sha256(raw_target_stack),
+        "raw_parallel_targets_sha256": _array_sha256(raw_target_stack),
     }
     target_chw = torch.from_numpy(
         np.ascontiguousarray(target_stack.transpose(0, 3, 1, 2))
@@ -225,7 +399,9 @@ def acquire_disney_material(
 
     camera_dir = Path(out_dir)
     camera_dir.mkdir(parents=True, exist_ok=True)
-    lighting_dir = camera_dir / "lighting"
+    material_root = camera_dir / "material"
+    evaluation_root = camera_dir / "evaluation"
+    lighting_dir = evaluation_root / "lighting"
     print(
         f"[end2end] preparing {hdri_count} fit and {eval_hdris} held-out HDRIs "
         f"with {hdri_rotations} rotations",
@@ -286,16 +462,18 @@ def acquire_disney_material(
     adapter_provenance = _adapter_provenance()
     profile_results = {}
     for profile in profiles:
-        profile_dir = camera_dir / profile / PROFILE_MODEL
+        material_dir = material_root / profile
+        evaluation_dir = evaluation_root / profile
         print(
-            f"[end2end] fitting lighting profile {profile} -> {profile_dir}",
+            f"[end2end] fitting lighting profile {profile} -> {material_dir}",
             flush=True,
         )
         profile_results[profile] = _fit_disney_profile(
             torch=torch,
             disney_module=disney_module,
             profile=profile,
-            profile_dir=profile_dir,
+            material_dir=material_dir,
+            evaluation_dir=evaluation_dir,
             camera_dir=camera_dir,
             target_chw=target_chw,
             hdri_fit_targets=hdri_fit_targets,
@@ -308,12 +486,14 @@ def acquire_disney_material(
             frame_ids=frame_ids,
             train_indices=train_indices,
             heldout_indices=heldout_indices,
+            excluded_indices=excluded_indices,
             evaluation_indices=evaluation_indices,
             evaluation_split=evaluation_split,
             evaluation_support=evaluation_support,
             base_color=base_color,
             normal=normal,
             foreground=foreground,
+            material_foreground=capture_foreground,
             view_dirs=view_dirs,
             device=torch_device,
             steps=steps,
@@ -321,20 +501,22 @@ def acquire_disney_material(
             hdri_rotations=hdri_rotations,
             eval_lights=eval_lights,
             input_hashes=input_hashes,
+            surface_validity=surface_validity,
             provenance=provenance,
             adapter_provenance=adapter_provenance,
         )
 
     manifest = {
-        "schema": "ictpolarreal.material-profiles.v1",
+        "schema": "ictpolarreal.material-profiles.v2",
         "material_acquisition": "end2end",
-        "model": "DisneyBRDFSimplifiedMultiLayer",
+        "model": MODEL_NAME,
         "profiles": list(profiles),
         "primary_profile": primary_profile,
-        "primary_material_dir": f"{primary_profile}/{PROFILE_MODEL}/material/maps",
+        "primary_material_dir": f"material/{primary_profile}/maps",
+        "olat_selection": light_selection,
         "lighting": {
-            "conditions": "lighting/conditions.json",
-            "weights": "lighting/weights.npz",
+            "conditions": "evaluation/lighting/conditions.json",
+            "weights": "evaluation/lighting/weights.npz",
             "fit_hdri_conditions": len(environments.train),
             "fit_natural_hdri_identities": int(hdri_count),
             "fit_calibration_conditions": int(4 * hdri_rotations),
@@ -343,10 +525,14 @@ def acquire_disney_material(
             "target_origin": "synthesized_from_measured_olat",
         },
         "evaluation_matrix": "each profile evaluated on the same OLAT and HDRI suites",
+        "surface_validity": surface_validity,
         "report": {"status": "pending"},
         "adapter": adapter_provenance,
         "profile_acquisitions": {
-            profile: f"{profile}/{PROFILE_MODEL}/acquisition.json" for profile in profiles
+            profile: f"material/{profile}/acquisition.json" for profile in profiles
+        },
+        "profile_evaluations": {
+            profile: f"evaluation/{profile}/summary.json" for profile in profiles
         },
     }
     manifest_path = camera_dir / "manifest.json"
@@ -376,7 +562,8 @@ def _fit_disney_profile(
     torch,
     disney_module,
     profile: str,
-    profile_dir: Path,
+    material_dir: Path,
+    evaluation_dir: Path,
     camera_dir: Path,
     target_chw,
     hdri_fit_targets,
@@ -389,12 +576,14 @@ def _fit_disney_profile(
     frame_ids: np.ndarray,
     train_indices: np.ndarray,
     heldout_indices: np.ndarray,
+    excluded_indices: np.ndarray,
     evaluation_indices: np.ndarray,
     evaluation_split: str,
     evaluation_support: np.ndarray,
     base_color: np.ndarray,
     normal: np.ndarray,
     foreground: np.ndarray,
+    material_foreground: np.ndarray,
     view_dirs: np.ndarray,
     device,
     steps: int,
@@ -402,6 +591,7 @@ def _fit_disney_profile(
     hdri_rotations: int,
     eval_lights: int,
     input_hashes: dict[str, str],
+    surface_validity: dict[str, Any],
     provenance: dict[str, Any],
     adapter_provenance: dict[str, Any],
 ) -> dict[str, Any]:
@@ -409,7 +599,7 @@ def _fit_disney_profile(
     model_class = disney_module.DisneyBRDFSimplifiedMultiLayer
     param_config = disney_module.DisneyParamConfig(per_pixel=True, height_mode="none")
     model = model_class(height, width, device=device, cfg=param_config).to(device)
-    _initialize_disney_scalars(torch, model)
+    scalar_initialization = _disney_scalar_initialization(torch, model)
     model.init_basecolor_from_image(torch.as_tensor(base_color, device=device), require_grad=False)
     model.init_normal_from_image(
         torch.as_tensor(normal, device=device), in_range="m11", require_grad=False
@@ -441,9 +631,8 @@ def _fit_disney_profile(
             L_dir=lights[stack_index : stack_index + 1],
             L_rgb=white_light,
             mask=mask_hwc,
-            return_hdr=True,
         )
-        return _normalize_render_foreground(prediction, mask_chw)
+        return prediction
 
     def render_hdri(condition_index: int, *, evaluation: bool):
         support = eval_support if evaluation else fit_support
@@ -457,9 +646,8 @@ def _fit_disney_profile(
             L_rgb=weights[condition_index].index_select(0, support),
             light_weights=integration_weights,
             mask=mask_hwc,
-            return_hdr=True,
         )
-        return _normalize_render_foreground(prediction, mask_chw)
+        return prediction
 
     def olat_loss(stack_index: int):
         target = target_chw[stack_index].to(device=device, non_blocking=True)
@@ -483,14 +671,14 @@ def _fit_disney_profile(
             ]
         )
     )
-    checkpoint_dir = profile_dir / "checkpoints"
+    checkpoint_dir = material_dir / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = checkpoint_dir / "latest.pt"
     checkpoint_temp_path = checkpoint_dir / "latest.tmp"
     signature = {
-        "schema": "ictpolarreal.end2end-checkpoint.v6",
+        "schema": "ictpolarreal.end2end-checkpoint.v7",
         "profile": profile,
-        "model": PROFILE_MODEL,
+        "model": MODEL_NAME,
         "height": height,
         "width": width,
         "light_directions_sha256": _array_sha256(light_dirs),
@@ -499,22 +687,21 @@ def _fit_disney_profile(
         **input_hashes,
         "fit_indices": [int(index) for index in train_indices],
         "heldout_indices": [int(index) for index in heldout_indices],
+        "excluded_indices": [int(index) for index in excluded_indices],
         "hdri_condition_weights_sha256": environment_hash,
         "hdri_fit_condition_ids": [condition.condition_id for condition in hdri_fit_conditions],
         "hdri_evaluation_condition_ids": [
             condition.condition_id for condition in hdri_evaluation_conditions
         ],
         "mix_schedule": f"{hdri_rotations}_hdri_then_{hdri_rotations}_olat",
-        "scalar_initialization": {
-            "physical_values": DISNEY_PHYSICAL_DEFAULTS,
-            "boundary_epsilon": SCALAR_INIT_EPS,
-        },
+        "scalar_initialization": scalar_initialization,
+        "surface_validity": surface_validity,
         "steps": int(steps),
         "learning_rate": float(learning_rate),
         "disney_brdf_sha256": provenance["disney_brdf_sha256"],
         "adapter": adapter_provenance,
     }
-    acquisition_path = profile_dir / "acquisition.json"
+    acquisition_path = material_dir / "acquisition.json"
     if acquisition_path.is_file():
         try:
             completed = json.loads(acquisition_path.read_text(encoding="utf-8"))
@@ -523,7 +710,7 @@ def _fit_disney_profile(
         if (
             completed is not None
             and completed.get("checkpoint_signature") == signature
-            and _profile_outputs_complete(profile_dir, completed)
+            and _profile_outputs_complete(material_dir, evaluation_dir, completed)
         ):
             print(
                 f"[end2end:{profile}] reusing completed profile with matching provenance",
@@ -627,7 +814,6 @@ def _fit_disney_profile(
             save_checkpoint(step + 1)
 
     model.eval()
-    evaluation_dir = profile_dir / "evaluation"
     hdri_support_split = (
         "heldout_olat"
         if len(heldout_indices)
@@ -661,9 +847,8 @@ def _fit_disney_profile(
             else:
                 final_loss = float(hdri_loss(final_index, evaluation=False).cpu())
 
-    material_dir = profile_dir / "material"
     maps_dir = material_dir / "maps"
-    _write_material_maps(maps_dir, maps, foreground)
+    _write_material_maps(maps_dir, maps, material_foreground)
     state = {name: value.detach().cpu() for name, value in model.state_dict().items()}
     torch.save(state, material_dir / "disney_brdf.pt")
     evaluation_summary = {
@@ -678,13 +863,13 @@ def _fit_disney_profile(
     _write_combined_evaluation_csv(evaluation_dir, profile, olat_summary, hdri_summary)
 
     metrics = {
-        "schema": "ictpolarreal.end2end-disney.v4",
+        "schema": "ictpolarreal.end2end-disney.v6",
         "material_acquisition": "end2end",
         "lighting_profile": profile,
-        "model": "DisneyBRDFSimplifiedMultiLayer",
+        "model": MODEL_NAME,
         "target": {
-            "olat": "2*cross + 2*max(parallel-cross, 0)",
-            "hdri": "spherical-Voronoi weighted sum of polarized OLAT targets",
+            "olat": "measured parallel-polarized OLAT (diffuse + specular)",
+            "hdri": "spherical-Voronoi weighted sum of measured parallel OLAT targets",
             "hdri_origin": "synthesized_from_measured_olat",
             "percentile": PERCENTILE,
         },
@@ -702,6 +887,13 @@ def _fit_disney_profile(
             else f"{profile} only"
         ),
         "light_split": {
+            "selection": _describe_light_selection(
+                light_ids,
+                train_indices,
+                heldout_indices,
+                excluded_indices,
+                requested_heldout_count=eval_lights,
+            ),
             "requested_heldout_lights": int(eval_lights),
             "fit_stack_indices": [int(index) for index in train_indices],
             "fit_light_indices": [int(light_ids[index]) for index in train_indices],
@@ -709,6 +901,9 @@ def _fit_disney_profile(
             "heldout_stack_indices": [int(index) for index in heldout_indices],
             "heldout_light_indices": [int(light_ids[index]) for index in heldout_indices],
             "heldout_frame_ids": [int(frame_ids[index]) for index in heldout_indices],
+            "excluded_stack_indices": [int(index) for index in excluded_indices],
+            "excluded_light_indices": [int(light_ids[index]) for index in excluded_indices],
+            "excluded_frame_ids": [int(frame_ids[index]) for index in excluded_indices],
         },
         "initial_evaluation_mse": {
             name: float(np.mean(losses))
@@ -729,10 +924,8 @@ def _fit_disney_profile(
         },
         "input_hashes": input_hashes,
         "hdri_condition_weights_sha256": environment_hash,
-        "scalar_initialization": {
-            "physical_values": DISNEY_PHYSICAL_DEFAULTS,
-            "boundary_epsilon": SCALAR_INIT_EPS,
-        },
+        "scalar_initialization": scalar_initialization,
+        "surface_validity": surface_validity,
         "evaluation": evaluation_summary,
         "imaginaire": provenance,
         "adapter": adapter_provenance,
@@ -852,6 +1045,7 @@ def _write_hdri_evaluation(
                 "mae": mae(prediction, target, foreground),
                 "psnr": psnr(prediction, target, foreground),
                 "ssim_global": ssim_global(prediction, target, foreground),
+                **_appearance_metrics(prediction, target, foreground),
                 "lighting_path": _relative_path(lighting_path, evaluation_dir),
                 "pred_path": _relative_path(pred_path, evaluation_dir),
                 "gt_path": _relative_path(gt_path, evaluation_dir),
@@ -864,7 +1058,7 @@ def _write_hdri_evaluation(
     summary = _evaluation_summary(
         rows,
         split=split,
-        target="spherical-Voronoi weighted sum of polarized OLAT targets",
+        target="spherical-Voronoi weighted sum of measured parallel OLAT targets",
         panels=["lighting", "ground_truth", "prediction", "absolute_error_x4"],
         metrics_path="metrics.csv",
         contact_sheet="contact_sheet.png",
@@ -882,7 +1076,9 @@ def _write_hdri_evaluation(
     print(
         f"[end2end] {split} evaluation: count={len(rows)} "
         f"PSNR={summary['metrics']['psnr']:.3f} "
-        f"SSIM-global={summary['metrics']['ssim_global']:.4f}",
+        f"SSIM-global={summary['metrics']['ssim_global']:.4f} "
+        f"intensity-ratio={summary['metrics']['mean_intensity_ratio']:.3f} "
+        f"corr={summary['metrics']['luminance_correlation']:.3f}",
         flush=True,
     )
     return summary, [float(row["mse"]) for row in rows]
@@ -909,14 +1105,15 @@ def _write_combined_evaluation_csv(
 
 
 def _profile_outputs_complete(
-    profile_dir: Path,
+    material_dir: Path,
+    evaluation_dir: Path,
     acquisition: dict[str, Any],
 ) -> bool:
-    maps_dir = profile_dir / "material" / "maps"
+    maps_dir = material_dir / "maps"
     required = [
-        profile_dir / "material" / "disney_brdf.pt",
-        profile_dir / "evaluation" / "summary.json",
-        profile_dir / "evaluation" / "metrics.csv",
+        material_dir / "disney_brdf.pt",
+        evaluation_dir / "summary.json",
+        evaluation_dir / "metrics.csv",
     ]
     required.extend(
         maps_dir / f"{name}.png"
@@ -937,7 +1134,7 @@ def _profile_outputs_complete(
     try:
         evaluations = acquisition["evaluation"]["evaluations"]
         for lighting in ("olat", "hdri"):
-            suite_dir = profile_dir / "evaluation" / lighting
+            suite_dir = evaluation_dir / lighting
             required.extend(
                 [
                     suite_dir / "summary.json",
@@ -963,7 +1160,7 @@ def _write_camera_report(
 ) -> dict[str, Any]:
     from PIL import Image, ImageDraw
 
-    report_dir = camera_dir / "report"
+    report_dir = camera_dir / "evaluation" / "report"
     report_dir.mkdir(parents=True, exist_ok=True)
     columns = [
         "profile / metrics",
@@ -1021,36 +1218,51 @@ def _write_camera_report(
         evaluations = result["evaluation"]["evaluations"]
         olat_summary = evaluations["olat"]
         hdri_summary = evaluations["hdri"]
+        olat_metrics = olat_summary["metrics"]
+        hdri_metrics = hdri_summary["metrics"]
         fit_conditions = result.get("fit_conditions", {})
         draw.text((8, y + 8), f"{profile.upper()}-trained", fill=(255, 220, 80))
         draw.text(
             (8, y + 30),
-            f"OLAT  PSNR {olat_summary['metrics']['psnr']:.2f}  "
-            f"SSIM {olat_summary['metrics']['ssim_global']:.3f}",
+            f"OLAT  PSNR {olat_metrics['psnr']:.2f}  "
+            f"SSIM {olat_metrics['ssim_global']:.3f}",
             fill="white",
         )
         draw.text(
             (8, y + 48),
-            f"HDRI  PSNR {hdri_summary['metrics']['psnr']:.2f}  "
-            f"SSIM {hdri_summary['metrics']['ssim_global']:.3f}",
+            f"HDRI  PSNR {hdri_metrics['psnr']:.2f}  "
+            f"SSIM {hdri_metrics['ssim_global']:.3f}",
             fill="white",
         )
         draw.text(
             (8, y + 68),
+            f"brightness pred/GT: OLAT "
+            f"{olat_metrics.get('mean_intensity_ratio', float('nan')):.2f} / HDRI "
+            f"{hdri_metrics.get('mean_intensity_ratio', float('nan')):.2f}",
+            fill=(190, 190, 190),
+        )
+        draw.text(
+            (8, y + 88),
+            f"luma corr: OLAT "
+            f"{olat_metrics.get('luminance_correlation', float('nan')):.2f} / HDRI "
+            f"{hdri_metrics.get('luminance_correlation', float('nan')):.2f}",
+            fill=(190, 190, 190),
+        )
+        draw.text(
+            (8, y + 108),
             f"fit: {fit_conditions.get('olat', 0)} OLAT / "
             f"{fit_conditions.get('hdri', 0)} HDRI",
             fill=(190, 190, 190),
         )
-        profile_dir = camera_dir / profile / PROFILE_MODEL
-        maps_dir = profile_dir / "material" / "maps"
+        maps_dir = camera_dir / "material" / profile / "maps"
         image_specs = [
             (maps_dir / "baseColor.png", 1.0),
             (maps_dir / "normal.png", 1.0),
             (maps_dir / "roughness.png", 1.0),
             (maps_dir / "specular.png", 1.0),
         ]
-        olat_root = profile_dir / "evaluation" / "olat"
-        hdri_root = profile_dir / "evaluation" / "hdri"
+        olat_root = camera_dir / "evaluation" / profile / "olat"
+        hdri_root = camera_dir / "evaluation" / profile / "hdri"
         olat_case = olat_root / "cases" / f"{shared_frame_id:06d}"
         hdri_case = hdri_root / "cases" / shared_condition_id
         image_specs.extend(
@@ -1115,9 +1327,9 @@ def _write_camera_report(
             )
     _write_metric_rows(report_dir / "metrics.csv", metric_rows)
     return {
-        "overview": "report/overview.png",
-        "summary": "report/summary.json",
-        "metrics": "report/metrics.csv",
+        "overview": "evaluation/report/overview.png",
+        "summary": "evaluation/report/summary.json",
+        "metrics": "evaluation/report/metrics.csv",
     }
 
 
@@ -1133,7 +1345,16 @@ def _evaluation_summary(
 ) -> dict[str, Any]:
     if not rows:
         raise ValueError(f"cannot summarize empty {split} evaluation")
-    metric_names = ("mse", "mae", "psnr", "ssim_global")
+    metric_names = (
+        "mse",
+        "mae",
+        "psnr",
+        "ssim_global",
+        "gt_mean_intensity",
+        "pred_mean_intensity",
+        "mean_intensity_ratio",
+        "luminance_correlation",
+    )
     psnr_values = np.asarray([float(row["psnr"]) for row in rows])
     median = float(np.median(psnr_values))
     representative_index = int(np.argmin(np.abs(psnr_values - median)))
@@ -1153,10 +1374,13 @@ def _evaluation_summary(
         if key in representative_row
     }
     return {
-        "schema": "ictpolarreal.relighting-evaluation.v2",
+        "schema": "ictpolarreal.relighting-evaluation.v3",
         "split": split,
         "count": len(rows),
-        "normalization": "independent foreground p99.5 linear clipping",
+        "normalization": (
+            "masked whole-image p99.5 linear clipping "
+            "(Imaginaire renderer parity)"
+        ),
         "target": target,
         "target_origin": target_origin,
         "metrics": {
@@ -1168,6 +1392,33 @@ def _evaluation_summary(
         "panels": panels,
         "representative_policy": "condition nearest median PSNR",
         "representative": representative,
+    }
+
+
+def _appearance_metrics(
+    prediction: np.ndarray,
+    target: np.ndarray,
+    foreground: np.ndarray,
+) -> dict[str, float]:
+    selected = foreground[..., 0] > 0.5
+    if not np.any(selected):
+        raise ValueError("appearance metrics require a non-empty foreground")
+    pred_values = prediction[selected]
+    target_values = target[selected]
+    pred_mean = float(np.mean(pred_values))
+    target_mean = float(np.mean(target_values))
+    luma = np.asarray([0.2989, 0.5870, 0.1140], dtype=np.float32)
+    pred_luma = pred_values @ luma
+    target_luma = target_values @ luma
+    if float(np.std(pred_luma)) <= 1e-8 or float(np.std(target_luma)) <= 1e-8:
+        correlation = 0.0
+    else:
+        correlation = float(np.corrcoef(pred_luma, target_luma)[0, 1])
+    return {
+        "gt_mean_intensity": target_mean,
+        "pred_mean_intensity": pred_mean,
+        "mean_intensity_ratio": pred_mean / max(target_mean, 1e-8),
+        "luminance_correlation": correlation,
     }
 
 
@@ -1261,8 +1512,8 @@ def _adapter_provenance() -> dict[str, Any]:
     acquisition_path = Path(__file__).resolve()
     lighting_path = acquisition_path.with_name("lighting_profiles.py")
     return {
-        "schema": "ictpolarreal.profile-acquisition-adapter.v1",
-        "algorithm_version": "disney-profile-matrix-v1",
+        "schema": "ictpolarreal.profile-acquisition-adapter.v2",
+        "algorithm_version": "superdimension-parity-v2",
         "end2end_acquisition_sha256": hashlib.sha256(
             acquisition_path.read_bytes()
         ).hexdigest(),
@@ -1293,13 +1544,49 @@ def _load_imaginaire_disney(imaginaire_root: str | Path):
     root_string = str(root)
     if root_string not in sys.path:
         sys.path.insert(0, root_string)
+
+    # disney_brdf imports torchvision at module scope, but only uses
+    # torchvision.utils.save_image inside optional shadow-debug branches.  The
+    # production acquisition never enables those branches, so do not make a
+    # large compiled vision package a hard runtime dependency.  Keep this shim
+    # local to the import: the loaded Disney module retains its reference while
+    # unrelated imports in this process continue to see the real environment.
+    torchvision_shim = None
+    had_torchvision_module = "torchvision" in sys.modules
+    previous_torchvision_module = sys.modules.get("torchvision")
+    try:
+        importlib.import_module("torchvision")
+    except ModuleNotFoundError as exc:
+        if exc.name != "torchvision":
+            raise
+
+        def _missing_torchvision_save_image(*_args, **_kwargs):
+            raise RuntimeError(
+                "Imaginaire shadow debug image export requires torchvision; "
+                "end2end material acquisition itself does not."
+            )
+
+        torchvision_shim = types.ModuleType("torchvision")
+        torchvision_shim.utils = types.SimpleNamespace(
+            save_image=_missing_torchvision_save_image
+        )
+        sys.modules["torchvision"] = torchvision_shim
     try:
         module = importlib.import_module("CookTorrance_IBL.disney_brdf")
     except ModuleNotFoundError as exc:
         raise ModuleNotFoundError(
             "Could not import Imaginaire's Disney BRDF runtime. The selected Python "
-            "environment must provide torch, torchvision, scipy, numpy, and Pillow."
+            "environment must provide torch, scipy, numpy, and Pillow."
         ) from exc
+    finally:
+        if (
+            torchvision_shim is not None
+            and sys.modules.get("torchvision") is torchvision_shim
+        ):
+            if had_torchvision_module:
+                sys.modules["torchvision"] = previous_torchvision_module
+            else:
+                del sys.modules["torchvision"]
     imported_path = Path(module.__file__).resolve()
     if imported_path != source_path:
         raise RuntimeError(
@@ -1311,21 +1598,26 @@ def _load_imaginaire_disney(imaginaire_root: str | Path):
 
 def _normalize_targets(targets: np.ndarray, foreground: np.ndarray) -> np.ndarray:
     targets = np.maximum(np.nan_to_num(targets, nan=0.0, posinf=0.0, neginf=0.0), 0.0)
-    selected = foreground[..., 0] > 0.5
-    flat = targets[:, selected, :].reshape(len(targets), -1)
+    # Match the renderer: mask first, then compute one p99.5 scale over the
+    # complete CHW image (including the now-zero background).
+    targets = targets * foreground[None, ...]
+    flat = targets.reshape(len(targets), -1)
     scales = np.quantile(flat, PERCENTILE / 100.0, axis=1).astype(np.float32)
     scales = np.maximum(scales, 1e-8)
     return np.clip(targets / scales[:, None, None, None], 0.0, 1.0).astype(np.float32)
 
 
 def _normalize_render_foreground(render, mask_chw):
-    """Apply the target's foreground-only p99.5 scale to a rendered HDR tensor."""
-    finite = render.nan_to_num(nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
-    valid = mask_chw.expand_as(render) > 0.5
-    values = finite.masked_select(valid)
-    if values.numel() == 0:
-        raise ValueError("cannot normalize a render without finite foreground pixels")
-    scale = _safe_torch_quantile(values, PERCENTILE / 100.0).clamp_min(1e-8)
+    """Mask an HDR tensor, then apply Imaginaire's whole-image p99.5 scale."""
+    finite = (
+        render.nan_to_num(nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+        * mask_chw
+    )
+    if not bool((mask_chw > 0.5).any()):
+        raise ValueError("cannot normalize a render without foreground pixels")
+    scale = _safe_torch_quantile(
+        finite.reshape(-1), PERCENTILE / 100.0
+    ).clamp_min(1e-8)
     return (finite / scale).clamp_max(1.0) * mask_chw
 
 
@@ -1374,8 +1666,8 @@ def _validate_hdri_gpu_memory(
 
 def _normalize_base_color(base_color: np.ndarray, foreground: np.ndarray) -> np.ndarray:
     image = np.maximum(np.nan_to_num(base_color, nan=0.0, posinf=0.0, neginf=0.0), 0.0)
-    selected = foreground[..., 0] > 0.5
-    values = image[selected]
+    image = image * foreground
+    values = image.reshape(-1)
     scale = float(np.quantile(values, PERCENTILE / 100.0)) if values.size else 1.0
     return np.clip(image / max(scale, 1e-8), 0.0, 1.0).astype(np.float32)
 
@@ -1483,6 +1775,7 @@ def _write_relighting_evaluation(
                 "mae": mae(prediction, target, foreground),
                 "psnr": psnr(prediction, target, foreground),
                 "ssim_global": ssim_global(prediction, target, foreground),
+                **_appearance_metrics(prediction, target, foreground),
                 "pred_path": _relative_path(pred_path, evaluation_dir),
                 "gt_path": _relative_path(gt_path, evaluation_dir),
                 "error_path": _relative_path(error_path, evaluation_dir),
@@ -1495,11 +1788,11 @@ def _write_relighting_evaluation(
     summary = _evaluation_summary(
         rows,
         split=split,
-        target="2*cross + 2*max(parallel-cross, 0)",
+        target="measured parallel-polarized OLAT (diffuse + specular)",
         panels=["ground_truth", "prediction", "absolute_error_x4"],
         metrics_path="metrics.csv",
         contact_sheet="contact_sheet.png",
-        target_origin="measured_polarized_olat",
+        target_origin="measured_parallel_olat",
     )
     summary["frame_ids"] = [row["frame_id"] for row in rows]
     summary["light_indices"] = [row["light_index"] for row in rows]
@@ -1513,7 +1806,9 @@ def _write_relighting_evaluation(
     print(
         f"[end2end] {split} relighting: count={len(rows)} "
         f"PSNR={summary['metrics']['psnr']:.3f} "
-        f"SSIM-global={summary['metrics']['ssim_global']:.4f}",
+        f"SSIM-global={summary['metrics']['ssim_global']:.4f} "
+        f"intensity-ratio={summary['metrics']['mean_intensity_ratio']:.3f} "
+        f"corr={summary['metrics']['luminance_correlation']:.3f}",
         flush=True,
     )
     return summary, [float(row["mse"]) for row in rows]

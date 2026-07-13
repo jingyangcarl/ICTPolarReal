@@ -73,16 +73,22 @@ bash run.sh process \
 
 The primary profile must be included in the requested profile list. Each
 camera's `manifest.json` records a `primary_material_dir` such as
-`mix/simplified-multilayer/material/maps`. Downstream ICTPolarReal loaders read
-that field, while preserving the legacy `brdf/` lookup for default Ward and
-older material roots.
+`material/mix/maps`. Downstream ICTPolarReal loaders read that field, while
+preserving the legacy `brdf/` lookup for default Ward and older material roots.
 
-All requested profiles start from the same initialization. Base color and
-normal are computed from the fitted OLAT subset using ICTPolarReal's polarized
-decomposition, then frozen during each Disney fit. The adapter initializes the
-Disney scalars in the renderer's sigmoid-logit storage space so their physical
-starting values match the recorded configuration. Each profile has its own
-optimizer, checkpoint, material state, provenance, and evaluation output.
+All requested profiles start from the same SuperDimension-compatible inputs:
+the dataset `static` image for base color, the dataset photometric `normal`, and
+a constant optical-axis view direction transformed into world space. Ward
+decomposition is only a fallback when either dataset initialization is absent.
+Base color and normal remain fixed during each Disney fit. Pixels that are
+inside the capture mask but fail `n dot v > 0` are excluded and counted in the
+acquisition provenance, which makes a coordinate-convention error visible
+instead of silently optimizing invalid shading.
+
+The Disney scalar maps keep Imaginaire's raw unconstrained constructor values.
+The adapter records both raw and sigmoid-constrained values but does not apply
+an extra logit transform. Each profile has its own optimizer, checkpoint,
+material state, provenance, and evaluation output.
 
 End-to-end optimization defaults to 33,000 steps and a learning rate of
 `1e-3`. Set these with `--end2end-steps` and
@@ -107,8 +113,8 @@ The environment preparation is deterministic:
    The Voronoi assignment is recomputed separately on the fit-light and
    evaluation-light bases, so both composites cover the full sphere without
    borrowing directions from the other split.
-4. The measured ICTPolarReal OLAT targets are combined with those RGB weights
-   to synthesize the environment-lit target.
+4. The measured ICTPolarReal parallel-polarized OLAT targets are combined with
+   those RGB weights to synthesize the environment-lit target.
 
 The defaults select 100 natural fit identities, four held-out natural
 identities, and four yaw rotations per identity. Configure them with:
@@ -121,21 +127,26 @@ Generated white, red, green, and blue (`w/r/g/b`) calibration environments are
 also added to the fit conditions, with the same rotations. They are never part
 of the held-out natural-HDRI suite.
 
-HDRI ground truth is therefore synthesized from measured ICTPolarReal OLATs;
-it is not an independently captured HDRI-lit photograph. The camera manifest,
-lighting condition manifest, and evaluation summaries record this target
-origin. The output demonstrates that the same acquisition implementation can
-be driven by OLAT, synthesized HDRI, or mixed targets, but it makes no claim of
-numerical parity with SuperDimension or another dataset.
+HDRI ground truth is therefore synthesized from measured ICTPolarReal parallel
+OLATs; it is not an independently captured HDRI-lit photograph. The camera
+manifest, lighting condition manifest, and evaluation summaries record this
+target origin. The output demonstrates that the same acquisition
+implementation can be driven by OLAT, synthesized HDRI, or mixed targets, but
+it makes no claim of numerical parity with SuperDimension or another dataset.
 
 ## Strict evaluation splits
 
-The default full camera has 346 calibrated OLAT pairs. With
-`--end2end-eval-lights 16`, the deterministic split reserves 16 measurements
-before material initialization and optimization, leaving exactly 330 fit
-lights. Training OLAT targets and training HDRI composites use only those fit
-lights. The held-out OLATs are used only by evaluation, including as the
-measured support for held-out-HDRI evaluation targets.
+The default full camera has 346 calibrated OLAT pairs. The ICTPolarReal
+adaptation applies a 164-light SuperDimension-style fit to the LSX visible
+hemisphere: calibrated indices `0..172` contain 173 visible lights, 164 evenly
+spaced indices are used for fitting, and the nine omitted visible indices are
+held out. Rear/unused indices `173..345` are excluded from both fitting and
+evaluation. With the default `--end2end-eval-lights 16`, all nine available
+visible holdouts are used.
+Training OLAT targets and training HDRI composites use only the 164 fit lights.
+The nine held-out OLATs are used only by evaluation, including as the measured
+support for held-out-HDRI evaluation targets. Reduced or non-LSX inputs fall
+back to the generic deterministic split.
 
 Natural HDRIs have a separate identity-level split controlled by
 `--end2end-eval-hdris`. A held-out environment identity and all its rotations
@@ -151,16 +162,13 @@ reconstruction. Setting `--end2end-eval-hdris 0` similarly uses fit HDRIs for
 the HDRI evaluation suite; the summaries label these cases `fitted_olat` or
 `fitted_hdri` rather than held out.
 
-Targets use the polarization convention:
-
-- `diffuse = 2 * cross`
-- `specular = 2 * max(parallel - cross, 0)`
-- `target = diffuse + specular`
-
-Target and prediction are independently normalized over the foreground with
-99.5th-percentile linear scaling and clipping. Metrics are foreground-masked.
-They measure scale-normalized LDR appearance, not absolute radiometric HDR
-accuracy.
+The OLAT target is the measured parallel-polarized image, which already
+contains diffuse and specular reflection. The flow does not reconstruct a
+synthetic `2*cross + 2*max(parallel-cross, 0)` target. Invalid/background pixels
+are zeroed first, then target and prediction use the renderer-native
+whole-image 99.5th-percentile linear scaling and clipping. Metrics use the same
+validity mask. They measure scale-normalized LDR appearance, not absolute
+radiometric HDR accuracy.
 
 ## Output layout
 
@@ -183,24 +191,17 @@ outputs/material_acquisition/
 Vector maps use the standard `[-1,1]` to `[0,1]` PNG encoding. Ward sigma and
 roughness use `x / (1 + x)` so values above one are retained in the PNG.
 
-End-to-end acquisition uses a profile-oriented camera tree:
+End-to-end acquisition uses a function-first camera tree. There is one place
+for acquired material and one place for evaluation:
 
 ```text
 outputs/material_acquisition_end2end/
   run.json
   object_name/camXX/
     manifest.json
-    lighting/
-      conditions.json
-      weights.npz
-      previews/<condition_id>.png
-    report/
-      overview.png
-      metrics.csv
-      summary.json
-    olat/simplified-multilayer/
-      acquisition.json
-      material/
+    material/
+      olat/
+        acquisition.json
         disney_brdf.pt
         maps/
           albedo.png
@@ -214,7 +215,10 @@ outputs/material_acquisition_end2end/
           anisotropic.png
           clearcoat.png
           clearcoatGloss.png
-      evaluation/
+      hdri/...
+      mix/...
+    evaluation/
+      olat/
         metrics.csv
         summary.json
         olat/
@@ -227,18 +231,28 @@ outputs/material_acquisition_end2end/
           summary.json
           contact_sheet.png
           cases/<condition_id>/{lighting,gt,pred,error,comparison}.png
-    hdri/simplified-multilayer/...
-    mix/simplified-multilayer/...
+      hdri/...
+      mix/...
+      report/
+        overview.png
+        metrics.csv
+        summary.json
+      lighting/
+        conditions.json
+        weights.npz
 ```
 
-Only requested profiles are created. `report/overview.png` uses one shared
-representative OLAT case and one shared representative HDRI case across all
-rows, alongside maps and aggregate metrics, so the profile comparison is
-visually aligned. `report/metrics.csv` and `report/summary.json` provide the
-same comparison in machine-readable form.
+Only requested profiles are created. `evaluation/report/overview.png` uses one
+shared representative OLAT case and one shared representative HDRI case across
+all rows, alongside maps and aggregate metrics, so the profile comparison is
+visually aligned. `evaluation/report/metrics.csv` and
+`evaluation/report/summary.json` provide the same comparison in
+machine-readable form. `evaluation/lighting/` contains only `conditions.json`
+and `weights.npz`; lighting thumbnails live in the HDRI cases that consume
+them, so there is no duplicate preview dump.
 
 During each long fit, the resumable checkpoint is
-`<profile>/simplified-multilayer/checkpoints/latest.pt`. Re-running with the
+`material/<profile>/checkpoints/latest.pt`. Re-running with the
 same inputs, profile, settings, material root, and Imaginaire source resumes
 it. The checkpoint is removed after maps, model state, acquisition provenance,
 and evaluations are written successfully. A later invocation validates those
@@ -250,9 +264,9 @@ requires a different material root or explicit cleanup of the stale checkpoint.
 The repository includes LSX light and camera calibration under `metadata/`.
 Raw 350-frame sequences skip indicator frames 0, 1, 348, and 349. Use
 `--max-lights N` for a diagnostic subset; the default 346-light selection is
-recommended for a full acquisition. Reducing it also reduces the pool from
-which the OLAT holdout is made, while always retaining at least four fit
-lights.
+required to reproduce the exact 164-fit/9-holdout SuperDimension selection.
+Reducing it uses the generic deterministic split and always retains at least
+four fit lights.
 
 Do not run the Disney optimizer on a GPU-less login node. Submit it through the
 pipeline:
