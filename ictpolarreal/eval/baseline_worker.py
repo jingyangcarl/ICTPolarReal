@@ -9,6 +9,10 @@ from pathlib import Path
 
 import numpy as np
 
+from ictpolarreal.eval.cache import (
+    forward_prediction_is_current,
+    write_forward_cache_signature,
+)
 from ictpolarreal.utils.io import read_image, write_image
 
 
@@ -271,7 +275,11 @@ def _run_diffusion_renderer(args: argparse.Namespace, manifest: dict) -> None:
     pending_forward = [
         sample
         for sample in forward_samples
-        if args.force or not _forward_output_path(args.out_root, sample).exists()
+        if args.force
+        or not forward_prediction_is_current(
+            _forward_output_path(args.out_root, sample),
+            sample,
+        )
     ]
     if not pending_forward:
         return
@@ -310,6 +318,8 @@ def _run_diffusion_renderer(args: argparse.Namespace, manifest: dict) -> None:
             num_frames=1,
             fixed_pose=True,
             rotate_envlight=False,
+            env_flip=bool(forward_sample["environment_flip"]),
+            env_rot=float(forward_sample["environment_rotation_degrees"]),
             env_format=["proj"],
             device=device,
         )
@@ -330,6 +340,7 @@ def _run_diffusion_renderer(args: argparse.Namespace, manifest: dict) -> None:
         prediction = _diffusion_renderer_prediction(output, output_hw=original_hw)
         output_path = _forward_output_path(args.out_root, forward_sample)
         write_image(output_path, prediction)
+        write_forward_cache_signature(output_path, forward_sample)
         print(f"[baseline:diffusion_renderer] wrote {output_path}")
 
 

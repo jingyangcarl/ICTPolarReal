@@ -16,6 +16,11 @@ from ictpolarreal.data.training import (
 from ictpolarreal.utils.io import write_image
 
 
+LIGHT_PROBE_MAPPING = "Light_Probe_Mapping_Main_WO_Daughter.txt"
+LIGHT_ORDER = "LSX3_light_z_spiral.txt"
+LIGHTING_CONVENTION = "lsx-main-zspiral-y180-v1"
+
+
 @dataclass(frozen=True)
 class ForwardEvaluationRecord:
     camera_key: tuple[str, str]
@@ -56,12 +61,16 @@ class ICTPolarRealForwardEvaluationDataset:
         )
         self.hdri_root = Path(hdri_root)
         self.hdri_olat_lights = hdri_olat_lights
+        self.light_mapping, self.light_order = _load_lightstage_mapping(
+            data_root,
+            light_root,
+        )
         self.records: list[ForwardEvaluationRecord] = []
         self.camera_keys: list[tuple[str, str]] = []
         self.static_indices: dict[tuple[str, str], int] = {}
         self.olat_indices: dict[tuple[str, str], list[int]] = {}
         self._synthesis_cache: dict[
-            tuple[str, str], tuple[np.ndarray, np.ndarray, np.ndarray]
+            tuple[str, str], tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
         ] = {}
 
         for index, record in enumerate(self.base.records):
@@ -147,15 +156,17 @@ class ICTPolarRealForwardEvaluationDataset:
         assert record.base_index is not None
         base_record = self.base.records[record.base_index]
         assert base_record.light_index is not None
-        output_path = Path(output_root) / "environments" / f"{record.lighting_name}.exr"
+        output_path = (
+            Path(output_root)
+            / "environments"
+            / LIGHTING_CONVENTION
+            / f"{record.lighting_name}.exr"
+        )
         if output_path.exists():
             return output_path
-        light_indices = sorted(self.base.light_directions)
-        directions = np.stack([self.base.light_directions[item] for item in light_indices])
-        selected = light_indices.index(base_record.light_index)
-        assignment = _latlong_voronoi(directions, height=256, width=512)
         environment = np.zeros((256, 512, 3), dtype=np.float32)
-        environment[assignment == selected] = 1.0
+        label = _mapping_label(self.light_order, base_record.light_index)
+        environment[self.light_mapping == label] = 1.0
         write_image(output_path, environment)
         return output_path
 
@@ -170,6 +181,7 @@ class ICTPolarRealForwardEvaluationDataset:
             output_hw = tuple(int(value) for value in static_sample["rgb"].shape[-2:])
             images = []
             directions = []
+            light_indices = []
             for base_index in selected:
                 record = self.base.records[base_index]
                 assert record.parallel_frame is not None and record.light_index is not None
@@ -178,6 +190,7 @@ class ICTPolarRealForwardEvaluationDataset:
                     continue
                 images.append(_resize(_read_hdr(path), output_hw))
                 directions.append(self.base.light_directions[record.light_index])
+                light_indices.append(record.light_index)
             if not images:
                 raise FileNotFoundError(f"No usable OLAT images found for {camera_key}")
             camera = self.base.records[self.static_indices[camera_key]].camera
@@ -186,10 +199,16 @@ class ICTPolarRealForwardEvaluationDataset:
                 np.stack(images),
                 np.stack(directions),
                 _normalize_vectors(normal),
+                np.asarray(light_indices, dtype=np.int32),
             )
 
-        images, directions, normal = self._synthesis_cache[camera_key]
-        radiance = _sample_latlong(_read_hdr(hdri_path), directions)
+        images, directions, normal, light_indices = self._synthesis_cache[camera_key]
+        radiance = _sample_lightstage_environment(
+            _read_hdr(hdri_path),
+            light_indices,
+            self.light_mapping,
+            self.light_order,
+        )
         luminance = radiance @ np.asarray([0.2126, 0.7152, 0.0722], dtype=np.float32)
         exposure = float(np.percentile(luminance[luminance > 0], 75)) if np.any(luminance > 0) else 1.0
         weights = radiance / max(exposure, 1e-6) / len(radiance)
@@ -237,30 +256,63 @@ def _read_hdr(path: str | Path) -> np.ndarray:
     return np.nan_to_num(image.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
 
 
-def _sample_latlong(environment: np.ndarray, directions: np.ndarray) -> np.ndarray:
-    height, width = environment.shape[:2]
-    directions = _normalize_vectors(directions)
-    theta = np.arccos(np.clip(directions[:, 1], -1.0, 1.0))
-    phi = np.arctan2(directions[:, 0], -directions[:, 2])
-    rows = np.clip(np.rint(theta / np.pi * (height - 1)).astype(np.int32), 0, height - 1)
-    columns = np.mod(np.rint((phi / (2.0 * np.pi) + 0.5) * width).astype(np.int32), width)
-    return environment[rows, columns]
+def _sample_lightstage_environment(
+    environment: np.ndarray,
+    light_indices: np.ndarray,
+    mapping: np.ndarray,
+    order: np.ndarray,
+) -> np.ndarray:
+    if environment.shape[:2] != mapping.shape:
+        import cv2
+
+        mapping = cv2.resize(
+            mapping,
+            environment.shape[1::-1],
+            interpolation=cv2.INTER_NEAREST,
+        )
+    radiance = []
+    for light_index in light_indices:
+        pixels = environment[mapping == _mapping_label(order, int(light_index))]
+        radiance.append(pixels.mean(axis=0) if len(pixels) else np.zeros(3, dtype=np.float32))
+    return np.asarray(radiance, dtype=np.float32)
 
 
-def _latlong_voronoi(directions: np.ndarray, *, height: int, width: int) -> np.ndarray:
-    latitude = (np.arange(height, dtype=np.float32) + 0.5) / height * np.pi
-    longitude = ((np.arange(width, dtype=np.float32) + 0.5) / width * 2.0 - 1.0) * np.pi
-    theta, phi = np.meshgrid(latitude, longitude, indexing="ij")
-    vectors = np.stack(
+def _mapping_label(order: np.ndarray, light_index: int) -> int:
+    if light_index < 0 or light_index >= len(order):
+        raise IndexError(f"Light index {light_index} is outside the LSX z-spiral table")
+    return int(order[light_index]) - 1
+
+
+def _load_lightstage_mapping(
+    data_root: str | Path,
+    light_root: str | Path | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    root = Path(data_root)
+    candidates = []
+    if light_root:
+        candidates.append(Path(light_root))
+    candidates.extend(
         (
-            np.sin(theta) * np.sin(phi),
-            np.cos(theta),
-            -np.sin(theta) * np.cos(phi),
-        ),
-        axis=-1,
-    ).reshape(-1, 3)
-    directions = _normalize_vectors(directions)
-    assignment = np.empty(len(vectors), dtype=np.int32)
-    for start in range(0, len(vectors), 4096):
-        assignment[start : start + 4096] = np.argmax(vectors[start : start + 4096] @ directions.T, axis=1)
-    return assignment.reshape(height, width)
+            root / "calibration",
+            root / "metadata",
+            root / "LSX",
+            Path(__file__).resolve().parents[2] / "metadata",
+            Path(__file__).resolve().parents[4] / "data" / "LSX",
+        )
+    )
+    for candidate in candidates:
+        mapping_path = candidate / LIGHT_PROBE_MAPPING
+        order_path = candidate / LIGHT_ORDER
+        if not mapping_path.is_file() or not order_path.is_file():
+            continue
+        mapping = np.loadtxt(mapping_path, dtype=np.int32)
+        order = np.loadtxt(order_path, dtype=np.int32)
+        if mapping.size != 256 * 512:
+            raise ValueError(f"Expected 256x512 LSX mapping values in {mapping_path}")
+        if order.ndim != 1 or not len(order):
+            raise ValueError(f"Invalid LSX z-spiral table in {order_path}")
+        return mapping.reshape(256, 512), order
+    raise FileNotFoundError(
+        f"Missing {LIGHT_PROBE_MAPPING} and {LIGHT_ORDER} under --light-root, "
+        "the data root, or metadata/."
+    )

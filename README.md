@@ -72,6 +72,24 @@ The original 350-frame capture layout reserves frames `000000`, `000001`,
 bundled LSX calibration maps valid frames `000002` through `000347` to light
 directions. `run.sh process` also accepts normalized 346-frame sequences.
 
+## Full Dataset Training
+
+The downloadable camera is a functional sample, not enough data for a
+quality model. Train release models on the full `fit_512` tree. If that tree
+already contains the released `albedo.exr`, `normal.exr`, and `specular.exr`
+maps, use it as both the data and material root:
+
+```bash
+bash run.sh train \
+  --data-root /path/to/fit_512 \
+  --material-root /path/to/fit_512
+```
+
+When `train_fitting_512_ck.csv` is next to `fit_512`, the loader detects it
+automatically and excludes incomplete camera captures. Run `bash run.sh
+check-data --data-root /path/to/fit_512` before a long job; use
+`--train-dry-run` for a no-weights tensor check.
+
 ## Outputs
 
 Default outputs are written to `outputs/`:
@@ -115,7 +133,9 @@ RGB2X training environment. See `docs/training.md` for the cache layout.
 Forward evaluation uses 20 fixed OLATs and 20 fixed HDRIs for each selected
 camera. Put evaluation environments under `data/hdri`, or pass `--hdri-root`.
 The CSV records `lighting_type=olat|hdri`, and `summary.json` reports each
-lighting subset separately.
+lighting subset separately. OLAT environments use the bundled LSX probe map.
+Diffusion Renderer receives the Light Stage convention explicitly: no
+horizontal flip and a 180-degree yaw.
 
 ## Flexible Usage
 

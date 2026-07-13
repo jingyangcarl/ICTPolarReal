@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
@@ -33,12 +34,50 @@ class CameraSample:
         return find_first_existing(light_dir, name)
 
 
-def iter_camera_samples(data_root: str | Path) -> Iterator[CameraSample]:
+def discover_camera_split(data_root: str | Path) -> Path | None:
     root = Path(data_root)
+    candidates = (
+        root / "train.csv",
+        root.parent / "train_fitting_512_ck.csv",
+    )
+    return next((path for path in candidates if path.is_file()), None)
+
+
+def load_camera_split(path: str | Path) -> set[tuple[str, str]]:
+    path = Path(path)
+    with path.open(newline="") as file:
+        reader = csv.DictReader(file)
+        if reader.fieldnames is None:
+            raise ValueError(f"Missing CSV header in camera split: {path}")
+        object_field = "object" if "object" in reader.fieldnames else "obj"
+        camera_field = "camera" if "camera" in reader.fieldnames else "cam"
+        if object_field not in reader.fieldnames or camera_field not in reader.fieldnames:
+            raise ValueError(f"Camera split must contain object/obj and camera/cam columns: {path}")
+        samples = set()
+        for row in reader:
+            camera = row[camera_field].strip()
+            camera = camera if camera.startswith("cam") else f"cam{int(camera):02d}"
+            samples.add((row[object_field].strip(), camera))
+    return samples
+
+
+def iter_camera_samples(
+    data_root: str | Path,
+    *,
+    split_file: str | Path | None = "auto",
+) -> Iterator[CameraSample]:
+    root = Path(data_root)
+    if split_file == "auto":
+        resolved_split = discover_camera_split(root)
+    else:
+        resolved_split = Path(split_file) if split_file is not None else None
+    allowed = load_camera_split(resolved_split) if resolved_split is not None else None
     for object_dir in sorted(p for p in root.iterdir() if p.is_dir()):
         if object_dir.name.startswith(".") or object_dir.name in {"calibration", "metadata"}:
             continue
         for camera_dir in sorted(object_dir.glob("cam[0-9][0-9]")):
+            if allowed is not None and (object_dir.name, camera_dir.name) not in allowed:
+                continue
             yield CameraSample(object_dir.name, camera_dir.name, camera_dir)
 
 

@@ -1,9 +1,11 @@
 import argparse
+import csv
 import json
 
 import numpy as np
 import pytest
 
+from ictpolarreal.data.dataset import iter_camera_samples
 from ictpolarreal.data.training import ICTPolarRealTrainingDataset
 from ictpolarreal.train.contracts import build_forward_condition, inverse_target_names
 from ictpolarreal.train.diffusion import (
@@ -75,6 +77,22 @@ def test_rgb2x_training_dataset_contract(tmp_path):
     assert sample["mask"].shape == (1, 16, 32)
     assert sample["light_index"] == 0
     assert sample["frame_id"] == 0
+
+
+def test_camera_discovery_uses_adjacent_curated_split(tmp_path):
+    data_root = tmp_path / "fit_512"
+    for object_name, camera_name in (("keep", "cam00"), ("skip", "cam01")):
+        (data_root / object_name / camera_name).mkdir(parents=True)
+    split_path = tmp_path / "train_fitting_512_ck.csv"
+    with split_path.open("w", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=("obj", "cam", "res"))
+        writer.writeheader()
+        writer.writerow({"obj": "keep", "cam": 0, "res": 512})
+
+    assert [
+        (sample.object_name, sample.camera) for sample in iter_camera_samples(data_root)
+    ] == [("keep", "cam00")]
+    assert len(list(iter_camera_samples(data_root, split_file=None))) == 2
 
 
 def test_rgb2x_inverse_and_forward_contracts(tmp_path):

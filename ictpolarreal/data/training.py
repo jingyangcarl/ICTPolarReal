@@ -93,8 +93,12 @@ class ICTPolarRealTrainingDataset(Dataset):
         directions = load_light_directions(self.data_root, light_indices, light_root=self.light_root)
         self.light_directions = dict(zip(light_indices, directions, strict=True))
 
-        for record in self.records:
-            self._require_material_maps(record.camera)
+        cameras = {
+            (record.camera.object_name, record.camera.camera): record.camera
+            for record in self.records
+        }
+        for camera in cameras.values():
+            self._require_material_maps(camera)
 
     def __len__(self) -> int:
         return len(self.records)

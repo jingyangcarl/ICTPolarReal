@@ -4,7 +4,7 @@ import argparse
 from collections import Counter
 from pathlib import Path
 
-from ictpolarreal.data.dataset import iter_camera_samples
+from ictpolarreal.data.dataset import discover_camera_split, iter_camera_samples
 from ictpolarreal.data.olat import numeric_image_ids, paired_light_frames
 
 
@@ -33,6 +33,8 @@ def main() -> None:
         print(f"[data-check] Sample Google Drive folder: {args.sample_url}")
         raise SystemExit(2)
 
+    split_file = discover_camera_split(root)
+    all_samples = list(iter_camera_samples(root, split_file=None))
     samples = list(iter_camera_samples(root))
     objects = sorted({sample.object_name for sample in samples})
     cameras = Counter(sample.camera for sample in samples)
@@ -72,6 +74,9 @@ def main() -> None:
         failures.append(f"found max {max(light_counts) if light_counts else 0} paired OLAT light(s), need at least {args.min_lights}")
 
     print(f"[data-check] data_root: {root.resolve()}")
+    if split_file is not None:
+        print(f"[data-check] camera_split: {split_file.resolve()}")
+        print(f"[data-check] excluded_camera_folders: {len(all_samples) - len(samples)}")
     print(f"[data-check] objects: {len(objects)}")
     print(f"[data-check] camera_samples: {len(samples)}")
     print(f"[data-check] cameras: {dict(sorted(cameras.items()))}")

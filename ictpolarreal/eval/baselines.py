@@ -9,8 +9,12 @@ from pathlib import Path
 
 import numpy as np
 
-from ictpolarreal.data.forward_evaluation import ICTPolarRealForwardEvaluationDataset
+from ictpolarreal.data.forward_evaluation import (
+    LIGHTING_CONVENTION,
+    ICTPolarRealForwardEvaluationDataset,
+)
 from ictpolarreal.data.dataset import iter_camera_samples
+from ictpolarreal.eval.cache import forward_prediction_is_current
 from ictpolarreal.utils.io import read_image, write_image
 
 
@@ -94,6 +98,9 @@ def prepare_manifest(
                     "lighting_type": record.lighting_type,
                     "lighting_name": record.lighting_name,
                     "environment": str(dataset.export_environment(index, out_root).resolve()),
+                    "lighting_convention": LIGHTING_CONVENTION,
+                    "environment_flip": False,
+                    "environment_rotation_degrees": 180.0,
                 }
             )
 
@@ -130,14 +137,15 @@ def _method_complete(
         "forward" not in stages
         or method != "diffusion_renderer"
         or all(
-            (
+            forward_prediction_is_current(
                 root
                 / method
                 / sample["object"]
                 / sample["camera"]
                 / sample["lighting_name"]
-                / "forward_rgb.png"
-            ).is_file()
+                / "forward_rgb.png",
+                sample,
+            )
             for sample in forward_samples or []
         )
     )

@@ -10,6 +10,7 @@ from ictpolarreal.eval.baselines import (
     _worker_environment,
     prepare_manifest,
 )
+from ictpolarreal.eval.cache import write_forward_cache_signature
 from ictpolarreal.utils.io import read_image, write_image
 
 
@@ -50,6 +51,9 @@ def test_forward_cache_contract(tmp_path):
             "lighting_type": "olat",
             "lighting_name": "olat_000000",
             "environment": "olat.exr",
+            "lighting_convention": "test-v1",
+            "environment_flip": False,
+            "environment_rotation_degrees": 180.0,
         },
         {
             "object": "object",
@@ -57,6 +61,9 @@ def test_forward_cache_contract(tmp_path):
             "lighting_type": "hdri",
             "lighting_name": "hdri_studio",
             "environment": "studio.exr",
+            "lighting_convention": "test-v1",
+            "environment_flip": False,
+            "environment_rotation_degrees": 180.0,
         },
     ]
     root = tmp_path / "baselines"
@@ -69,15 +76,16 @@ def test_forward_cache_contract(tmp_path):
         forward_samples=forward_samples,
     )
     for sample in forward_samples:
-        write_image(
+        output_path = (
             root
             / "diffusion_renderer"
             / sample["object"]
             / sample["camera"]
             / sample["lighting_name"]
-            / "forward_rgb.png",
-            np.zeros((4, 4, 3), dtype=np.float32),
+            / "forward_rgb.png"
         )
+        write_image(output_path, np.zeros((4, 4, 3), dtype=np.float32))
+        write_forward_cache_signature(output_path, sample)
     assert _method_complete(
         root,
         "diffusion_renderer",
