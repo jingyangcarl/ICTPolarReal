@@ -140,11 +140,22 @@ def test_training_evaluation_writes_method_history(tmp_path):
     )
 
     assert (step_root / "metrics.csv").exists()
-    assert (step_root / "comparisons" / "object" / "cam00" / "static" / "albedo.png").exists()
+    assert (
+        step_root
+        / "comparisons"
+        / "static"
+        / "object__cam00__static__albedo.png"
+    ).exists()
+    video_path = step_root / "videos" / "object__cam00__albedo__static.mp4"
+    assert video_path.stat().st_size > 0
+    assert (step_root / "README.md").exists()
     summary = json.loads((step_root / "summary.json").read_text())
     assert summary["methods"]["rgb2x"]["label"] == "RGB2X"
     assert summary["methods"]["ours"]["label"] == "Ours"
     assert summary["methods"]["dsine"]["status"] == "skipped"
+    assert summary["videos"] == {
+        "object/cam00/albedo/static": "videos/object__cam00__albedo__static.mp4"
+    }
     assert len((tmp_path / "eval" / "history.jsonl").read_text().splitlines()) == 1
 
 

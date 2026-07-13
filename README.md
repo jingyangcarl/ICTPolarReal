@@ -82,7 +82,7 @@ Default outputs are written to `outputs/`:
 - `outputs/train/forward/gbuffer/`: PBR G-buffer-to-RGB LoRA and relighting predictions.
 - `outputs/train/forward/polarization/`: cross/parallel-to-RGB LoRA and relighting predictions.
 - `outputs/train/*/training_history.csv`: step, task, loss, and learning-rate history.
-- `outputs/train/inverse/eval/` and `outputs/train/forward/<mode>/eval/`: authoritative multi-method panels, CSV metrics, JSON summaries, and history.
+- `outputs/train/inverse/eval/` and `outputs/train/forward/<mode>/eval/`: authoritative comparison videos, flat PNG frames, CSV metrics, JSON summaries, and history.
 - `outputs/eval_ictpolarreal_decomposition/`: CSV metrics and JSON summary.
 
 ## Training-Time Methods

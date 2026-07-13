@@ -56,9 +56,11 @@ checkouts under `external/` or the parent directory. Use the corresponding
 `--*-python` and `--*-repo` options for other layouts. Manual prediction roots
 remain supported with repeatable `--eval-baseline METHOD=PATH` options.
 
-A final comparison runs when training ends. Each `step-NNNNNN` folder contains
-metrics, normalized predictions, targets, and labeled panels under
-`comparisons/`; `eval/history.jsonl` tracks all runs. Unsupported task/method
+A final comparison runs when training ends. Open `step-NNNNNN/videos/` first;
+it contains labeled OLAT and HDRI MP4 comparisons. The same folder keeps a
+short `README.md`, aggregate metrics, and flat artifacts organized as
+`comparisons/<lighting>/`, `predictions/<method>/<lighting>/`, and
+`targets/<lighting>/`. `eval/history.jsonl` tracks all runs. Unsupported task/method
 pairs are explicitly recorded as `skipped` in `summary.json`. Forward rows
 include `lighting_type`, and summaries contain separate OLAT and HDRI metrics.
 

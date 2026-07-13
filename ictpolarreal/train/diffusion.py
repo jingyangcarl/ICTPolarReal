@@ -698,22 +698,12 @@ def _run_periodic_evaluation(
                         target = _tensor_image(target_tensor[0])
                         mask = batch["mask"][0].float().cpu().permute(1, 2, 0).numpy()
                         light = _sample_light_name(sample)
-                        prediction_path = (
-                            step_root
-                            / method
-                            / "predictions"
-                            / sample["object"]
-                            / sample["camera"]
-                            / light
-                            / f"{task}.png"
-                        )
-                        target_path = (
-                            step_root
-                            / "ground_truth"
-                            / sample["object"]
-                            / sample["camera"]
-                            / light
-                            / f"{task}.png"
+                        prediction_path, target_path = _evaluation_image_paths(
+                            step_root,
+                            method=method,
+                            sample=sample,
+                            light=light,
+                            task=task,
                         )
                         write_image(prediction_path, prediction)
                         write_image(target_path, target)
@@ -793,22 +783,12 @@ def _evaluate_external_method(
             prediction = _read_prediction(source_path, output_hw=target.shape[:2])
             mask = batch["mask"][0].float().cpu().permute(1, 2, 0).numpy()
             light = _sample_light_name(sample)
-            prediction_path = (
-                step_root
-                / method
-                / "predictions"
-                / sample["object"]
-                / sample["camera"]
-                / light
-                / f"{task}.png"
-            )
-            target_path = (
-                step_root
-                / "ground_truth"
-                / sample["object"]
-                / sample["camera"]
-                / light
-                / f"{task}.png"
+            prediction_path, target_path = _evaluation_image_paths(
+                step_root,
+                method=method,
+                sample=sample,
+                light=light,
+                task=task,
             )
             write_image(prediction_path, prediction)
             write_image(target_path, target)
@@ -924,6 +904,29 @@ def _evaluation_row(
     }
 
 
+def _evaluation_image_paths(
+    step_root: Path,
+    *,
+    method: str,
+    sample: dict,
+    light: str,
+    task: str,
+) -> tuple[Path, Path]:
+    lighting_type = str(_sample_value(sample, "lighting_type", "static"))
+    filename = f"{_evaluation_stem(sample['object'], sample['camera'], light, task)}.png"
+    return (
+        step_root / "predictions" / method / lighting_type / filename,
+        step_root / "targets" / lighting_type / filename,
+    )
+
+
+def _evaluation_stem(*values: str) -> str:
+    return "__".join(
+        "".join(character if character.isalnum() or character in "-_" else "_" for character in value)
+        for value in values
+    )
+
+
 def _write_training_evaluation(
     rows: list[dict],
     *,
@@ -935,14 +938,16 @@ def _write_training_evaluation(
     step_root.mkdir(parents=True, exist_ok=True)
     for row in rows:
         row.setdefault("lighting_type", "static")
+    videos = {}
     if rows:
         with (step_root / "metrics.csv").open("w", newline="") as file:
             writer = csv.DictWriter(file, fieldnames=list(rows[0]))
             writer.writeheader()
             writer.writerows(rows)
-        _write_comparison_panels(rows, step_root=step_root)
+        panel_records = _write_comparison_panels(rows, step_root=step_root)
+        videos = _write_comparison_videos(panel_records, step_root=step_root)
 
-    summary: dict[str, object] = {"step": step, "methods": {}}
+    summary: dict[str, object] = {"step": step, "videos": videos, "methods": {}}
     all_methods = set(method_status or {}) | {row["method"] for row in rows}
     for method in sorted(all_methods):
         method_summary = {}
@@ -978,6 +983,7 @@ def _write_training_evaluation(
         }
     summary_text = json.dumps(summary, indent=2, sort_keys=True) + "\n"
     (step_root / "summary.json").write_text(summary_text)
+    _write_evaluation_readme(step_root, step=step, videos=videos)
     history_path = output_dir / "eval" / "history.jsonl"
     history_path.parent.mkdir(parents=True, exist_ok=True)
     with history_path.open("a") as file:
@@ -998,19 +1004,58 @@ def _write_training_evaluation(
                     f"SSIM={lighting_metrics['ssim']:.4f} "
                     f"n={lighting_metrics['count']}"
                 )
+    for group, path in videos.items():
+        print(f"[eval:training] video {group}: {step_root / path}")
     print(f"[eval:training] step={step} wrote {step_root}")
 
 
-def _write_comparison_panels(rows: list[dict], *, step_root: Path) -> None:
+def _write_evaluation_readme(
+    step_root: Path,
+    *,
+    step: int,
+    videos: dict[str, str],
+) -> None:
+    video_lines = "\n".join(f"- `{path}`: {group}" for group, path in videos.items())
+    if not video_lines:
+        video_lines = "- No comparison videos were generated."
+    (step_root / "README.md").write_text(
+        f"""# Evaluation Step {step:,}
+
+Start with the MP4 files under `videos/`.
+
+| Path | Contents |
+| --- | --- |
+| `videos/` | Side-by-side ground-truth and method comparisons. |
+| `comparisons/<lighting>/` | The labeled PNG frames used by each video. |
+| `metrics.csv` | One metric row per method, sample, and task. |
+| `summary.json` | Aggregate metrics split by OLAT and HDRI. |
+| `predictions/<method>/<lighting>/` | Flat per-method prediction images. |
+| `targets/<lighting>/` | Flat ground-truth images. |
+
+## Videos
+
+{video_lines}
+"""
+    )
+
+
+def _write_comparison_panels(rows: list[dict], *, step_root: Path) -> list[dict[str, str]]:
     import numpy as np
     from PIL import Image, ImageDraw
 
     grouped = {}
     for row in rows:
-        key = (row["object"], row["camera"], row["light"], row["task"])
+        key = (
+            row["object"],
+            row["camera"],
+            row["light"],
+            row["task"],
+            row["lighting_type"],
+        )
         grouped.setdefault(key, []).append(row)
 
-    for (object_name, camera, light, task), selected in grouped.items():
+    records = []
+    for (object_name, camera, light, task, lighting_type), selected in grouped.items():
         images = [("Ground truth", read_image(selected[0]["target"], channels=3))]
         images.extend(
             (EVALUATION_METHOD_LABELS.get(row["method"], row["method"]), read_image(row["prediction"], channels=3))
@@ -1037,9 +1082,86 @@ def _write_comparison_panels(rows: list[dict], *, step_root: Path) -> None:
         for panel in panels:
             comparison.paste(panel, (x_offset, 0))
             x_offset += panel.width
-        comparison_path = step_root / "comparisons" / object_name / camera / light / f"{task}.png"
+        title_height = 28
+        titled_comparison = Image.new(
+            "RGB",
+            (comparison.width, comparison.height + title_height),
+            "white",
+        )
+        title = f"{object_name}/{camera} | {lighting_type.upper()} | {light}"
+        ImageDraw.Draw(titled_comparison).text((6, 7), title, fill="black")
+        titled_comparison.paste(comparison, (0, title_height))
+        filename = f"{_evaluation_stem(object_name, camera, light, task)}.png"
+        comparison_path = step_root / "comparisons" / lighting_type / filename
         comparison_path.parent.mkdir(parents=True, exist_ok=True)
-        comparison.save(comparison_path)
+        titled_comparison.save(comparison_path)
+        records.append(
+            {
+                "object": object_name,
+                "camera": camera,
+                "light": light,
+                "task": task,
+                "lighting_type": lighting_type,
+                "path": str(comparison_path),
+            }
+        )
+    return records
+
+
+def _write_comparison_videos(
+    records: list[dict[str, str]],
+    *,
+    step_root: Path,
+) -> dict[str, str]:
+    import cv2
+    import numpy as np
+
+    grouped = {}
+    for record in records:
+        key = (
+            record["object"],
+            record["camera"],
+            record["task"],
+            record["lighting_type"],
+        )
+        grouped.setdefault(key, []).append(record)
+
+    videos = {}
+    for (object_name, camera, task, lighting_type), selected in grouped.items():
+        selected.sort(key=lambda item: item["light"])
+        frames = [cv2.imread(item["path"], cv2.IMREAD_COLOR) for item in selected]
+        if any(frame is None for frame in frames):
+            raise RuntimeError(f"Could not read comparison frames for {object_name}/{camera}")
+        height = max(frame.shape[0] for frame in frames)
+        width = max(frame.shape[1] for frame in frames)
+        height += height % 2
+        width += width % 2
+        filename = f"{_evaluation_stem(object_name, camera, task, lighting_type)}.mp4"
+        output_path = step_root / "videos" / filename
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fps = 6.0 if lighting_type == "olat" else 2.0
+        writer = cv2.VideoWriter(
+            str(output_path),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            fps,
+            (width, height),
+        )
+        if not writer.isOpened():
+            raise RuntimeError(f"Could not create evaluation video: {output_path}")
+        try:
+            for frame in frames:
+                canvas = np.full((height, width, 3), 255, dtype=np.uint8)
+                y = (height - frame.shape[0]) // 2
+                x = (width - frame.shape[1]) // 2
+                canvas[y : y + frame.shape[0], x : x + frame.shape[1]] = frame
+                writer.write(canvas)
+        finally:
+            writer.release()
+        if not output_path.is_file() or output_path.stat().st_size == 0:
+            raise RuntimeError(f"Evaluation video is empty: {output_path}")
+        group = f"{object_name}/{camera}/{task}/{lighting_type}"
+        videos[group] = str(output_path.relative_to(step_root))
+    return videos
 
 
 def _evaluation_indices(dataset, *, stage: str, count: int) -> list[int]:
