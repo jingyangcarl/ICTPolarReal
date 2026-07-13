@@ -89,6 +89,7 @@ running on a different machine or dataset:
 ```bash
 bash run.sh check-data
 bash run.sh process --data-root /path/to/data --output-root /path/to/out
+bash run.sh process --slurm --backend torch --device cuda --slurm-account ACCOUNT --slurm-partition PARTITION
 bash run.sh train --data-root /path/to/data --train-stage inverse
 bash run.sh train --data-root /path/to/data --train-stage forward --forward-mode gbuffer
 bash run.sh evaluate --data-root /path/to/data --pred-root /path/to/predictions
@@ -102,6 +103,11 @@ Useful options:
 - `--max-lights N`: use a sphere-wide subset for a quick diagnostic; the default
   346-light fit is recommended for material quality.
 - `--backend torch --device cuda`: explicitly select the PyTorch optimizer.
+- `--slurm`: submit material acquisition to Slurm instead of running it in the
+  current shell. Resource options include `--slurm-account`, `--slurm-partition`,
+  `--slurm-time`, `--slurm-cpus`, `--slurm-mem`, and `--slurm-gpus`.
+- `--slurm-dry-run`: validate data and print the fully escaped `sbatch` command
+  without submitting a job. Logs default to `outputs/slurm/`.
 - `--train-stage inverse|forward|both`: choose the training stage.
 - `--inverse-workflow pbr|polarization|both`: choose inverse supervision targets.
 - `--forward-mode gbuffer|polarization|both`: choose the forward conditioning representation.

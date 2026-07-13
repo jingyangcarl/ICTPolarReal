@@ -40,3 +40,23 @@ For a custom location or explicit GPU execution:
 ```bash
 bash run.sh process --data-root /path/to/data --output-root /path/to/output --backend torch --device cuda
 ```
+
+On a Slurm cluster, submit the same acquisition as a one-GPU batch job so the
+fit does not run on the login node:
+
+```bash
+bash run.sh process \
+  --slurm \
+  --env-name ictpolarreal \
+  --backend torch \
+  --device cuda \
+  --slurm-account ACCOUNT \
+  --slurm-partition PARTITION
+```
+
+The submit host validates the dataset before requesting a GPU, and the worker
+validates it again after leaving the queue. By default the job requests one GPU,
+16 CPU cores, 128 GB of host memory, and 3:59 hours. Slurm stdout/stderr logs go
+under `outputs/slurm/`, while material maps keep the normal
+`outputs/material_acquisition/` layout. Use `--slurm-dry-run` to inspect the
+exact `sbatch` command without submitting it.

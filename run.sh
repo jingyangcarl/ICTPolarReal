@@ -61,6 +61,17 @@ DOWNLOAD_SAMPLE=0
 SKIP_SETUP=0
 SKIP_PROCESS=0
 SKIP_TRAIN=0
+SLURM_SUBMIT=0
+SLURM_DRY_RUN=0
+SLURM_ACCOUNT="${ICTPOLARREAL_SLURM_ACCOUNT:-}"
+SLURM_PARTITION="${ICTPOLARREAL_SLURM_PARTITION:-}"
+SLURM_QOS="${ICTPOLARREAL_SLURM_QOS:-}"
+SLURM_TIME="${ICTPOLARREAL_SLURM_TIME:-03:59:00}"
+SLURM_CPUS="${ICTPOLARREAL_SLURM_CPUS:-16}"
+SLURM_MEM="${ICTPOLARREAL_SLURM_MEM:-128G}"
+SLURM_GPUS="${ICTPOLARREAL_SLURM_GPUS:-1}"
+SLURM_JOB_NAME="${ICTPOLARREAL_SLURM_JOB_NAME:-ictpolarreal-material}"
+SLURM_LOG_DIR="${ICTPOLARREAL_SLURM_LOG_DIR:-}"
 
 usage() {
   cat <<EOF
@@ -123,11 +134,23 @@ Options:
   --skip-setup              For all: use the current environment.
   --skip-process            For all: skip material preprocessing.
   --skip-train              For all: skip training.
+  --slurm                   Submit process as a Slurm job instead of running locally.
+  --slurm-dry-run           Print the sbatch command without submitting it.
+  --slurm-account NAME      Slurm account. Default: cluster default.
+  --slurm-partition NAMES   Slurm partition or comma-separated partitions. Default: cluster default.
+  --slurm-qos NAME          Optional Slurm QOS.
+  --slurm-time HH:MM:SS     Slurm time limit. Default: ${SLURM_TIME}
+  --slurm-cpus N            CPU cores per task. Default: ${SLURM_CPUS}
+  --slurm-mem SIZE          Host memory. Default: ${SLURM_MEM}
+  --slurm-gpus N            GPUs per node; 0 requests no GPU. Default: ${SLURM_GPUS}
+  --slurm-job-name NAME     Slurm job name. Default: ${SLURM_JOB_NAME}
+  --slurm-log-dir PATH      Slurm log folder. Default: OUTPUT_ROOT/slurm
 
 Examples:
   bash run.sh all
   bash run.sh check-data
   bash run.sh process --backend torch --device cuda
+  bash run.sh process --slurm --backend torch --device cuda --slurm-account ACCOUNT --slurm-partition PARTITION
   bash run.sh train --train-stage inverse --inverse-workflow both
   bash run.sh train --train-stage forward --forward-mode gbuffer
 EOF
@@ -183,6 +206,17 @@ parse_args() {
       --skip-setup) SKIP_SETUP=1; shift ;;
       --skip-process) SKIP_PROCESS=1; shift ;;
       --skip-train) SKIP_TRAIN=1; shift ;;
+      --slurm) SLURM_SUBMIT=1; shift ;;
+      --slurm-dry-run) SLURM_SUBMIT=1; SLURM_DRY_RUN=1; shift ;;
+      --slurm-account) SLURM_ACCOUNT="$2"; shift 2 ;;
+      --slurm-partition) SLURM_PARTITION="$2"; shift 2 ;;
+      --slurm-qos) SLURM_QOS="$2"; shift 2 ;;
+      --slurm-time) SLURM_TIME="$2"; shift 2 ;;
+      --slurm-cpus) SLURM_CPUS="$2"; shift 2 ;;
+      --slurm-mem) SLURM_MEM="$2"; shift 2 ;;
+      --slurm-gpus) SLURM_GPUS="$2"; shift 2 ;;
+      --slurm-job-name) SLURM_JOB_NAME="$2"; shift 2 ;;
+      --slurm-log-dir) SLURM_LOG_DIR="$2"; shift 2 ;;
       -h|--help) usage; exit 0 ;;
       *) echo "Unknown option: $1"; usage; exit 2 ;;
     esac
@@ -192,6 +226,9 @@ parse_args() {
   fi
   if [[ "${MATERIAL_ROOT_EXPLICIT}" != "1" ]]; then
     MATERIAL_ROOT="${OUTPUT_ROOT}/material_acquisition"
+  fi
+  if [[ -z "${SLURM_LOG_DIR}" ]]; then
+    SLURM_LOG_DIR="${OUTPUT_ROOT}/slurm"
   fi
   if (( MAX_LIGHTS > MIN_DECOMP_LIGHTS )); then
     REQUIRED_DECOMP_LIGHTS="${MAX_LIGHTS}"
@@ -525,6 +562,100 @@ process_materials() {
     --chunk-size "${DECOMP_CHUNK_SIZE}"
 }
 
+validate_slurm_options() {
+  if ! [[ "${SLURM_CPUS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[slurm] --slurm-cpus must be a positive integer; got: ${SLURM_CPUS}" >&2
+    return 2
+  fi
+  if ! [[ "${SLURM_GPUS}" =~ ^[0-9]+$ ]]; then
+    echo "[slurm] --slurm-gpus must be a non-negative integer; got: ${SLURM_GPUS}" >&2
+    return 2
+  fi
+  if [[ -z "${SLURM_TIME}" || -z "${SLURM_MEM}" || -z "${SLURM_JOB_NAME}" ]]; then
+    echo "[slurm] time, memory, and job name must be non-empty." >&2
+    return 2
+  fi
+}
+
+submit_process_slurm() {
+  if [[ -n "${SLURM_JOB_ID:-}" || "${ICTPOLARREAL_SLURM_WORKER:-0}" == "1" ]]; then
+    echo "[slurm] Already inside Slurm job ${SLURM_JOB_ID:-unknown}; processing in this allocation."
+    process_materials
+    return
+  fi
+  validate_slurm_options
+  if [[ "${SLURM_GPUS}" != "0" && "${BACKEND}" == "cpu" ]]; then
+    echo "[slurm] Warning: requesting ${SLURM_GPUS} GPU(s) with the CPU processing backend." >&2
+  fi
+  if [[ "${SLURM_DRY_RUN}" != "1" ]] && ! command -v sbatch >/dev/null 2>&1; then
+    echo "[slurm] sbatch is not available. Run on a Slurm submit host or omit --slurm." >&2
+    return 127
+  fi
+
+  mkdir -p "${SLURM_LOG_DIR}"
+  local worker_pythonpath="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+  local sbatch_args=(
+    --parsable
+    "--job-name=${SLURM_JOB_NAME}"
+    --nodes=1
+    --ntasks=1
+    "--cpus-per-task=${SLURM_CPUS}"
+    "--mem=${SLURM_MEM}"
+    "--time=${SLURM_TIME}"
+    "--output=${SLURM_LOG_DIR}/%x-%j.out"
+    "--error=${SLURM_LOG_DIR}/%x-%j.err"
+    "--chdir=${REPO_ROOT}"
+    "--export=ALL,ICTPOLARREAL_SLURM_WORKER=1,PYTHONPATH=${worker_pythonpath}"
+  )
+  if [[ -n "${SLURM_ACCOUNT}" ]]; then sbatch_args+=("--account=${SLURM_ACCOUNT}"); fi
+  if [[ -n "${SLURM_PARTITION}" ]]; then sbatch_args+=("--partition=${SLURM_PARTITION}"); fi
+  if [[ -n "${SLURM_QOS}" ]]; then sbatch_args+=("--qos=${SLURM_QOS}"); fi
+  if [[ "${SLURM_GPUS}" != "0" ]]; then sbatch_args+=("--gpus-per-node=${SLURM_GPUS}"); fi
+
+  local worker_args=(
+    process
+    --data-root "${DATA_ROOT}"
+    --output-root "${OUTPUT_ROOT}"
+    --material-root "${MATERIAL_ROOT}"
+    --env-name "${ENV_NAME}"
+    --max-lights "${MAX_LIGHTS}"
+    --min-lights "${MIN_DECOMP_LIGHTS}"
+    --light-start "${LIGHT_START}"
+    --frame-layout "${FRAME_LAYOUT}"
+    --backend "${BACKEND}"
+    --device "${DEVICE}"
+    --decomp-noise "${DECOMP_NOISE}"
+    --normal-steps "${NORMAL_STEPS}"
+    --sigma-steps "${SIGMA_STEPS}"
+    --decomp-chunk-size "${DECOMP_CHUNK_SIZE}"
+  )
+  if [[ -n "${LIGHT_ROOT}" ]]; then worker_args+=(--light-root "${LIGHT_ROOT}"); fi
+
+  if [[ "${SLURM_DRY_RUN}" == "1" ]]; then
+    printf '[slurm] dry run:'
+    printf ' %q' sbatch "${sbatch_args[@]}" "${REPO_ROOT}/run.sh" "${worker_args[@]}"
+    printf '\n'
+    return
+  fi
+
+  local result job_id
+  if ! result="$(sbatch "${sbatch_args[@]}" "${REPO_ROOT}/run.sh" "${worker_args[@]}")"; then
+    echo "[slurm] Submission failed." >&2
+    return 1
+  fi
+  job_id="${result%%;*}"
+  if ! [[ "${job_id}" =~ ^[0-9]+$ ]]; then
+    echo "[slurm] Could not parse job id from sbatch output: ${result}" >&2
+    return 1
+  fi
+  echo "[slurm] Submitted job: ${job_id}"
+  echo "[slurm] Material root: ${MATERIAL_ROOT}"
+  echo "[slurm] Stdout: ${SLURM_LOG_DIR}/${SLURM_JOB_NAME}-${job_id}.out"
+  echo "[slurm] Stderr: ${SLURM_LOG_DIR}/${SLURM_JOB_NAME}-${job_id}.err"
+  echo "[slurm] Status: squeue -j ${job_id}"
+  echo "[slurm] Accounting: sacct -j ${job_id} --format=JobID,State,ExitCode,Elapsed"
+}
+
 train_inverse() {
   cd "${REPO_ROOT}"
   activate_env || true
@@ -639,12 +770,16 @@ main() {
   local command="$1"
   shift
   parse_args "$@"
+  if [[ "${SLURM_SUBMIT}" == "1" && "${command}" != "process" ]]; then
+    echo "[slurm] --slurm is currently supported only by the process command." >&2
+    exit 2
+  fi
 
   case "${command}" in
     setup) setup_env ;;
     check-env) check_env ;;
     check-data) check_data ;;
-    process) check_data; process_materials ;;
+    process) check_data; if [[ "${SLURM_SUBMIT}" == "1" ]]; then submit_process_slurm; else process_materials; fi ;;
     train) train_models ;;
     evaluate) evaluate_predictions ;;
     all)
