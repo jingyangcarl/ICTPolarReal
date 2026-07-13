@@ -7,8 +7,11 @@ from pathlib import Path
 def forward_cache_signature(sample: dict[str, object]) -> dict[str, object]:
     return {
         "lighting_convention": sample["lighting_convention"],
+        "gbuffer_convention": sample["gbuffer_convention"],
+        "sampling_convention": sample["sampling_convention"],
         "environment_flip": bool(sample["environment_flip"]),
         "environment_rotation_degrees": float(sample["environment_rotation_degrees"]),
+        "environment_strength": float(sample["environment_strength"]),
     }
 
 

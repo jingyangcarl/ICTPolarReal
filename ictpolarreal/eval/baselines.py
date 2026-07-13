@@ -99,8 +99,11 @@ def prepare_manifest(
                     "lighting_name": record.lighting_name,
                     "environment": str(dataset.export_environment(index, out_root).resolve()),
                     "lighting_convention": LIGHTING_CONVENTION,
+                    "gbuffer_convention": "diffusion-renderer-display-normal-v1",
+                    "sampling_convention": "fixed-seed-v1",
                     "environment_flip": False,
                     "environment_rotation_degrees": 180.0,
+                    "environment_strength": 10.0 if record.lighting_type == "olat" else 1.0,
                 }
             )
 

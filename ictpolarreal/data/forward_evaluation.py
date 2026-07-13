@@ -18,7 +18,7 @@ from ictpolarreal.utils.io import write_image
 
 LIGHT_PROBE_MAPPING = "Light_Probe_Mapping_Main_WO_Daughter.txt"
 LIGHT_ORDER = "LSX3_light_z_spiral.txt"
-LIGHTING_CONVENTION = "lsx-main-zspiral-y180-v1"
+LIGHTING_CONVENTION = "diffusion-renderer-lightstage-v2"
 
 
 @dataclass(frozen=True)
@@ -280,7 +280,7 @@ def _sample_lightstage_environment(
 def _mapping_label(order: np.ndarray, light_index: int) -> int:
     if light_index < 0 or light_index >= len(order):
         raise IndexError(f"Light index {light_index} is outside the LSX z-spiral table")
-    return int(order[light_index]) - 1
+    return int(order[light_index])
 
 
 def _load_lightstage_mapping(

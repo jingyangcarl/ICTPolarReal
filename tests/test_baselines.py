@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
+from ictpolarreal.eval.baseline_worker import _diffusion_renderer_forward_batch
 from ictpolarreal.eval.baselines import (
     BASELINE_TASKS,
     _method_complete,
@@ -52,8 +53,11 @@ def test_forward_cache_contract(tmp_path):
             "lighting_name": "olat_000000",
             "environment": "olat.exr",
             "lighting_convention": "test-v1",
+            "gbuffer_convention": "display-normal-v1",
+            "sampling_convention": "fixed-seed-v1",
             "environment_flip": False,
             "environment_rotation_degrees": 180.0,
+            "environment_strength": 10.0,
         },
         {
             "object": "object",
@@ -62,8 +66,11 @@ def test_forward_cache_contract(tmp_path):
             "lighting_name": "hdri_studio",
             "environment": "studio.exr",
             "lighting_convention": "test-v1",
+            "gbuffer_convention": "display-normal-v1",
+            "sampling_convention": "fixed-seed-v1",
             "environment_flip": False,
             "environment_rotation_degrees": 180.0,
+            "environment_strength": 1.0,
         },
     ]
     root = tmp_path / "baselines"
@@ -107,3 +114,30 @@ def test_worker_environment_uses_selected_python_prefix(tmp_path, monkeypatch):
     assert environment["PATH"].split(os.pathsep)[0] == str(python.parent)
     assert str(Path(__file__).resolve().parents[1]) in environment["PYTHONPATH"]
     assert str(repo) in environment["PYTHONPATH"]
+
+
+def test_diffusion_renderer_forward_batch_uses_display_space_normal(tmp_path):
+    sample = {"object": "object", "camera": "cam00", "input": str(tmp_path / "static.png")}
+    image = np.zeros((8, 8, 3), dtype=np.float32)
+    write_image(sample["input"], image)
+    for task in ("basecolor", "normal", "metallic", "roughness", "depth"):
+        write_image(
+            tmp_path / "object" / "cam00" / "_gbuffer" / f"{task}.png",
+            image,
+        )
+
+    batch = _diffusion_renderer_forward_batch(
+        sample,
+        out_root=tmp_path,
+        height=8,
+        width=8,
+    )
+
+    np.testing.assert_array_equal(
+        batch["basecolor"][0, :, 0, 0, 0].numpy(),
+        [-1.0, -1.0, -1.0],
+    )
+    np.testing.assert_array_equal(
+        batch["normal"][0, :, 0, 0, 0].numpy(),
+        [1.0, -1.0, -1.0],
+    )

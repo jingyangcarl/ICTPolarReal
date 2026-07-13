@@ -77,26 +77,15 @@ def test_forward_evaluation_covers_fixed_olat_and_hdri(tmp_path):
     assert environment.max() == 1.0
     assert environment.min() == 0.0
 
-    height, width = environment.shape[:2]
-    latitude = (np.arange(height, dtype=np.float32) + 0.5) / height * np.pi
-    longitude = ((np.arange(width, dtype=np.float32) + 0.5) / width * 2.0 - 1.0) * np.pi
-    theta, phi = np.meshgrid(latitude, longitude, indexing="ij")
-    vectors = np.stack(
-        (
-            np.sin(theta) * np.sin(phi),
-            np.cos(theta),
-            -np.sin(theta) * np.cos(phi),
-        ),
-        axis=-1,
+    expected_label = dataset.light_order[0]
+    np.testing.assert_array_equal(
+        environment[..., 0] > 0.5,
+        dataset.light_mapping == expected_label,
     )
-    renderer_environment = np.roll(environment[..., 0], width // 2, axis=1)
-    centroid = vectors[renderer_environment > 0.5].mean(axis=0)
-    centroid /= np.linalg.norm(centroid)
-    assert centroid @ dataset.base.light_directions[0] > 0.999
 
 
-def test_lightstage_environment_sampling_uses_zero_based_mapping_labels():
-    mapping = np.asarray([[0, 0, 1], [2, 2, 2]], dtype=np.int32)
+def test_lightstage_environment_sampling_uses_z_spiral_mapping_labels():
+    mapping = np.asarray([[1, 1, 2], [3, 3, 3]], dtype=np.int32)
     order = np.asarray([1, 3], dtype=np.int32)
     environment = np.asarray(
         [

@@ -166,6 +166,9 @@ def _diffusion_renderer_forward_batch(
     batch = _diffusion_renderer_batch(sample["input"], height=height, width=width)
     for task in ("basecolor", "normal", "metallic", "roughness", "depth"):
         image = read_image(_gbuffer_path(out_root, sample, task), channels=3)
+        if task == "normal":
+            # Match the released evaluator's saved normal before forward inference.
+            image[..., 0] = 1.0 - image[..., 0]
         tensor = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0)
         tensor = functional.interpolate(
             tensor,
@@ -301,7 +304,7 @@ def _run_diffusion_renderer(args: argparse.Namespace, manifest: dict) -> None:
         seed=args.seed,
     )
     device = torch.device("cuda")
-    for index, forward_sample in enumerate(pending_forward):
+    for forward_sample in pending_forward:
         camera_key = (forward_sample["object"], forward_sample["camera"])
         if camera_key not in input_by_camera:
             raise KeyError(f"No staged static input for forward sample {camera_key}")
@@ -320,6 +323,7 @@ def _run_diffusion_renderer(args: argparse.Namespace, manifest: dict) -> None:
             rotate_envlight=False,
             env_flip=bool(forward_sample["environment_flip"]),
             env_rot=float(forward_sample["environment_rotation_degrees"]),
+            env_strength=float(forward_sample["environment_strength"]),
             env_format=["proj"],
             device=device,
         )
@@ -332,10 +336,7 @@ def _run_diffusion_renderer(args: argparse.Namespace, manifest: dict) -> None:
             .permute(0, 4, 1, 2, 3)
             .expand_as(batch["env_ldr"])
         )
-        output = forward_pipeline.generate_video(
-            data_batch=batch,
-            seed=args.seed + index,
-        )
+        output = forward_pipeline.generate_video(data_batch=batch, seed=args.seed)
         original_hw = tuple(int(value) for value in batch["in_res"][0])
         prediction = _diffusion_renderer_prediction(output, output_hw=original_hw)
         output_path = _forward_output_path(args.out_root, forward_sample)
