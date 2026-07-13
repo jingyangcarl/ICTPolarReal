@@ -30,6 +30,8 @@ train = [
   "peft>=0.7",
   "safetensors>=0.4",
   "torch>=2.0",
+  "torchvision>=0.15",
+  "scipy>=1.10",
   "transformers>=4.40,<5",
 ]
 

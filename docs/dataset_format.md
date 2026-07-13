@@ -31,6 +31,14 @@ outputs/material_acquisition/object_name/camXX/brdf/roughness.png
 outputs/material_acquisition/object_name/camXX/brdf/specular.png
 ```
 
+This is the default Ward acquisition root. With
+`--material-acquisition end2end`, the same object/camera layout and common map
+names are written under `outputs/material_acquisition_end2end/`, alongside the
+additional `baseColor`, `metallic`, `specularTint`, `subsurface`,
+`anisotropic`, `clearcoat`, and `clearcoatGloss` maps. The folder
+also records `disney_brdf.pt` and `acquisition.json`. An explicit
+`--material-root` overrides either mode-specific root.
+
 The RGB2X training loader pairs the processed albedo, normal, and specular maps
 with static and calibrated OLAT observations. Inverse training predicts PBR or
 cross/parallel targets from RGB. Forward training conditions on either the PBR

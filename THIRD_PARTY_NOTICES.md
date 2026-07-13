@@ -15,3 +15,8 @@ own licenses.
 
 When porting additional code from ObjectReal submodules, preserve upstream
 license headers and add the upstream project, source URL, and license here.
+
+The optional `--material-acquisition end2end` mode interoperates at runtime
+with an external NVIDIA Imaginaire checkout. No Imaginaire source is copied or
+redistributed in this repository. Users must obtain that checkout separately
+and comply with its NVIDIA Source Code License and runtime dependency licenses.

@@ -9,11 +9,19 @@ ENV_NAME="${ENV_NAME:-ictpolarreal}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.10}"
 DATA_ROOT="${DATA_ROOT:-${REPO_ROOT}/data/sample}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_ROOT}/outputs}"
+MATERIAL_ACQUISITION="${MATERIAL_ACQUISITION:-default}"
 MATERIAL_ROOT_EXPLICIT=0
 if [[ -n "${MATERIAL_ROOT:-}" ]]; then
   MATERIAL_ROOT_EXPLICIT=1
 fi
-MATERIAL_ROOT="${MATERIAL_ROOT:-${OUTPUT_ROOT}/material_acquisition}"
+if [[ "${MATERIAL_ACQUISITION}" == "end2end" ]]; then
+  MATERIAL_ROOT="${MATERIAL_ROOT:-${OUTPUT_ROOT}/material_acquisition_end2end}"
+else
+  MATERIAL_ROOT="${MATERIAL_ROOT:-${OUTPUT_ROOT}/material_acquisition}"
+fi
+IMAGINAIRE_ROOT="${IMAGINAIRE_ROOT:-${REPO_ROOT}/../imaginaire}"
+END2END_STEPS="${END2END_STEPS:-33000}"
+END2END_LEARNING_RATE="${END2END_LEARNING_RATE:-1e-3}"
 TRAIN_STAGE="${TRAIN_STAGE:-both}"
 INVERSE_WORKFLOW="${INVERSE_WORKFLOW:-both}"
 FORWARD_MODE="${FORWARD_MODE:-both}"
@@ -90,7 +98,13 @@ Commands:
 Options:
   --data-root PATH          Dataset root. Default: ${DATA_ROOT}
   --output-root PATH        Output root. Default: ${OUTPUT_ROOT}
-  --material-root PATH      Processed material map root. Default: ${MATERIAL_ROOT}
+  --material-root PATH      Override the mode-specific processed material map root.
+  --material-acquisition MODE
+                            default (Ward) or end2end (Disney BRDF). Default: ${MATERIAL_ACQUISITION}
+  --imaginaire-root PATH    External Imaginaire checkout. Default: ${IMAGINAIRE_ROOT}
+  --end2end-steps N         Disney BRDF optimization steps. Default: ${END2END_STEPS}
+  --end2end-learning-rate FLOAT
+                            Disney BRDF learning rate. Default: ${END2END_LEARNING_RATE}
   --env-name NAME           Conda/micromamba env name. Default: ${ENV_NAME}
   --train-stage STAGE       inverse, forward, or both. Default: ${TRAIN_STAGE}
   --inverse-workflow MODE   pbr, polarization, or both. Default: ${INVERSE_WORKFLOW}
@@ -150,6 +164,7 @@ Examples:
   bash run.sh all
   bash run.sh check-data
   bash run.sh process --backend torch --device cuda
+  bash run.sh process --material-acquisition end2end --slurm --backend torch --device cuda
   bash run.sh process --slurm --backend torch --device cuda --slurm-account ACCOUNT --slurm-partition PARTITION
   bash run.sh train --train-stage inverse --inverse-workflow both
   bash run.sh train --train-stage forward --forward-mode gbuffer
@@ -162,6 +177,10 @@ parse_args() {
       --data-root) DATA_ROOT="$2"; shift 2 ;;
       --output-root) OUTPUT_ROOT="$2"; shift 2 ;;
       --material-root) MATERIAL_ROOT="$2"; MATERIAL_ROOT_EXPLICIT=1; shift 2 ;;
+      --material-acquisition) MATERIAL_ACQUISITION="$2"; shift 2 ;;
+      --imaginaire-root) IMAGINAIRE_ROOT="$2"; shift 2 ;;
+      --end2end-steps) END2END_STEPS="$2"; shift 2 ;;
+      --end2end-learning-rate) END2END_LEARNING_RATE="$2"; shift 2 ;;
       --env-name) ENV_NAME="$2"; shift 2 ;;
       --train-stage) TRAIN_STAGE="$2"; shift 2 ;;
       --inverse-workflow) INVERSE_WORKFLOW="$2"; shift 2 ;;
@@ -221,11 +240,29 @@ parse_args() {
       *) echo "Unknown option: $1"; usage; exit 2 ;;
     esac
   done
+  case "${MATERIAL_ACQUISITION}" in
+    default|end2end) ;;
+    *) echo "Unknown --material-acquisition: ${MATERIAL_ACQUISITION}; expected default or end2end." >&2; exit 2 ;;
+  esac
+  if [[ "${MATERIAL_ACQUISITION}" == "end2end" ]]; then
+    if [[ ! -d "${IMAGINAIRE_ROOT}" ]]; then
+      echo "Missing --imaginaire-root directory: ${IMAGINAIRE_ROOT}" >&2
+      exit 2
+    fi
+    IMAGINAIRE_ROOT="$(cd "${IMAGINAIRE_ROOT}" && pwd -P)"
+  fi
   if [[ "${PRED_ROOT_EXPLICIT}" != "1" ]]; then
     PRED_ROOT="${OUTPUT_ROOT}/train/inverse/predictions"
   fi
   if [[ "${MATERIAL_ROOT_EXPLICIT}" != "1" ]]; then
-    MATERIAL_ROOT="${OUTPUT_ROOT}/material_acquisition"
+    if [[ "${MATERIAL_ACQUISITION}" == "end2end" ]]; then
+      MATERIAL_ROOT="${OUTPUT_ROOT}/material_acquisition_end2end"
+    else
+      MATERIAL_ROOT="${OUTPUT_ROOT}/material_acquisition"
+    fi
+  fi
+  if [[ "${MATERIAL_ROOT}" != /* ]]; then
+    MATERIAL_ROOT="${PWD}/${MATERIAL_ROOT}"
   fi
   if [[ -z "${SLURM_LOG_DIR}" ]]; then
     SLURM_LOG_DIR="${OUTPUT_ROOT}/slurm"
@@ -550,6 +587,10 @@ process_materials() {
   python -m ictpolarreal.processing.prepare_materials \
     --data-root "${DATA_ROOT}" \
     --out-root "${MATERIAL_ROOT}" \
+    --material-acquisition "${MATERIAL_ACQUISITION}" \
+    --imaginaire-root "${IMAGINAIRE_ROOT}" \
+    --end2end-steps "${END2END_STEPS}" \
+    --end2end-learning-rate "${END2END_LEARNING_RATE}" \
     --max-lights "${MAX_LIGHTS}" \
     --light-start "${LIGHT_START}" \
     --frame-layout "${FRAME_LAYOUT}" \
@@ -569,6 +610,10 @@ validate_slurm_options() {
   fi
   if ! [[ "${SLURM_GPUS}" =~ ^[0-9]+$ ]]; then
     echo "[slurm] --slurm-gpus must be a non-negative integer; got: ${SLURM_GPUS}" >&2
+    return 2
+  fi
+  if [[ "${MATERIAL_ACQUISITION}" == "end2end" && "${SLURM_GPUS}" != "1" ]]; then
+    echo "[slurm] --material-acquisition end2end requires exactly one GPU; use --slurm-gpus 1." >&2
     return 2
   fi
   if [[ -z "${SLURM_TIME}" || -z "${SLURM_MEM}" || -z "${SLURM_JOB_NAME}" ]]; then
@@ -617,6 +662,10 @@ submit_process_slurm() {
     --data-root "${DATA_ROOT}"
     --output-root "${OUTPUT_ROOT}"
     --material-root "${MATERIAL_ROOT}"
+    --material-acquisition "${MATERIAL_ACQUISITION}"
+    --imaginaire-root "${IMAGINAIRE_ROOT}"
+    --end2end-steps "${END2END_STEPS}"
+    --end2end-learning-rate "${END2END_LEARNING_RATE}"
     --env-name "${ENV_NAME}"
     --max-lights "${MAX_LIGHTS}"
     --min-lights "${MIN_DECOMP_LIGHTS}"

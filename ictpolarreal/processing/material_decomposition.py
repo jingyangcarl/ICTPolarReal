@@ -111,7 +111,22 @@ def decompose_camera_sample(
     normal_steps: int = 30,
     sigma_steps: int = 50,
     chunk_size: int = 4096,
+    material_acquisition: str = "default",
+    imaginaire_root: str | Path | None = None,
+    end2end_steps: int = 33000,
+    end2end_learning_rate: float = 1e-3,
 ) -> int:
+    if material_acquisition not in {"default", "end2end"}:
+        raise ValueError("material_acquisition must be default or end2end")
+    if material_acquisition == "end2end":
+        if backend == "cpu":
+            raise ValueError("end2end material acquisition requires --backend torch or auto")
+        if imaginaire_root is None:
+            raise ValueError("end2end material acquisition requires an Imaginaire checkout")
+        from ictpolarreal.processing.end2end_acquisition import validate_end2end_runtime
+
+        validate_end2end_runtime(imaginaire_root, device)
+
     layout, available_pairs = paired_light_frames(sample.camera_dir, frame_layout)
     pairs = select_light_pairs(available_pairs, light_start=light_start, max_lights=max_lights)
     if len(pairs) < MIN_FIT_LIGHTS:
@@ -156,7 +171,26 @@ def decompose_camera_sample(
         sigma_steps=sigma_steps,
         chunk_size=chunk_size,
     )
-    _write_material_maps(out_root, sample, maps)
+    if material_acquisition == "default":
+        _write_material_maps(out_root, sample, maps)
+    else:
+        from ictpolarreal.processing.end2end_acquisition import acquire_disney_material
+
+        material_dir = Path(out_root) / sample.object_name / sample.camera / "brdf"
+        acquire_disney_material(
+            cross_stack,
+            parallel_stack,
+            light_dirs,
+            base_color=maps.diffuse_albedo,
+            normal=maps.diffuse_normal,
+            mask=mask,
+            view_dirs=view_dirs,
+            out_dir=material_dir,
+            imaginaire_root=imaginaire_root,
+            device=device,
+            steps=end2end_steps,
+            learning_rate=end2end_learning_rate,
+        )
     return len(cross_images)
 
 

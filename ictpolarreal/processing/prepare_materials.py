@@ -25,10 +25,24 @@ def main() -> None:
     parser.add_argument("--normal-steps", type=int, default=30)
     parser.add_argument("--sigma-steps", type=int, default=50)
     parser.add_argument("--chunk-size", type=int, default=4096)
+    parser.add_argument(
+        "--material-acquisition",
+        choices=["default", "end2end"],
+        default="default",
+        help="default polarized Ward fit or Imaginaire Disney end-to-end fit.",
+    )
+    parser.add_argument(
+        "--imaginaire-root",
+        default=str(Path(__file__).resolve().parents[3] / "imaginaire"),
+        help="External Imaginaire checkout used only by end2end acquisition.",
+    )
+    parser.add_argument("--end2end-steps", type=int, default=33000)
+    parser.add_argument("--end2end-learning-rate", type=float, default=1e-3)
     args = parser.parse_args()
 
     out_root = Path(args.out_root)
     samples = list(iter_camera_samples(args.data_root))
+    print(f"[process] material acquisition: {args.material_acquisition}")
     processed = 0
     light_count = 0
     for sample in tqdm(samples, desc="decompose cameras"):
@@ -46,6 +60,10 @@ def main() -> None:
             normal_steps=args.normal_steps,
             sigma_steps=args.sigma_steps,
             chunk_size=args.chunk_size,
+            material_acquisition=args.material_acquisition,
+            imaginaire_root=args.imaginaire_root,
+            end2end_steps=args.end2end_steps,
+            end2end_learning_rate=args.end2end_learning_rate,
         )
         if used:
             processed += 1

@@ -44,7 +44,7 @@ same command.
 | 1 | Set up the environment | Creates or reuses the `ictpolarreal` environment and installs the package. |
 | 2 | Check Python packages | Verifies imports and reports PyTorch/CUDA availability. |
 | 3 | Prepare sample data | Validates `data/sample`; if needed, downloads one complete 346-light camera view. |
-| 4 | Decompose polarization data | Fits diffuse normals/albedo and specular BRDF parameters, then writes material PNG maps. |
+| 4 | Acquire material maps | Uses the default polarized Ward decomposition, or the optional end-to-end Disney BRDF fit, then writes material PNG maps. |
 | 5 | Fine-tune RGB2X | Trains inverse and forward models, periodically comparing pretrained and fine-tuned predictions. |
 | 6 | Evaluate predictions | Writes CSV metrics and a JSON summary under `outputs/`. |
 
@@ -75,6 +75,8 @@ directions. `run.sh process` also accepts normalized 346-frame sequences.
 Default outputs are written to `outputs/`:
 
 - `outputs/material_acquisition/`: decomposed material PNG maps under `<object>/<camera>/brdf/`.
+- `outputs/material_acquisition_end2end/`: Disney BRDF maps when
+  `--material-acquisition end2end` is selected.
 - `outputs/train/inverse/`: prompt-conditioned RGB-to-PBR/polarization LoRA and predictions.
 - `outputs/train/forward/gbuffer/`: PBR G-buffer-to-RGB LoRA and relighting predictions.
 - `outputs/train/forward/polarization/`: cross/parallel-to-RGB LoRA and relighting predictions.
@@ -90,6 +92,7 @@ running on a different machine or dataset:
 bash run.sh check-data
 bash run.sh process --data-root /path/to/data --output-root /path/to/out
 bash run.sh process --slurm --backend torch --device cuda --slurm-account ACCOUNT --slurm-partition PARTITION
+bash run.sh process --material-acquisition end2end --slurm --backend torch --device cuda
 bash run.sh train --data-root /path/to/data --train-stage inverse
 bash run.sh train --data-root /path/to/data --train-stage forward --forward-mode gbuffer
 bash run.sh evaluate --data-root /path/to/data --pred-root /path/to/predictions
@@ -99,6 +102,13 @@ Useful options:
 
 - `--data-root PATH`: dataset location. Default: `data/sample`.
 - `--output-root PATH`: output location. Default: `outputs`.
+- `--material-acquisition default|end2end`: keep the current polarized Ward
+  decomposition (`default`) or use Imaginaire's direct-OLAT differentiable
+  Disney BRDF fit (`end2end`).
+- `--imaginaire-root PATH`: path to the external Imaginaire checkout used by
+  `end2end`. The default is the sibling folder `../imaginaire`.
+- `--end2end-steps N` and `--end2end-learning-rate FLOAT`: control the Disney
+  optimization. Defaults are 33,000 steps and a learning rate of `1e-3`.
 - `--torch-variant cpu --device cpu`: use CPU for diagnostics; diffusion training is slow without CUDA.
 - `--max-lights N`: use a sphere-wide subset for a quick diagnostic; the default
   346-light fit is recommended for material quality.
@@ -116,8 +126,19 @@ Useful options:
 - `--resume latest`: continue from the newest checkpoint in each selected stage.
 - `--train-eval-steps N`: periodically compare frozen pretrained and current fine-tuned weights.
 - `--train-eval-samples N`: set the fixed evaluation subset size; `0` disables in-training evaluation.
-- `--material-root PATH`: use precomputed material maps from another run.
+- `--material-root PATH`: override the mode-specific material output root or use
+  precomputed material maps from another run.
 - `--skip-setup`: reuse the current environment.
+
+The end-to-end mode does not vendor Imaginaire. Its source code, license, and
+runtime dependencies remain external to this repository. Obtain an authorized
+Imaginaire checkout, comply with its license, and install its required Python
+dependencies (including PyTorch, torchvision, SciPy, NumPy, and Pillow) in the
+same environment used by the Slurm worker. The modes are separated
+automatically for comparison: `default` writes to
+`outputs/material_acquisition`, while `end2end` writes to
+`outputs/material_acquisition_end2end`. An explicit `--material-root` overrides
+these defaults when a different comparison layout is needed.
 
 Objaverse-style evaluation uses `configs/eval_objaverse_samples.json`; see
 `samples/objaverse/README.md` for the expected sample layout.
