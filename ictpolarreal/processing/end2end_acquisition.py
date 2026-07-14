@@ -1594,13 +1594,17 @@ def _report_font(size: int, *, bold: bool = False):
 
     names = (
         (
-            "DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "LiberationSans-Bold.ttf",
+            "DejaVuSans-Bold.ttf",
         )
         if bold
         else (
-            "DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "LiberationSans-Regular.ttf",
+            "DejaVuSans.ttf",
         )
     )
     for name in names:
@@ -1608,7 +1612,16 @@ def _report_font(size: int, *, bold: bool = False):
             return ImageFont.truetype(name, size=size)
         except OSError:
             pass
-    return ImageFont.load_default()
+    # Pillow's scalable embedded font is the final portable fallback.  Passing
+    # the requested size is essential: load_default() without it is a fixed
+    # 10 px bitmap font, which made every report label unreadably small.
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError as exc:  # Pillow < 10.1 has no scalable default font.
+        raise RuntimeError(
+            "a scalable TrueType report font is required; install Liberation Sans "
+            "or DejaVu Sans"
+        ) from exc
 
 
 def _fit_pil_path(path: Path, width: int, height: int):
@@ -1748,38 +1761,57 @@ def _write_suite_comparison(case_paths: Sequence[Path], output: Path, title: str
     canvas.save(output)
 
 
+def _report_camera_label(camera_dir: Path) -> str:
+    name = camera_dir.name
+    if name.startswith("cam") and name[3:].isdigit():
+        return f"Camera {int(name[3:]):02d}"
+    return name
+
+
 def _write_material_overview(
     camera_dir: Path, profiles: Sequence[str], output: Path
 ) -> None:
     from PIL import Image, ImageDraw
 
-    map_names = ("baseColor", "normal", "roughness", "specular")
+    map_names = (
+        ("baseColor", "Base color"),
+        ("normal", "Normal"),
+        ("roughness", "Roughness"),
+        ("specular", "Specular"),
+    )
     panel_width, panel_height = 270, 440
     label_width, margin, gap = 190, 44, 18
-    header = 108
+    header = 170
     width = 2 * margin + label_width + len(map_names) * panel_width + 3 * gap
     height = header + len(profiles) * panel_height + (len(profiles) - 1) * gap + margin
     canvas = Image.new("RGB", (width, height), (10, 10, 12))
     draw = ImageDraw.Draw(canvas)
     draw.text(
-        (margin, 17),
-        "Disney BRDF material maps",
-        font=_report_font(34, bold=True),
+        (margin, 16),
+        f"{_report_camera_label(camera_dir)} · Disney BRDF material maps",
+        font=_report_font(54, bold=True),
         fill="white",
     )
     draw.text(
-        (margin, 60),
-        "Rows: acquisition lighting profile  ·  Columns: fitted material parameter",
-        font=_report_font(20),
-        fill=(176, 181, 190),
+        (margin, 82),
+        "Compare material fits trained with different lighting profiles",
+        font=_report_font(32),
+        fill=(205, 209, 216),
     )
-    for index, name in enumerate(map_names):
+    _centered_text(
+        draw,
+        (margin, 122, margin + label_width - gap, header),
+        "TRAINED ON",
+        _report_font(32, bold=True),
+        (205, 209, 216),
+    )
+    for index, (_, label) in enumerate(map_names):
         x = margin + label_width + index * (panel_width + gap)
         _centered_text(
             draw,
-            (x, 62, x + panel_width, header),
-            name,
-            _report_font(22, bold=True),
+            (x, 118, x + panel_width, header),
+            label,
+            _report_font(34, bold=True),
             (235, 238, 242),
         )
     for row, profile in enumerate(profiles):
@@ -1787,12 +1819,12 @@ def _write_material_overview(
         _centered_text(
             draw,
             (margin, y, margin + label_width - gap, y + panel_height),
-            f"{profile.upper()}-trained",
-            _report_font(24, bold=True),
+            profile.upper(),
+            _report_font(38, bold=True),
             (255, 216, 90),
         )
         maps_dir = camera_dir / "material" / profile / "maps"
-        for column, name in enumerate(map_names):
+        for column, (name, _) in enumerate(map_names):
             x = margin + label_width + column * (panel_width + gap)
             canvas.paste(
                 _fit_pil_path(
@@ -1814,38 +1846,38 @@ def _write_evaluation_overview(
     from PIL import Image, ImageDraw
 
     width, margin = 1800, 58
-    matrix_top, matrix_header, metric_height = 125, 64, 138
+    matrix_top, matrix_header, metric_height = 165, 84, 180
     matrix_left, metric_width = 300, 690
-    hero_panel_width, hero_panel_height, hero_label = 290, 410, 44
+    hero_panel_width, hero_panel_height, hero_label = 290, 410, 58
     olat_top = matrix_top + matrix_header + len(profiles) * metric_height + 80
-    hdri_top = olat_top + 70 + hero_label + hero_panel_height + 70
-    height = hdri_top + 70 + hero_label + hero_panel_height + 70
+    hdri_top = olat_top + 76 + hero_label + hero_panel_height + 86
+    height = hdri_top + 76 + hero_label + hero_panel_height + 80
     canvas = Image.new("RGB", (width, height), (9, 9, 11))
     draw = ImageDraw.Draw(canvas)
-    title_font = _report_font(40, bold=True)
-    section_font = _report_font(28, bold=True)
-    label_font = _report_font(22, bold=True)
-    metric_font = _report_font(28, bold=True)
-    note_font = _report_font(19)
+    title_font = _report_font(64, bold=True)
+    section_font = _report_font(44, bold=True)
+    label_font = _report_font(36, bold=True)
+    metric_font = _report_font(46, bold=True)
+    note_font = _report_font(32)
     draw.text(
-        (margin, 25),
-        "Material acquisition · relighting evaluation",
+        (margin, 18),
+        f"{_report_camera_label(stage.parent)} · Relighting evaluation",
         font=title_font,
         fill="white",
     )
     draw.text(
-        (margin, 78),
-        "Rows are training-light profiles; columns are test-light suites. Higher PSNR / SSIM is better.",
+        (margin, 96),
+        "Rows: model training light · Columns: test light · Higher is better",
         font=note_font,
-        fill=(176, 181, 190),
+        fill=(205, 209, 216),
     )
     draw.text(
-        (margin, matrix_top + 17),
-        "TRAINED ON",
+        (margin, matrix_top + 20),
+        "MODEL",
         font=label_font,
-        fill=(160, 166, 176),
+        fill=(205, 209, 216),
     )
-    for column, lighting in enumerate(("OLAT test", "HDRI test")):
+    for column, lighting in enumerate(("TESTED ON OLAT", "TESTED ON HDRI")):
         x = matrix_left + column * metric_width
         _centered_text(
             draw,
@@ -1870,7 +1902,7 @@ def _write_evaluation_overview(
         _centered_text(
             draw,
             (margin, y, matrix_left - 16, y + metric_height),
-            f"{profile.upper()}-trained",
+            f"{profile.upper()} model",
             label_font,
             (255, 216, 90),
         )
@@ -1890,28 +1922,34 @@ def _write_evaluation_overview(
                 width=3 if is_best else 1,
             )
             draw.text(
-                (x + 28, y + 22),
-                f"{float(metrics['psnr']):.2f} dB   ·   {float(metrics['ssim_global']):.3f} SSIM",
+                (x + 30, y + 26),
+                f"{float(metrics['psnr']):.2f} dB",
+                font=metric_font,
+                fill="white",
+            )
+            draw.text(
+                (x + 360, y + 26),
+                f"{float(metrics['ssim_global']):.3f} SSIM",
                 font=metric_font,
                 fill="white",
             )
             ratio = float(metrics.get("mean_intensity_ratio", float("nan")))
             corr = float(metrics.get("luminance_correlation", float("nan")))
             draw.text(
-                (x + 28, y + 78),
-                f"brightness pred/ref {ratio:.3f}    ·    luminance corr {corr:.3f}",
+                (x + 30, y + 105),
+                f"Brightness {ratio:.3f}  ·  Correlation {corr:.3f}",
                 font=note_font,
-                fill=(185, 190, 199),
+                fill=(205, 209, 216),
             )
     _draw_hero_row(
         canvas,
         draw,
         stage / "olat" / "cases" / olat_case_id,
         olat_top,
-        "Representative OLAT relighting",
+        "OLAT relighting example",
         [("Reference", "reference.png")]
         + [
-            (f"{profile.upper()}-trained", f"predictions/{profile}.png")
+            (f"{profile.upper()} model", f"predictions/{profile}.png")
             for profile in profiles
         ],
         hero_panel_width,
@@ -1925,10 +1963,10 @@ def _write_evaluation_overview(
         draw,
         stage / "hdri" / "cases" / hdri_case_id,
         hdri_top,
-        "Representative HDRI relighting · reference synthesized from measured OLAT",
+        "HDRI relighting example",
         [("Lighting", "lighting.png"), ("Reference", "reference.png")]
         + [
-            (f"{profile.upper()}-trained", f"predictions/{profile}.png")
+            (f"{profile.upper()} model", f"predictions/{profile}.png")
             for profile in profiles
         ],
         hero_panel_width,
@@ -1957,7 +1995,7 @@ def _draw_hero_row(
     total_width = len(panels) * panel_width + (len(panels) - 1) * gap
     start_x = (canvas.width - total_width) // 2
     draw.text((start_x, top), title, font=title_font, fill="white")
-    y = top + 58
+    y = top + 70
     for index, (label, relative_path) in enumerate(panels):
         x = start_x + index * (panel_width + gap)
         _centered_text(

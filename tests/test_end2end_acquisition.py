@@ -23,6 +23,20 @@ from ictpolarreal.processing import (
 from ictpolarreal.utils.io import read_image, write_image
 
 
+def test_report_font_preserves_requested_scale():
+    small = end2end_acquisition._report_font(16)
+    large = end2end_acquisition._report_font(48, bold=True)
+
+    small_box = small.getbbox("Readable")
+    large_box = large.getbbox("Readable")
+    small_height = small_box[3] - small_box[1]
+    large_height = large_box[3] - large_box[1]
+
+    assert large_height >= 30
+    assert large_height >= 2 * small_height
+    assert end2end_acquisition._report_camera_label(Path("cam07")) == "Camera 07"
+
+
 def test_split_light_indices_reserves_sphere_spread_holdout():
     train, heldout = end2end_acquisition.split_light_indices(346, 16)
 
