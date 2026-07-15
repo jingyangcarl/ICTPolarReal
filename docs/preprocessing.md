@@ -76,10 +76,10 @@ camera's `manifest.json` records a `primary_material_dir` such as
 `material/mix/maps`. Downstream ICTPolarReal loaders read that field, while
 preserving the legacy `brdf/` lookup for default Ward and older material roots.
 
-All requested profiles start from the same SuperDimension-compatible inputs:
-the dataset `static` image for base color, the dataset photometric `normal`, and
-a constant optical-axis view direction transformed into world space. Ward
-decomposition is only a fallback when either dataset initialization is absent.
+All requested profiles start from the same ICTPolarReal inputs: the dataset
+`albedo` image for base color, the dataset photometric `normal`, and a constant
+optical-axis view direction transformed into world space. Ward decomposition is
+only a fallback when either dataset initialization is absent.
 Base color and normal remain fixed during each Disney fit. Pixels that are
 inside the capture mask but fail `n dot v > 0` are excluded and counted in the
 acquisition provenance, which makes a coordinate-convention error visible
@@ -92,7 +92,10 @@ material state, provenance, and evaluation output.
 
 End-to-end optimization defaults to 33,000 steps and a learning rate of
 `1e-3`. Set these with `--end2end-steps` and
-`--end2end-learning-rate`.
+`--end2end-learning-rate`. Learned scalar maps use masked L1 total variation
+with weight `1e-2`; change it with `--end2end-tv-weight`, or set the weight to
+`0` for an unregularized comparison. The regularizer only connects neighboring
+pixels that both belong to the `capture mask × n dot v` fitting region.
 
 ## HDRI conditions and synthesized targets
 

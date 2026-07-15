@@ -420,7 +420,7 @@ def test_end2end_initialization_and_optimizer_exclude_same_heldout_lights(
     assert acquisition["eval_lights"] == 2
 
 
-def test_end2end_prefers_static_photometric_inputs_and_constant_view(
+def test_end2end_prefers_albedo_photometric_inputs_and_constant_view(
     monkeypatch, tmp_path
 ):
     camera_dir = tmp_path / "object" / "cam00"
@@ -429,11 +429,12 @@ def test_end2end_prefers_static_photometric_inputs_and_constant_view(
         directory.mkdir(parents=True)
         for frame_id in range(4):
             (directory / f"{frame_id:06d}.png").touch()
-    for name in ("static.png", "normal.png", "mask.png"):
+    for name in ("albedo.png", "static.png", "normal.png", "mask.png"):
         (camera_dir / name).touch()
     sample = CameraSample("object", "cam00", camera_dir)
 
-    static = np.full((2, 3, 3), 0.35, dtype=np.float32)
+    albedo = np.full((2, 3, 3), 0.35, dtype=np.float32)
+    static = np.full((2, 3, 3), 0.8, dtype=np.float32)
     photometric_normal = np.zeros((2, 3, 3), dtype=np.float32)
     photometric_normal[..., 2] = 1.0
     optical_axis = np.asarray([0.0, 0.6, 0.8], dtype=np.float32)
@@ -441,6 +442,8 @@ def test_end2end_prefers_static_photometric_inputs_and_constant_view(
 
     def fake_read(path, **_kwargs):
         stem = Path(path).stem
+        if stem == "albedo":
+            return albedo.copy()
         if stem == "static":
             return static.copy()
         if stem == "normal":
@@ -472,7 +475,7 @@ def test_end2end_prefers_static_photometric_inputs_and_constant_view(
     )
 
     def unexpected_ward(*_args, **_kwargs):
-        raise AssertionError("dataset static/normal inputs must bypass Ward initialization")
+        raise AssertionError("dataset albedo/normal inputs must bypass Ward initialization")
 
     captured = {}
 
@@ -503,10 +506,56 @@ def test_end2end_prefers_static_photometric_inputs_and_constant_view(
     )
 
     assert used == 4
-    np.testing.assert_array_equal(captured["base_color"], static)
+    np.testing.assert_array_equal(captured["base_color"], albedo)
+    assert captured["base_color_source"] == "dataset_albedo"
     np.testing.assert_array_equal(captured["normal"], photometric_normal)
     np.testing.assert_array_equal(captured["view_dirs"], constant_view)
     np.testing.assert_array_equal(captured["view_dirs"][0, 0], optical_axis)
+
+
+def test_masked_disney_scalar_tv_penalizes_an_interior_spike():
+    torch = pytest.importorskip("torch")
+    scalar = torch.zeros((3, 3), dtype=torch.float32)
+    scalar[1, 1] = 1.0
+    scalar.requires_grad_()
+    model = SimpleNamespace(
+        _param_maps=lambda: {
+            name: scalar for name in end2end_acquisition.DISNEY_TV_SCALAR_NAMES
+        }
+    )
+    mask = torch.ones((3, 3, 1), dtype=torch.float32)
+
+    total_variation = end2end_acquisition._masked_disney_scalar_total_variation(
+        torch, model, mask
+    )
+    total_variation.backward()
+
+    assert total_variation.item() > 0.0
+    assert scalar.grad[1, 1].abs().item() > 0.0
+
+
+def test_masked_disney_scalar_tv_ignores_differences_outside_fit_mask():
+    torch = pytest.importorskip("torch")
+    scalar = torch.tensor(
+        [[0.25, 0.25, 0.0, 1.0], [0.25, 0.25, 1.0, 0.0]],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    model = SimpleNamespace(
+        _param_maps=lambda: {
+            name: scalar for name in end2end_acquisition.DISNEY_TV_SCALAR_NAMES
+        }
+    )
+    mask = torch.zeros((2, 4, 1), dtype=torch.float32)
+    mask[:, :2] = 1.0
+
+    total_variation = end2end_acquisition._masked_disney_scalar_total_variation(
+        torch, model, mask
+    )
+    total_variation.backward()
+
+    assert total_variation.item() == pytest.approx(0.0)
+    assert torch.count_nonzero(scalar.grad[:, 2:]) == 0
 
 
 def test_end2end_view_is_constant_optical_axis(tmp_path):
@@ -800,6 +849,7 @@ def test_camera_report_consolidates_clean_lighting_first_contract(
         )
 
         profile_results[profile] = {
+            "schema": "ictpolarreal.end2end-disney.v8",
             "lighting_profile": profile,
             "fit_conditions": {
                 "olat": 8 if profile in {"olat", "mix"} else 0,
@@ -834,6 +884,9 @@ def test_camera_report_consolidates_clean_lighting_first_contract(
                 }
             }
         }
+        (material_dir / "acquisition.json").write_text(
+            json.dumps(profile_results[profile]), encoding="utf-8"
+        )
 
     evaluation_root = tmp_path / "evaluation"
     provenance_dir = (
@@ -952,6 +1005,12 @@ def test_camera_report_consolidates_clean_lighting_first_contract(
     ) == artifacts
 
     for profile in profiles:
+        acquisition = json.loads(
+            (tmp_path / "material" / profile / "acquisition.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert acquisition["schema"] == "ictpolarreal.end2end-disney.v8"
         assert end2end_acquisition._profile_outputs_complete(
             tmp_path / "material" / profile,
             evaluation_root / ".profiles" / profile,
@@ -1087,6 +1146,8 @@ def test_imaginaire_disney_import_treats_torchvision_as_debug_only(
                 "17",
                 "--end2end-learning-rate",
                 "0.002",
+                "--end2end-tv-weight",
+                "0.025",
                 "--end2end-eval-lights",
                 "7",
                 "--end2end-profiles",
@@ -1152,6 +1213,9 @@ def test_prepare_materials_dispatches_acquisition_mode(
     assert calls[0]["end2end_learning_rate"] == pytest.approx(
         0.002 if expected_mode == "end2end" else 1e-3
     )
+    assert calls[0]["end2end_tv_weight"] == pytest.approx(
+        0.025 if expected_mode == "end2end" else 1e-2
+    )
     if expected_mode == "end2end":
         assert calls[0]["end2end_profiles"] == "hdri,mix"
         assert calls[0]["end2end_hdri_root"] == "/tmp/hdris"
@@ -1197,6 +1261,8 @@ def test_slurm_dry_run_propagates_end2end_selector_and_options(tmp_path):
             "17",
             "--end2end-learning-rate",
             "0.002",
+            "--end2end-tv-weight",
+            "0.025",
             "--end2end-eval-lights",
             "7",
             "--end2end-profiles",
@@ -1237,6 +1303,7 @@ def test_slurm_dry_run_propagates_end2end_selector_and_options(tmp_path):
     assert f"--imaginaire-root {imaginaire_root}" in result.stdout
     assert "--end2end-steps 17" in result.stdout
     assert "--end2end-learning-rate 0.002" in result.stdout
+    assert "--end2end-tv-weight 0.025" in result.stdout
     assert "--end2end-eval-lights 7" in result.stdout
     command = shlex.split(result.stdout.partition(":")[2])
     assert command[command.index("--end2end-profiles") + 1] == "hdri,mix"

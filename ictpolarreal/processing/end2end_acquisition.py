@@ -46,6 +46,16 @@ DISNEY_SCALAR_NAMES = (
     "clearcoat",
     "clearcoatGloss",
 )
+DISNEY_TV_SCALAR_NAMES = (
+    "metallic",
+    "subsurface",
+    "specular",
+    "roughness",
+    "specularTint",
+    "anisotropic",
+    "clearcoat",
+    "clearcoatGloss",
+)
 REPORT_PROFILES = ("olat", "hdri", "mix")
 ERROR_HEATMAP_MAX = 0.25
 
@@ -231,6 +241,7 @@ def acquire_disney_material(
     light_ids: np.ndarray | None = None,
     frame_ids: np.ndarray | None = None,
     base_color: np.ndarray,
+    base_color_source: str,
     normal: np.ndarray,
     mask: np.ndarray | None,
     view_dirs: np.ndarray,
@@ -239,6 +250,7 @@ def acquire_disney_material(
     device: str = "cuda",
     steps: int = 33000,
     learning_rate: float = 1e-3,
+    tv_weight: float = 1e-2,
     eval_lights: int = 16,
     lighting_profiles: str | Sequence[str] = "olat,hdri,mix",
     hdri_root: str | Path | None = None,
@@ -259,6 +271,10 @@ def acquire_disney_material(
         raise ValueError("end2end steps must be a positive integer")
     if learning_rate <= 0:
         raise ValueError("end2end learning rate must be positive")
+    if not math.isfinite(tv_weight) or tv_weight < 0:
+        raise ValueError("end2end TV weight must be finite and non-negative")
+    if not base_color_source.strip():
+        raise ValueError("end2end base color source must be non-empty")
     if eval_lights < 0:
         raise ValueError("end2end evaluation light count must be non-negative")
     if hdri_count <= 0:
@@ -496,6 +512,7 @@ def acquire_disney_material(
             evaluation_split=evaluation_split,
             evaluation_support=evaluation_support,
             base_color=base_color,
+            base_color_source=base_color_source,
             normal=normal,
             foreground=foreground,
             material_foreground=capture_foreground,
@@ -503,6 +520,7 @@ def acquire_disney_material(
             device=torch_device,
             steps=steps,
             learning_rate=learning_rate,
+            tv_weight=tv_weight,
             hdri_rotations=hdri_rotations,
             eval_lights=eval_lights,
             input_hashes=input_hashes,
@@ -585,6 +603,7 @@ def _fit_disney_profile(
     evaluation_split: str,
     evaluation_support: np.ndarray,
     base_color: np.ndarray,
+    base_color_source: str,
     normal: np.ndarray,
     foreground: np.ndarray,
     material_foreground: np.ndarray,
@@ -592,6 +611,7 @@ def _fit_disney_profile(
     device,
     steps: int,
     learning_rate: float,
+    tv_weight: float,
     hdri_rotations: int,
     eval_lights: int,
     input_hashes: dict[str, str],
@@ -664,6 +684,13 @@ def _fit_disney_profile(
         residual = (render_hdri(condition_index, evaluation=evaluation) - target) * mask_chw
         return residual.square().sum() / foreground_values
 
+    def scalar_total_variation():
+        return _masked_disney_scalar_total_variation(
+            torch,
+            model,
+            mask_hwc,
+        )
+
     environment_hash = _array_sha256(
         np.stack(
             [
@@ -680,7 +707,7 @@ def _fit_disney_profile(
     checkpoint_path = checkpoint_dir / "latest.pt"
     checkpoint_temp_path = checkpoint_dir / "latest.tmp"
     signature = {
-        "schema": "ictpolarreal.end2end-checkpoint.v7",
+        "schema": "ictpolarreal.end2end-checkpoint.v8",
         "profile": profile,
         "model": MODEL_NAME,
         "height": height,
@@ -698,10 +725,16 @@ def _fit_disney_profile(
             condition.condition_id for condition in hdri_evaluation_conditions
         ],
         "mix_schedule": f"{hdri_rotations}_hdri_then_{hdri_rotations}_olat",
+        "base_color_source": base_color_source,
         "scalar_initialization": scalar_initialization,
         "surface_validity": surface_validity,
         "steps": int(steps),
         "learning_rate": float(learning_rate),
+        "regularization": {
+            "kind": "masked_l1_total_variation",
+            "weight": float(tv_weight),
+            "parameters": list(DISNEY_TV_SCALAR_NAMES),
+        },
         "disney_brdf_sha256": provenance["disney_brdf_sha256"],
         "adapter": adapter_provenance,
     }
@@ -788,6 +821,8 @@ def _fit_disney_profile(
     log_every = max(1, min(500, steps // 20))
     checkpoint_every = max(1000, len(train_indices) * 10)
     final_loss = float(np.mean(initial_evaluation_losses["olat"]))
+    final_tv = 0.0
+    final_objective = final_loss
     final_kind, final_index, final_label = training_condition(max(start_step - 1, 0))
     model.train()
     for step in range(start_step, steps):
@@ -799,20 +834,29 @@ def _fit_disney_profile(
         optimizer.zero_grad(set_to_none=True)
         final_kind, final_index, final_label = training_condition(step)
         if final_kind == "olat":
-            loss = olat_loss(final_index)
+            data_loss = olat_loss(final_index)
         else:
-            loss = hdri_loss(final_index, evaluation=False)
-        if not bool(torch.isfinite(loss)):
+            data_loss = hdri_loss(final_index, evaluation=False)
+        tv_loss = (
+            scalar_total_variation()
+            if tv_weight > 0.0
+            else data_loss.new_zeros(())
+        )
+        objective = data_loss + tv_weight * tv_loss
+        if not bool(torch.isfinite(objective)):
             raise RuntimeError(
-                f"Non-finite {profile} end2end loss at iteration {step + 1}"
+                f"Non-finite {profile} end2end objective at iteration {step + 1}"
             )
-        loss.backward()
+        objective.backward()
         optimizer.step()
-        final_loss = float(loss.detach().cpu())
+        final_loss = float(data_loss.detach().cpu())
+        final_tv = float(tv_loss.detach().cpu())
+        final_objective = float(objective.detach().cpu())
         if step == 0 or (step + 1) % log_every == 0 or step + 1 == steps:
             print(
                 f"[end2end:{profile}] iteration {step + 1}/{steps} "
-                f"kind={final_kind} {final_label} loss={final_loss:.7f} "
+                f"kind={final_kind} {final_label} mse={final_loss:.7f} "
+                f"tv={final_tv:.7f} objective={final_objective:.7f} "
                 f"lr={optimizer.param_groups[0]['lr']:.3e}",
                 flush=True,
             )
@@ -847,11 +891,12 @@ def _fit_disney_profile(
             olat_support_split=hdri_support_split,
         )
         maps = _material_maps_numpy(model)
-        if start_step >= steps:
-            if final_kind == "olat":
-                final_loss = float(olat_loss(final_index).cpu())
-            else:
-                final_loss = float(hdri_loss(final_index, evaluation=False).cpu())
+        if final_kind == "olat":
+            final_loss = float(olat_loss(final_index).cpu())
+        else:
+            final_loss = float(hdri_loss(final_index, evaluation=False).cpu())
+        final_tv = float(scalar_total_variation().cpu())
+        final_objective = final_loss + tv_weight * final_tv
 
     maps_dir = material_dir / "maps"
     _write_material_maps(maps_dir, maps, material_foreground)
@@ -869,7 +914,7 @@ def _fit_disney_profile(
     _write_combined_evaluation_csv(evaluation_dir, profile, olat_summary, hdri_summary)
 
     metrics = {
-        "schema": "ictpolarreal.end2end-disney.v7",
+        "schema": "ictpolarreal.end2end-disney.v8",
         "material_acquisition": "end2end",
         "lighting_profile": profile,
         "model": MODEL_NAME,
@@ -882,7 +927,16 @@ def _fit_disney_profile(
         "steps": int(steps),
         "resumed_from_step": int(start_step),
         "learning_rate": float(learning_rate),
+        "base_color_source": base_color_source,
         "final_training_condition_mse": final_loss,
+        "final_training_objective": final_objective,
+        "regularization": {
+            "kind": "masked_l1_total_variation",
+            "weight": float(tv_weight),
+            "parameters": list(DISNEY_TV_SCALAR_NAMES),
+            "final_total_variation": final_tv,
+            "weighted_final_total_variation": float(tv_weight * final_tv),
+        },
         "fit_conditions": {
             "olat": int(len(train_indices)) if profile in {"olat", "mix"} else 0,
             "hdri": int(len(hdri_fit_conditions)) if profile in {"hdri", "mix"} else 0,
@@ -2093,7 +2147,7 @@ def _update_profile_acquisition_reports(
                 ),
                 "representative": representative,
             }
-        result["schema"] = "ictpolarreal.end2end-disney.v7"
+        result["schema"] = "ictpolarreal.end2end-disney.v8"
         result["evaluation"] = {
             "schema": "ictpolarreal.profile-evaluation.v2",
             "profile": profile,
@@ -2313,7 +2367,7 @@ def _adapter_provenance() -> dict[str, Any]:
     lighting_path = Path(__file__).resolve().with_name("lighting_profiles.py")
     return {
         "schema": "ictpolarreal.profile-acquisition-adapter.v2",
-        "algorithm_version": "superdimension-parity-v2",
+        "algorithm_version": "ictpolarreal-masked-tv-v1",
         "lighting_profiles_sha256": hashlib.sha256(
             lighting_path.read_bytes()
         ).hexdigest(),
@@ -2475,6 +2529,44 @@ def _foreground_mask(mask: np.ndarray | None, height: int, width: int) -> np.nda
     if mask.ndim == 2:
         mask = mask[..., None]
     return (mask[..., :1] > 0.5).astype(np.float32)
+
+
+def _masked_disney_scalar_total_variation(torch, model, mask_hwc):
+    """Average first-order TV over fitted Disney scalar maps.
+
+    Only neighbor pairs whose two pixels belong to the fitting foreground are
+    considered.  This smooths isolated material noise without pulling the
+    object boundary or excluded back-facing pixels toward background values.
+    """
+    mask = mask_hwc
+    if mask.ndim == 3 and mask.shape[-1] == 1:
+        mask = mask[..., 0]
+    if mask.ndim != 2:
+        raise ValueError(f"TV mask must have shape (H,W) or (H,W,1), got {mask.shape}")
+
+    horizontal_mask = mask[:, 1:] * mask[:, :-1]
+    vertical_mask = mask[1:, :] * mask[:-1, :]
+    horizontal_count = horizontal_mask.sum().clamp_min(1.0)
+    vertical_count = vertical_mask.sum().clamp_min(1.0)
+    constrained = model._param_maps()
+    terms = []
+    for name in DISNEY_TV_SCALAR_NAMES:
+        scalar = constrained[name]
+        if scalar.ndim == 3 and scalar.shape[-1] == 1:
+            scalar = scalar[..., 0]
+        if scalar.ndim != 2 or tuple(scalar.shape) != tuple(mask.shape):
+            raise ValueError(
+                f"Disney scalar {name} must have shape {tuple(mask.shape)}, "
+                f"got {tuple(scalar.shape)}"
+            )
+        horizontal = (
+            (scalar[:, 1:] - scalar[:, :-1]).abs() * horizontal_mask
+        ).sum() / horizontal_count
+        vertical = (
+            (scalar[1:, :] - scalar[:-1, :]).abs() * vertical_mask
+        ).sum() / vertical_count
+        terms.append(0.5 * (horizontal + vertical))
+    return torch.stack(terms).mean()
 
 
 def _material_maps_numpy(model) -> dict[str, np.ndarray]:

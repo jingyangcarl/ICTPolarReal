@@ -115,6 +115,7 @@ def decompose_camera_sample(
     imaginaire_root: str | Path | None = None,
     end2end_steps: int = 33000,
     end2end_learning_rate: float = 1e-3,
+    end2end_tv_weight: float = 1e-2,
     end2end_eval_lights: int = 16,
     end2end_profiles: str = "olat,hdri,mix",
     end2end_hdri_root: str | Path | None = None,
@@ -168,7 +169,7 @@ def decompose_camera_sample(
     mask = read_image(mask_path, channels=1) if mask_path else None
     view_dirs = load_view_directions(data_root, sample, cross_stack.shape[1:3])
 
-    static_path = sample.image_path("static")
+    albedo_path = sample.image_path("albedo")
     photometric_normal_path = sample.image_path("normal")
     initialization_indices = np.arange(len(cross_stack), dtype=np.int64)
     if material_acquisition == "end2end":
@@ -181,7 +182,7 @@ def decompose_camera_sample(
         )
     needs_ward_initialization = (
         material_acquisition == "default"
-        or static_path is None
+        or albedo_path is None
         or photometric_normal_path is None
     )
     maps = None
@@ -201,7 +202,7 @@ def decompose_camera_sample(
         )
     else:
         print(
-            "[end2end] using the dataset static/photometric initialization; "
+            "[end2end] using the dataset albedo/photometric initialization; "
             "skipping the unrelated Ward pre-fit",
             flush=True,
         )
@@ -213,9 +214,12 @@ def decompose_camera_sample(
 
         material_dir = Path(out_root) / sample.object_name / sample.camera
         disney_base_color = (
-            read_image(static_path)
-            if static_path is not None
+            read_image(albedo_path)
+            if albedo_path is not None
             else maps.diffuse_albedo
+        )
+        base_color_source = (
+            "dataset_albedo" if albedo_path is not None else "ward_diffuse_fallback"
         )
         disney_normal = (
             read_image(photometric_normal_path)
@@ -226,8 +230,8 @@ def decompose_camera_sample(
             data_root, sample, cross_stack.shape[1:3]
         )
         print(
-            "[end2end] SuperDimension-parity initialization: "
-            f"baseColor={'static capture' if static_path else 'Ward diffuse fallback'}, "
+            "[end2end] acquisition initialization: "
+            f"baseColor={'dataset albedo' if albedo_path else 'Ward diffuse fallback'}, "
             f"normal={'photometric normal' if photometric_normal_path else 'Ward normal fallback'}, "
             "view=constant camera optical axis",
             flush=True,
@@ -239,6 +243,7 @@ def decompose_camera_sample(
             light_ids=np.asarray(light_indices, dtype=np.int64),
             frame_ids=np.asarray(frame_ids, dtype=np.int64),
             base_color=disney_base_color,
+            base_color_source=base_color_source,
             normal=disney_normal,
             mask=mask,
             view_dirs=disney_view_dirs,
@@ -247,6 +252,7 @@ def decompose_camera_sample(
             device=device,
             steps=end2end_steps,
             learning_rate=end2end_learning_rate,
+            tv_weight=end2end_tv_weight,
             eval_lights=end2end_eval_lights,
             lighting_profiles=end2end_profiles,
             hdri_root=end2end_hdri_root,

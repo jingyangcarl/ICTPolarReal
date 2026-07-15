@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -58,6 +59,15 @@ def main() -> None:
     parser.add_argument("--end2end-steps", type=int, default=33000)
     parser.add_argument("--end2end-learning-rate", type=float, default=1e-3)
     parser.add_argument(
+        "--end2end-tv-weight",
+        type=float,
+        default=1e-2,
+        help=(
+            "Weight for masked L1 total variation on learned Disney scalar maps; "
+            "set to 0 for an unregularized ablation."
+        ),
+    )
+    parser.add_argument(
         "--end2end-eval-lights",
         type=int,
         default=16,
@@ -101,6 +111,8 @@ def main() -> None:
             parser.error("--end2end-steps must be positive")
         if args.end2end_learning_rate <= 0:
             parser.error("--end2end-learning-rate must be positive")
+        if not math.isfinite(args.end2end_tv_weight) or args.end2end_tv_weight < 0:
+            parser.error("--end2end-tv-weight must be finite and non-negative")
         if args.end2end_eval_lights < 0:
             parser.error("--end2end-eval-lights must be non-negative")
         if args.end2end_hdri_count <= 0:
@@ -137,6 +149,7 @@ def main() -> None:
             "imaginaire_root": str(Path(args.imaginaire_root).expanduser().resolve()),
             "end2end_steps": args.end2end_steps,
             "end2end_learning_rate": args.end2end_learning_rate,
+            "end2end_tv_weight": args.end2end_tv_weight,
             "end2end_eval_lights": args.end2end_eval_lights,
             "end2end_hdri_root": (
                 str(Path(args.end2end_hdri_root).expanduser().resolve())
@@ -175,6 +188,7 @@ def main() -> None:
                 imaginaire_root=args.imaginaire_root,
                 end2end_steps=args.end2end_steps,
                 end2end_learning_rate=args.end2end_learning_rate,
+                end2end_tv_weight=args.end2end_tv_weight,
                 end2end_eval_lights=args.end2end_eval_lights,
                 end2end_profiles=args.end2end_profiles,
                 end2end_hdri_root=args.end2end_hdri_root,

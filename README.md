@@ -114,6 +114,9 @@ Useful options:
   `end2end`. The default is the sibling folder `../imaginaire`.
 - `--end2end-steps N` and `--end2end-learning-rate FLOAT`: control the Disney
   optimization. Defaults are 33,000 steps and a learning rate of `1e-3`.
+- `--end2end-tv-weight FLOAT`: control masked L1 total variation on the learned
+  scalar material maps. The default is `1e-2`; use `0` for an unregularized
+  ablation. Frozen albedo/normal maps and object boundaries are not regularized.
 - `--end2end-profiles LIST`: choose independent `olat`, `hdri`, and `mix` fits.
   The default is `olat,hdri,mix`; `all` is an alias, and a subset such as
   `--end2end-profiles olat` avoids fitting the other profiles.
@@ -168,14 +171,13 @@ acquisition modes write to separate roots automatically: `default` uses
 `outputs/material_acquisition_end2end`. An explicit `--material-root` overrides
 the selected root.
 
-End-to-end acquisition follows the working SuperDimension/Imaginaire contract:
-the OLAT target is the measured parallel-polarized image; initialization uses
-the dataset static image, photometric normal, and a constant optical-axis view;
-pixels failing the `n dot v > 0` validity gate are excluded; and Disney scalar
-maps retain the renderer's raw unconstrained defaults. Invalid/background
-pixels are masked before renderer-native whole-image 99.5th-percentile linear
-scaling. This avoids the earlier synthetic polarization target, per-pixel view,
-and double-logit initialization mismatches.
+ICTPolarReal end-to-end acquisition uses the measured parallel-polarized OLAT
+image as its target and initializes frozen base color from the dataset
+`albedo.exr`, together with the photometric normal and a constant optical-axis
+view. Pixels failing the `n dot v > 0` validity gate are excluded. Masked L1
+total variation regularizes only the learned Disney scalar maps and only across
+neighbor pairs inside that fitting mask. Invalid/background pixels are masked
+before whole-image 99.5th-percentile linear scaling.
 
 End-to-end HDRI targets are not separately photographed environment-light
 captures. They are synthesized from the measured ICTPolarReal parallel OLAT
