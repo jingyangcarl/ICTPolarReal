@@ -89,6 +89,11 @@ FREQUENCY_ADAPTIVE_STRONG_MEDIAN3_WEIGHT = 0.50
 FREQUENCY_ADAPTIVE_STRONG_MEDIAN7_WEIGHT = 0.50
 FREQUENCY_ADAPTIVE_HALO_V1_BLEND = 0.84
 FREQUENCY_ADAPTIVE_FOCUSED_MAPS = ("anisotropic", "subsurface")
+FREQUENCY_ADAPTIVE_EVIDENCE_CROP_SIZE = 96
+FREQUENCY_ADAPTIVE_EVIDENCE_SCALE = 3
+FREQUENCY_ADAPTIVE_EVIDENCE_SCHEMA = (
+    "ictpolarreal.adaptive-cleanup-evidence.v1"
+)
 FREQUENCY_ADAPTIVE_GUIDE_SCALE_PERCENTILE = 90.0
 FREQUENCY_EVALUATION_GUARD_SCHEMA = (
     "ictpolarreal.frequency-consensus-evaluation-guard.v1"
@@ -372,6 +377,19 @@ def compose_regularization_comparison(
         acquisitions,
         contract,
     )
+    if contract.get("active_frequency_upgrade"):
+        if frequency_cleanup is None or frequency_cleanup.get("available") is not True:
+            raise ValueError("active frequency upgrade is missing cleanup diagnostics")
+        frequency_cleanup["adaptive_cleanup_evidence"] = (
+            _measure_adaptive_cleanup_evidence(
+                baseline_camera,
+                regularized_camera,
+                profiles,
+                interior_mask,
+                guide_diagnostic,
+                map_metrics,
+            )
+        )
     evaluation_metrics = _collect_evaluation_metrics(acquisitions, profiles)
     case_png_metrics = _collect_case_png_metrics(
         baseline_camera,
@@ -453,6 +471,22 @@ def compose_regularization_comparison(
                 frequency_cleanup,
                 stage / "material" / "frequency_fullmaps_1to1.png",
             )
+            adaptive_evidence = frequency_cleanup.get(
+                "adaptive_cleanup_evidence"
+            )
+            if contract.get("active_frequency_upgrade"):
+                if not isinstance(adaptive_evidence, dict):
+                    raise ValueError("adaptive cleanup evidence metadata is missing")
+                _write_adaptive_cleanup_evidence(
+                    baseline_camera,
+                    regularized_camera,
+                    profiles,
+                    interior_mask,
+                    guide_diagnostic,
+                    adaptive_evidence,
+                    summary,
+                    stage / "material" / "adaptive_cleanup_evidence.png",
+                )
         _write_json(stage / "summary.json", summary)
         _write_overview(
             baseline_camera,
@@ -469,6 +503,9 @@ def compose_regularization_comparison(
             require_frequency_detail=(
                 frequency_cleanup is not None
                 and frequency_cleanup.get("available") is True
+            ),
+            require_adaptive_cleanup_evidence=bool(
+                contract.get("active_frequency_upgrade")
             ),
         )
 
@@ -1332,11 +1369,9 @@ def _map_spatial_metrics(
         guide_masks["edge_vertical"],
     )
 
-    padded = np.pad(values, 2, mode="edge")
-    windows = np.lib.stride_tricks.sliding_window_view(padded, (5, 5))
-    median = np.median(windows, axis=(-2, -1))
-    residual = np.abs(values - median)[mask]
-    quiet_residual = np.abs(values - median)[guide_masks["quiet_pixels"]]
+    residual_map = _own_median5_residual(values)
+    residual = residual_map[mask]
+    quiet_residual = residual_map[guide_masks["quiet_pixels"]]
     result = {
         "neighbor_variation": neighbor_variation,
         "median5_residual_mae": float(residual.mean()),
@@ -1357,7 +1392,7 @@ def _map_spatial_metrics(
     left, top, right, bottom = FREQUENCY_DETAIL_CROP_BOX
     if values.shape[1] >= right and values.shape[0] >= bottom:
         hotspot_quiet = guide_masks["quiet_pixels"][top:bottom, left:right]
-        hotspot_residual = np.abs(values - median)[top:bottom, left:right]
+        hotspot_residual = residual_map[top:bottom, left:right]
         hotspot_quiet_count = int(np.count_nonzero(hotspot_quiet))
         result["fixed_hotspot_quiet_pixels"] = hotspot_quiet_count
         result[
@@ -1373,6 +1408,17 @@ def _map_spatial_metrics(
             "fixed_hotspot_median5_residual_outlier_fraction_gt_0p05"
         ] = None
     return result
+
+
+def _own_median5_residual(values: np.ndarray) -> np.ndarray:
+    """Return the absolute residual to each exported map's own 5x5 median."""
+    values = np.asarray(values)
+    if values.ndim != 2:
+        raise ValueError("median5 residual input must be two-dimensional")
+    padded = np.pad(values, 2, mode="edge")
+    windows = np.lib.stride_tricks.sliding_window_view(padded, (5, 5))
+    median = np.median(windows, axis=(-2, -1))
+    return np.abs(values - median)
 
 
 def _measure_material_maps(
@@ -4712,6 +4758,18 @@ def _build_summary(
                 {
                     "hotspot_1to1": "material/frequency_hotspot_1to1.png",
                     "fullmaps_1to1": "material/frequency_fullmaps_1to1.png",
+                    **(
+                        {
+                            "adaptive_cleanup_evidence": (
+                                "material/adaptive_cleanup_evidence.png"
+                            )
+                        }
+                        if isinstance(
+                            frequency_cleanup.get("adaptive_cleanup_evidence"),
+                            dict,
+                        )
+                        else {}
+                    ),
                 }
                 if frequency_cleanup is not None
                 and frequency_cleanup.get("available") is True
@@ -6270,6 +6328,380 @@ def _densest_flagged_crop_box(
     )
 
 
+def _window_sums(values: np.ndarray, crop_size: int) -> np.ndarray:
+    values = np.asarray(values)
+    if values.ndim != 2:
+        raise ValueError("crop score input must be two-dimensional")
+    if crop_size <= 0 or crop_size > min(values.shape):
+        raise ValueError("crop size must fit inside the score input")
+    integral = np.pad(
+        values.astype(np.int64, copy=False),
+        ((1, 0), (1, 0)),
+        mode="constant",
+    ).cumsum(axis=0, dtype=np.int64).cumsum(axis=1, dtype=np.int64)
+    return (
+        integral[crop_size:, crop_size:]
+        - integral[:-crop_size, crop_size:]
+        - integral[crop_size:, :-crop_size]
+        + integral[:-crop_size, :-crop_size]
+    )
+
+
+def _select_adaptive_cleanup_crop(
+    removed_masks: Sequence[np.ndarray],
+    introduced_masks: Sequence[np.ndarray],
+    quiet_masks: Sequence[np.ndarray],
+    crop_size: int = FREQUENCY_ADAPTIVE_EVIDENCE_CROP_SIZE,
+) -> dict[str, Any]:
+    """Select one auditable crop shared by every lighting profile for a map."""
+    if not removed_masks or not (
+        len(removed_masks) == len(introduced_masks) == len(quiet_masks)
+    ):
+        raise ValueError("adaptive crop selection requires matched profile masks")
+    shape = np.asarray(removed_masks[0]).shape
+    if len(shape) != 2:
+        raise ValueError("adaptive crop masks must be two-dimensional")
+    normalized = []
+    for label, masks in (
+        ("removed", removed_masks),
+        ("introduced", introduced_masks),
+        ("quiet", quiet_masks),
+    ):
+        arrays = [np.asarray(mask, dtype=bool) for mask in masks]
+        if any(array.shape != shape for array in arrays):
+            raise ValueError(f"adaptive {label} crop masks do not share a shape")
+        normalized.append(arrays)
+    removed, introduced, quiet = normalized
+    removed_scores = sum(
+        (_window_sums(mask, crop_size) for mask in removed),
+        start=np.zeros(
+            (shape[0] - crop_size + 1, shape[1] - crop_size + 1),
+            dtype=np.int64,
+        ),
+    )
+    introduced_scores = sum(
+        (_window_sums(mask, crop_size) for mask in introduced),
+        start=np.zeros_like(removed_scores),
+    )
+    quiet_scores = sum(
+        (_window_sums(mask, crop_size) for mask in quiet),
+        start=np.zeros_like(removed_scores),
+    )
+    net_scores = removed_scores - introduced_scores
+    tops, lefts = np.indices(net_scores.shape)
+    # Lexicographic audit rule: maximize net removed, then removed; minimize
+    # introduced; maximize quiet support; finally prefer the top/left window.
+    order = np.lexsort(
+        (
+            lefts.ravel(),
+            tops.ravel(),
+            -quiet_scores.ravel(),
+            introduced_scores.ravel(),
+            -removed_scores.ravel(),
+            -net_scores.ravel(),
+        )
+    )
+    top = int(tops.ravel()[order[0]])
+    left = int(lefts.ravel()[order[0]])
+    return {
+        "crop_box_xyxy": [left, top, left + crop_size, top + crop_size],
+        "crop_size_pixels": crop_size,
+        "aggregate_net_removed": int(net_scores[top, left]),
+        "aggregate_removed": int(removed_scores[top, left]),
+        "aggregate_introduced": int(introduced_scores[top, left]),
+        "aggregate_quiet_pixels": int(quiet_scores[top, left]),
+        "selection_rule": (
+            "maximize aggregate net removed (removed minus introduced) across "
+            "profiles, then maximize removed, minimize introduced, maximize "
+            "quiet pixels, then prefer top and left"
+        ),
+        "manual_selection": False,
+    }
+
+
+def _adaptive_transition_counts(
+    fixed_outliers: np.ndarray,
+    adaptive_outliers: np.ndarray,
+    quiet_pixels: np.ndarray,
+) -> dict[str, Any]:
+    fixed = np.asarray(fixed_outliers, dtype=bool)
+    adaptive = np.asarray(adaptive_outliers, dtype=bool)
+    quiet = np.asarray(quiet_pixels, dtype=bool)
+    if fixed.shape != adaptive.shape or fixed.shape != quiet.shape or fixed.ndim != 2:
+        raise ValueError("adaptive evidence masks must be matched 2D arrays")
+    if np.any(fixed & ~quiet) or np.any(adaptive & ~quiet):
+        raise ValueError("adaptive evidence outliers must be restricted to quiet pixels")
+    removed = fixed & ~adaptive
+    introduced = adaptive & ~fixed
+    persistent = fixed & adaptive
+    quiet_count = int(np.count_nonzero(quiet))
+    fixed_count = int(np.count_nonzero(fixed))
+    adaptive_count = int(np.count_nonzero(adaptive))
+    return {
+        "quiet_pixels": quiet_count,
+        "fixed_v1_outliers": fixed_count,
+        "adaptive_v1_outliers": adaptive_count,
+        "fixed_v1_outlier_fraction": (
+            float(fixed_count / quiet_count) if quiet_count else None
+        ),
+        "adaptive_v1_outlier_fraction": (
+            float(adaptive_count / quiet_count) if quiet_count else None
+        ),
+        "removed": int(np.count_nonzero(removed)),
+        "introduced": int(np.count_nonzero(introduced)),
+        "persistent": int(np.count_nonzero(persistent)),
+        "net_removed": fixed_count - adaptive_count,
+        "relative_reduction_fraction": (
+            float((fixed_count - adaptive_count) / fixed_count)
+            if fixed_count
+            else None
+        ),
+    }
+
+
+def _aggregate_adaptive_transition_counts(
+    rows: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    if not rows:
+        raise ValueError("adaptive evidence aggregate requires at least one row")
+    quiet = sum(int(row["quiet_pixels"]) for row in rows)
+    fixed = sum(int(row["fixed_v1_outliers"]) for row in rows)
+    adaptive = sum(int(row["adaptive_v1_outliers"]) for row in rows)
+    removed = sum(int(row["removed"]) for row in rows)
+    introduced = sum(int(row["introduced"]) for row in rows)
+    persistent = sum(int(row["persistent"]) for row in rows)
+    if fixed != removed + persistent or adaptive != introduced + persistent:
+        raise ValueError("adaptive evidence transition counts are inconsistent")
+    return {
+        "quiet_pixels": quiet,
+        "fixed_v1_outliers": fixed,
+        "adaptive_v1_outliers": adaptive,
+        "fixed_v1_outlier_fraction": float(fixed / quiet) if quiet else None,
+        "adaptive_v1_outlier_fraction": float(adaptive / quiet) if quiet else None,
+        "removed": removed,
+        "introduced": introduced,
+        "persistent": persistent,
+        "net_removed": fixed - adaptive,
+        "relative_reduction_fraction": (
+            float((fixed - adaptive) / fixed) if fixed else None
+        ),
+        "direction": (
+            "improvement"
+            if adaptive < fixed
+            else "regression"
+            if adaptive > fixed
+            else "unchanged"
+        ),
+    }
+
+
+def _adaptive_cleanup_profile_masks(
+    baseline_camera: Path,
+    regularized_camera: Path,
+    profile: str,
+    interior_mask: np.ndarray,
+    guide_diagnostic: dict[str, Any],
+) -> dict[str, Any]:
+    maps_dir = baseline_camera / "material" / profile / "maps"
+    guide_masks, _ = _guide_region_masks(
+        _read_rgb_map(maps_dir / "baseColor.png"),
+        _read_rgb_map(maps_dir / "normal.png"),
+        interior_mask,
+        albedo_sigma=float(guide_diagnostic["albedo_sigma"]),
+        normal_sigma=float(guide_diagnostic["normal_sigma"]),
+    )
+    quiet = guide_masks["quiet_pixels"]
+    maps = {}
+    for map_name in SCALAR_MAPS:
+        fixed_values = _read_scalar_map(maps_dir / f"{map_name}.png")
+        adaptive_values = _read_scalar_map(
+            regularized_camera
+            / "material"
+            / profile
+            / "maps"
+            / f"{map_name}.png"
+        )
+        if fixed_values.shape != interior_mask.shape or adaptive_values.shape != (
+            interior_mask.shape
+        ):
+            raise ValueError("adaptive evidence maps do not match the fit interior")
+        fixed = quiet & (
+            _own_median5_residual(fixed_values) > FREQUENCY_EVIDENCE_THRESHOLD
+        )
+        adaptive = quiet & (
+            _own_median5_residual(adaptive_values) > FREQUENCY_EVIDENCE_THRESHOLD
+        )
+        maps[map_name] = {
+            "fixed": fixed,
+            "adaptive": adaptive,
+            "removed": fixed & ~adaptive,
+            "introduced": adaptive & ~fixed,
+            "persistent": fixed & adaptive,
+        }
+    return {"quiet": quiet, "maps": maps}
+
+
+def _measure_adaptive_cleanup_evidence(
+    baseline_camera: Path,
+    regularized_camera: Path,
+    profiles: Sequence[str],
+    interior_mask: np.ndarray,
+    guide_diagnostic: dict[str, Any],
+    map_metrics: dict[str, Any],
+) -> dict[str, Any]:
+    if not profiles:
+        raise ValueError("adaptive cleanup evidence requires lighting profiles")
+    profile_masks = {
+        profile: _adaptive_cleanup_profile_masks(
+            baseline_camera,
+            regularized_camera,
+            profile,
+            interior_mask,
+            guide_diagnostic,
+        )
+        for profile in profiles
+    }
+    per_profile: dict[str, Any] = {}
+    all_rows = []
+    focused_rows = []
+    non_focused_rows = []
+    regressions = []
+    for profile in profiles:
+        quiet = profile_masks[profile]["quiet"]
+        profile_maps = {}
+        for map_name in SCALAR_MAPS:
+            masks = profile_masks[profile]["maps"][map_name]
+            counts = _adaptive_transition_counts(
+                masks["fixed"], masks["adaptive"], quiet
+            )
+            expected_fixed = map_metrics[profile][map_name]["baseline"][
+                "quiet_region_median5_residual_outlier_count_gt_0p05"
+            ]
+            expected_adaptive = map_metrics[profile][map_name]["regularized"][
+                "quiet_region_median5_residual_outlier_count_gt_0p05"
+            ]
+            if (
+                counts["fixed_v1_outliers"] != expected_fixed
+                or counts["adaptive_v1_outliers"] != expected_adaptive
+            ):
+                raise ValueError(
+                    "adaptive evidence counts differ from exported-map metrics: "
+                    f"{profile}/{map_name}"
+                )
+            profile_maps[map_name] = counts
+            all_rows.append(counts)
+            if map_name in FREQUENCY_ADAPTIVE_FOCUSED_MAPS:
+                focused_rows.append(counts)
+            else:
+                non_focused_rows.append(counts)
+                if counts["adaptive_v1_outliers"] > counts["fixed_v1_outliers"]:
+                    regressions.append(
+                        {
+                            "profile": profile,
+                            "map": map_name,
+                            "fixed_v1_outliers": counts["fixed_v1_outliers"],
+                            "adaptive_v1_outliers": counts[
+                                "adaptive_v1_outliers"
+                            ],
+                            "net_introduced": -counts["net_removed"],
+                        }
+                    )
+        per_profile[profile] = {"maps": profile_maps}
+
+    crops = {}
+    for map_name in FREQUENCY_ADAPTIVE_FOCUSED_MAPS:
+        selection = _select_adaptive_cleanup_crop(
+            [
+                profile_masks[profile]["maps"][map_name]["removed"]
+                for profile in profiles
+            ],
+            [
+                profile_masks[profile]["maps"][map_name]["introduced"]
+                for profile in profiles
+            ],
+            [profile_masks[profile]["quiet"] for profile in profiles],
+        )
+        left, top, right, bottom = selection["crop_box_xyxy"]
+        crop_rows = []
+        per_profile_crop = {}
+        for profile in profiles:
+            masks = profile_masks[profile]["maps"][map_name]
+            quiet = profile_masks[profile]["quiet"]
+            counts = _adaptive_transition_counts(
+                masks["fixed"][top:bottom, left:right],
+                masks["adaptive"][top:bottom, left:right],
+                quiet[top:bottom, left:right],
+            )
+            per_profile_crop[profile] = counts
+            crop_rows.append(counts)
+        aggregate_crop = _aggregate_adaptive_transition_counts(crop_rows)
+        if (
+            aggregate_crop["net_removed"] != selection["aggregate_net_removed"]
+            or aggregate_crop["removed"] != selection["aggregate_removed"]
+            or aggregate_crop["introduced"]
+            != selection["aggregate_introduced"]
+            or aggregate_crop["quiet_pixels"]
+            != selection["aggregate_quiet_pixels"]
+        ):
+            raise ValueError("adaptive evidence crop scores do not match counts")
+        crops[map_name] = {
+            **selection,
+            "aggregate": aggregate_crop,
+            "profiles": per_profile_crop,
+        }
+
+    all_summary = _aggregate_adaptive_transition_counts(all_rows)
+    focused_summary = _aggregate_adaptive_transition_counts(focused_rows)
+    non_focused_summary = _aggregate_adaptive_transition_counts(non_focused_rows)
+    regressions.sort(
+        key=lambda row: (-int(row["net_introduced"]), row["profile"], row["map"])
+    )
+    return {
+        "schema": FREQUENCY_ADAPTIVE_EVIDENCE_SCHEMA,
+        "available": True,
+        "comparison": "frequency-consensus-v1-fixed-target-to-adaptive-v1",
+        "variant_labels": {"baseline": "Fixed v1", "regularized": "Adaptive v1"},
+        "definition": {
+            "source": "exact exported scalar-map PNGs",
+            "outlier": "abs(map - own median5_nearest) > 0.05",
+            "threshold": FREQUENCY_EVIDENCE_THRESHOLD,
+            "threshold_operator": ">",
+            "region": (
+                "baseline-guide quiet pixels inside the radius-2 eroded fit mask"
+            ),
+            "guide_configuration": {
+                "albedo_sigma": float(guide_diagnostic["albedo_sigma"]),
+                "normal_sigma": float(guide_diagnostic["normal_sigma"]),
+                "quiet_percentile": QUIET_GUIDE_PERCENTILE,
+            },
+            "transitions": {
+                "removed": "Fixed v1 outlier and not Adaptive v1 outlier",
+                "introduced": "Adaptive v1 outlier and not Fixed v1 outlier",
+                "persistent": "outlier in both variants",
+            },
+        },
+        "profiles": per_profile,
+        "focused_maps": list(FREQUENCY_ADAPTIVE_FOCUSED_MAPS),
+        "focused_summary": focused_summary,
+        "all_map_summary": all_summary,
+        "non_focused_summary": non_focused_summary,
+        "non_focused_regressions": regressions,
+        "non_focused_regression_count": len(regressions),
+        "crops": crops,
+        "presentation": {
+            "artifact": "material/adaptive_cleanup_evidence.png",
+            "scale": FREQUENCY_ADAPTIVE_EVIDENCE_SCALE,
+            "resampling": "nearest",
+            "crop_shared_across_profiles_per_focused_map": True,
+            "manual_selection": False,
+            "disclosure": (
+                "Focused-map cleanup is reported separately from non-focused "
+                "regression; no claim is made that every map improves."
+            ),
+        },
+    }
+
+
 def _frequency_annotation_layout(
     profile_cleanup: dict[str, Any],
 ) -> dict[str, Any]:
@@ -6584,6 +7016,351 @@ def _write_frequency_full_maps(
     canvas.save(output)
 
 
+def _write_adaptive_cleanup_evidence(
+    baseline_camera: Path,
+    regularized_camera: Path,
+    profiles: Sequence[str],
+    interior_mask: np.ndarray,
+    guide_diagnostic: dict[str, Any],
+    evidence: dict[str, Any],
+    summary: dict[str, Any],
+    output: Path,
+) -> None:
+    if evidence.get("schema") != FREQUENCY_ADAPTIVE_EVIDENCE_SCHEMA:
+        raise ValueError("adaptive cleanup evidence has an invalid schema")
+    if evidence.get("focused_maps") != list(FREQUENCY_ADAPTIVE_FOCUSED_MAPS):
+        raise ValueError("adaptive cleanup evidence focused maps are invalid")
+    profile_masks = {
+        profile: _adaptive_cleanup_profile_masks(
+            baseline_camera,
+            regularized_camera,
+            profile,
+            interior_mask,
+            guide_diagnostic,
+        )
+        for profile in profiles
+    }
+    scale = FREQUENCY_ADAPTIVE_EVIDENCE_SCALE
+    source_size = FREQUENCY_ADAPTIVE_EVIDENCE_CROP_SIZE
+    tile_size = source_size * scale
+    gutter = 350
+    columns = (
+        "Fixed v1 raw",
+        "Adaptive v1 raw",
+        "Fixed v1 outliers",
+        "Adaptive v1 outliers",
+        "Transition",
+    )
+    width = gutter + len(columns) * tile_size + 40
+    header_height = 430
+    section_heading_height = 130
+    column_heading_height = 64
+    row_gap = 26
+    row_stride = tile_size + row_gap
+    section_height = (
+        section_heading_height
+        + column_heading_height
+        + len(profiles) * row_stride
+        + 28
+    )
+    footer_height = 164
+    height = (
+        header_height
+        + len(FREQUENCY_ADAPTIVE_FOCUSED_MAPS) * section_height
+        + footer_height
+    )
+    canvas = Image.new("RGB", (width, height), (12, 14, 18))
+    draw = ImageDraw.Draw(canvas)
+    contract = summary["comparison_contract"]
+    draw.text(
+        (36, 22),
+        "Fixed frequency consensus v1 → Adaptive v1 · cleanup evidence",
+        font=_font(43, bold=True),
+        fill="white",
+    )
+    header_lines = (
+        (
+            "Controlled A/B · fixed frequency consensus v1 "
+            f"λ={contract['baseline_tv_weight']:g} → Adaptive v1 "
+            f"λ={contract['regularized_tv_weight']:g} · exact exported scalar-map PNGs",
+            (151, 205, 255),
+            True,
+        ),
+        (
+            "Outlier = |map − its own 5×5 nearest-border median| > 0.05 · "
+            "baseline-guide quiet pixels inside the eroded fit interior",
+            (215, 222, 230),
+            False,
+        ),
+        (
+            "Shared 96×96 crops; no cherry-picking · categorical colors; "
+            "|Δ|×8: frequency_fullmaps_1to1.png",
+            (215, 222, 230),
+            True,
+        ),
+    )
+    for line_index, (line, color, bold) in enumerate(header_lines):
+        draw.text(
+            (38, 78 + 34 * line_index),
+            line,
+            font=_font_for_width(
+                draw,
+                line,
+                max_width=width - 76,
+                preferred_size=24,
+                minimum_size=22,
+                bold=bold,
+            ),
+            fill=color,
+        )
+
+    focused = evidence["focused_summary"]
+    all_maps = evidence["all_map_summary"]
+    non_focused = evidence["non_focused_summary"]
+    gates = summary["scalar_map_cleanup_qualification"]["gates"]
+    all_gate = gates["aggregate_quiet_outlier_relative_reduction"]
+    band_gate = gates["aggregate_guide_textured_band3_8_amplitude_ratio"]
+    edge_gate = gates["guide_edge_gradient_magnitude_ratio"]
+    psnr_gate = gates["aggregate_relighting_delta_psnr_db"]
+    ssim_gate = gates["aggregate_relighting_delta_ssim_global"]
+    all_gate_threshold = float(all_gate["threshold"])
+
+    def percentage(value: float | None, digits: int = 2) -> str:
+        return "n/a" if value is None else f"{100.0 * value:.{digits}f}%"
+
+    def relative_change_label(value: float | None) -> str:
+        if value is None:
+            return "n/a"
+        return (
+            f"{100.0 * value:.1f}% reduction"
+            if value >= 0.0
+            else f"{-100.0 * value:.1f}% increase"
+        )
+
+    cards = (
+        (
+            "FOCUSED A + S",
+            f"{percentage(focused['fixed_v1_outlier_fraction'])} → "
+            f"{percentage(focused['adaptive_v1_outlier_fraction'])}\n"
+            f"{relative_change_label(focused['relative_reduction_fraction'])}",
+            (54, 167, 255),
+        ),
+        (
+            "ALL 8 MAPS",
+            f"{percentage(all_maps['fixed_v1_outlier_fraction'])} → "
+            f"{percentage(all_maps['adaptive_v1_outlier_fraction'])}\n"
+            f"{relative_change_label(all_maps['relative_reduction_fraction'])}\n"
+            f"{100.0 * all_gate_threshold:.0f}% gate "
+            f"{'met' if all_gate['meets_threshold'] else 'MISS'}",
+            (255, 177, 64) if not all_gate["meets_threshold"] else (72, 205, 132),
+        ),
+        (
+            "TEXTURE + EDGES",
+            f"3–8 px amplitude {percentage(band_gate['observed'], 2)}\n"
+            f"edge ratio {100.0 * edge_gate['observed_minimum']:.1f}–"
+            f"{100.0 * edge_gate['observed_maximum']:.1f}%",
+            (72, 205, 132),
+        ),
+        (
+            "RELIGHTING",
+            f"ΔPSNR {float(psnr_gate['observed']):+.4f} dB · "
+            f"{'met' if psnr_gate['meets_threshold'] else 'MISS'}\n"
+            f"ΔSSIM {float(ssim_gate['observed']):+.5f} · "
+            f"{'met' if ssim_gate['meets_threshold'] else 'MISS'}",
+            (
+                (72, 205, 132)
+                if psnr_gate["meets_threshold"] and ssim_gate["meets_threshold"]
+                else (255, 177, 64)
+            ),
+        ),
+    )
+    card_gap = 18
+    card_left = 36
+    card_width = (width - 2 * card_left - 3 * card_gap) // 4
+    card_top = 188
+    card_height = 166
+    for index, (title, body, accent) in enumerate(cards):
+        left = card_left + index * (card_width + card_gap)
+        draw.rounded_rectangle(
+            (left, card_top, left + card_width, card_top + card_height),
+            radius=16,
+            fill=(24, 28, 35),
+            outline=accent,
+            width=3,
+        )
+        draw.text(
+            (left + 20, card_top + 16),
+            title,
+            font=_font(24, bold=True),
+            fill=accent,
+        )
+        draw.multiline_text(
+            (left + 20, card_top + 58),
+            body,
+            font=_font(25, bold=True),
+            fill="white",
+            spacing=9,
+        )
+    legend_y = 374
+    legend = (
+        ((0, 224, 255), "removed"),
+        ((255, 145, 30), "introduced"),
+        ((155, 160, 168), "persistent"),
+    )
+    draw.text((38, legend_y), "Transition:", font=_font(24, bold=True), fill="white")
+    legend_x = 190
+    for color, label in legend:
+        draw.rounded_rectangle(
+            (legend_x, legend_y + 1, legend_x + 27, legend_y + 28),
+            radius=4,
+            fill=color,
+        )
+        draw.text(
+            (legend_x + 38, legend_y - 2),
+            label,
+            font=_font(24),
+            fill=(225, 225, 225),
+        )
+        legend_x += 190
+
+    y = header_height
+    for map_name in FREQUENCY_ADAPTIVE_FOCUSED_MAPS:
+        crop = evidence["crops"][map_name]
+        crop_box = tuple(crop["crop_box_xyxy"])
+        if len(crop_box) != 4:
+            raise ValueError("adaptive evidence crop box is invalid")
+        left, top, right, bottom = crop_box
+        if right - left != source_size or bottom - top != source_size:
+            raise ValueError("adaptive evidence crop must be 96x96")
+        draw.rectangle((0, y, width, y + section_height), fill=(16, 19, 24))
+        draw.text(
+            (36, y + 18),
+            _display_name(map_name).upper(),
+            font=_font(38, bold=True),
+            fill="white",
+        )
+        draw.text(
+            (36, y + 68),
+            (
+                f"shared crop x={left}:{right}, y={top}:{bottom} · selected by "
+                "net removed → removed → fewest introduced → quiet support → top/left"
+            ),
+            font=_font(24),
+            fill=(200, 207, 216),
+        )
+        for column, label in enumerate(columns):
+            _draw_centered_text(
+                draw,
+                (gutter + column * tile_size, y + section_heading_height, tile_size, column_heading_height),
+                label,
+                _font(23, bold=True),
+                "white",
+            )
+        row_y = y + section_heading_height + column_heading_height
+        for profile in profiles:
+            masks = profile_masks[profile]["maps"][map_name]
+            quiet = profile_masks[profile]["quiet"]
+            full_counts = _adaptive_transition_counts(
+                masks["fixed"], masks["adaptive"], quiet
+            )
+            if full_counts != evidence["profiles"][profile]["maps"][map_name]:
+                raise ValueError(
+                    "adaptive evidence writer counts differ from metadata: "
+                    f"{profile}/{map_name}"
+                )
+            crop_counts = _adaptive_transition_counts(
+                masks["fixed"][top:bottom, left:right],
+                masks["adaptive"][top:bottom, left:right],
+                quiet[top:bottom, left:right],
+            )
+            if crop_counts != crop["profiles"][profile]:
+                raise ValueError(
+                    "adaptive evidence crop counts differ from metadata: "
+                    f"{profile}/{map_name}"
+                )
+            draw.multiline_text(
+                (36, row_y + 28),
+                (
+                    f"{profile.upper()}\n"
+                    f"full {percentage(full_counts['fixed_v1_outlier_fraction'])} → "
+                    f"{percentage(full_counts['adaptive_v1_outlier_fraction'])}\n"
+                    f"crop removed {crop_counts['removed']}\n"
+                    f"introduced {crop_counts['introduced']}\n"
+                    f"persistent {crop_counts['persistent']}"
+                ),
+                font=_font(24, bold=True),
+                fill="white",
+                spacing=10,
+            )
+            with Image.open(
+                baseline_camera
+                / "material"
+                / profile
+                / "maps"
+                / f"{map_name}.png"
+            ) as image:
+                fixed_raw = image.convert("L").crop(crop_box)
+            with Image.open(
+                regularized_camera
+                / "material"
+                / profile
+                / "maps"
+                / f"{map_name}.png"
+            ) as image:
+                adaptive_raw = image.convert("L").crop(crop_box)
+            quiet_crop = quiet[top:bottom, left:right]
+            fixed_crop = masks["fixed"][top:bottom, left:right]
+            adaptive_crop = masks["adaptive"][top:bottom, left:right]
+            fixed_diagnostic = np.zeros((source_size, source_size, 3), dtype=np.uint8)
+            adaptive_diagnostic = np.zeros_like(fixed_diagnostic)
+            fixed_diagnostic[quiet_crop] = (24, 27, 32)
+            adaptive_diagnostic[quiet_crop] = (24, 27, 32)
+            fixed_diagnostic[fixed_crop] = (245, 245, 245)
+            adaptive_diagnostic[adaptive_crop] = (245, 245, 245)
+            transition = np.zeros_like(fixed_diagnostic)
+            transition[quiet_crop] = (18, 21, 25)
+            transition[fixed_crop & adaptive_crop] = (155, 160, 168)
+            transition[fixed_crop & ~adaptive_crop] = (0, 224, 255)
+            transition[adaptive_crop & ~fixed_crop] = (255, 145, 30)
+            panels = (
+                fixed_raw.convert("RGB"),
+                adaptive_raw.convert("RGB"),
+                Image.fromarray(fixed_diagnostic, mode="RGB"),
+                Image.fromarray(adaptive_diagnostic, mode="RGB"),
+                Image.fromarray(transition, mode="RGB"),
+            )
+            for column, panel in enumerate(panels):
+                enlarged = panel.resize(
+                    (tile_size, tile_size), Image.Resampling.NEAREST
+                )
+                canvas.paste(enlarged, (gutter + column * tile_size, row_y))
+            row_y += row_stride
+        y += section_height
+
+    nonfocused_direction = non_focused["direction"]
+    nonfocused_delta = non_focused["adaptive_v1_outliers"] - non_focused[
+        "fixed_v1_outliers"
+    ]
+    disclosure = (
+        "Disclosure · Focused anisotropic/subsurface: "
+        f"{relative_change_label(focused['relative_reduction_fraction'])}.\n"
+        f"Non-focused maps: {percentage(non_focused['fixed_v1_outlier_fraction'])} → "
+        f"{percentage(non_focused['adaptive_v1_outlier_fraction'])}, "
+        f"{nonfocused_direction}, {nonfocused_delta:+d} outliers; "
+        f"{evidence['non_focused_regression_count']} profile/map rows regress.\n"
+        "The result does not support a claim that every map improves."
+    )
+    draw.multiline_text(
+        (38, y + 24),
+        disclosure,
+        font=_font(25, bold=True),
+        fill=(255, 196, 103) if nonfocused_direction == "regression" else (220, 225, 232),
+        spacing=10,
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(output)
+
+
 def _overview_pixel_detail_layout(
     map_names: Sequence[str],
     captions: Sequence[str],
@@ -6708,6 +7485,7 @@ def _overview_pixel_detail_layout(
 def _frequency_overview_headlines(
     gate_report: dict[str, Any],
     relighting_line: str,
+    adaptive_evidence: dict[str, Any] | None = None,
 ) -> tuple[str, ...]:
     if not isinstance(gate_report, dict):
         raise ValueError("frequency overview requires cleanup qualification metadata")
@@ -6758,6 +7536,68 @@ def _frequency_overview_headlines(
         gate_count = int(gate_report["gate_count"])
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError("frequency overview qualification status is invalid") from exc
+    if adaptive_evidence is not None:
+        if adaptive_evidence.get("schema") != FREQUENCY_ADAPTIVE_EVIDENCE_SCHEMA:
+            raise ValueError("frequency overview adaptive evidence is invalid")
+        focused = adaptive_evidence["focused_summary"]
+        all_maps = adaptive_evidence["all_map_summary"]
+        non_focused = adaptive_evidence["non_focused_summary"]
+        all_gate = gates["aggregate_quiet_outlier_relative_reduction"]
+        edge_gate = gates["guide_edge_gradient_magnitude_ratio"]
+
+        def fraction(value: float | None) -> str:
+            return "n/a" if value is None else f"{100.0 * value:.2f}%"
+
+        def relative_change_label(value: float | None) -> str:
+            if value is None:
+                return "n/a"
+            return (
+                f"{100.0 * value:.1f}% reduction"
+                if value >= 0.0
+                else f"{-100.0 * value:.1f}% increase"
+            )
+
+        nonfocused_delta = (
+            int(non_focused["adaptive_v1_outliers"])
+            - int(non_focused["fixed_v1_outliers"])
+        )
+        all_gate_threshold = float(all_gate["threshold"])
+        return (
+            (
+                f"Map-cleanup qualification: {status} {thresholds_met}/{gate_count} · "
+                "focused cleanup and safeguards are reported separately."
+            ),
+            (
+                "Focused anisotropic + subsurface quiet outliers: "
+                f"{fraction(focused['fixed_v1_outlier_fraction'])} → "
+                f"{fraction(focused['adaptive_v1_outlier_fraction'])} · "
+                f"{relative_change_label(focused['relative_reduction_fraction'])}"
+            ),
+            (
+                "All-map quiet outliers: "
+                f"{fraction(all_maps['fixed_v1_outlier_fraction'])} → "
+                f"{fraction(all_maps['adaptive_v1_outlier_fraction'])} · "
+                f"{100.0 * all_gate_threshold:.0f}% gate "
+                f"{'met' if all_gate['meets_threshold'] else 'MISS'}"
+            ),
+            (
+                "Non-focused maps: "
+                f"{fraction(non_focused['fixed_v1_outlier_fraction'])} → "
+                f"{fraction(non_focused['adaptive_v1_outlier_fraction'])} · "
+                f"{non_focused['direction']} {nonfocused_delta:+d} outliers"
+            ),
+            (
+                "Safeguards: 3–8 px amplitude retained "
+                f"{100.0 * float(band_ratio):.2f}% · edge ratio "
+                f"{100.0 * float(edge_gate['observed_minimum']):.1f}–"
+                f"{100.0 * float(edge_gate['observed_maximum']):.1f}%"
+            ),
+            relighting_line,
+            (
+                "Scope: focused-map change does not mean every material "
+                "map or the reconstruction improves."
+            ),
+        )
     return (
         (
             f"Map-cleanup qualification: {status} {thresholds_met}/{gate_count} · "
@@ -6799,7 +7639,16 @@ def _write_overview(
 ) -> None:
     width = 1800
     header_height = 537
-    hero_maps = ("roughness", "specular", "subsurface", "anisotropic")
+    frequency_cleanup = summary.get("frequency_cleanup")
+    adaptive_evidence = (
+        frequency_cleanup.get("adaptive_cleanup_evidence")
+        if isinstance(frequency_cleanup, dict)
+        else None
+    )
+    if isinstance(adaptive_evidence, dict):
+        hero_maps = ("anisotropic", "subsurface", "roughness", "specular")
+    else:
+        hero_maps = ("roughness", "specular", "subsurface", "anisotropic")
     material_left = OVERVIEW_MATERIAL_LEFT
     material_tile_width = 170
     with Image.open(
@@ -6824,7 +7673,6 @@ def _write_overview(
     impulse_cleanup = summary.get("impulse_cleanup")
     impulse_profile_cleanup = None
     impulse_artifact = None
-    frequency_cleanup = summary.get("frequency_cleanup")
     frequency_profile_cleanup = None
     if (
         isinstance(impulse_cleanup, dict)
@@ -6856,7 +7704,11 @@ def _write_overview(
         if not isinstance(detail_profile, str) or detail_profile not in profiles:
             raise ValueError("frequency overview profile is invalid")
         frequency_profile_cleanup = frequency_cleanup["profiles"][detail_profile]
-        detail_maps = ("subsurface", "specular")
+        detail_maps = (
+            tuple(FREQUENCY_ADAPTIVE_FOCUSED_MAPS)
+            if isinstance(adaptive_evidence, dict)
+            else ("subsurface", "specular")
+        )
     else:
         ranked_detail_maps = sorted(
             (
@@ -6895,15 +7747,28 @@ def _write_overview(
                 f"{cleanup_map['exported_change_outside_own_flags']['maximum_absolute']:.6f}"
             )
         elif frequency_profile_cleanup is not None:
-            cleanup_map = frequency_profile_cleanup["maps"][map_name]
-            count_labels = frequency_profile_cleanup.get(
-                "annotation_labels",
-                {"updated": "updates", "consensus": "consensus"},
-            )
-            detail_captions.append(
-                f"{count_labels['updated']} {cleanup_map['updated_entries']}\n"
-                f"{count_labels['consensus']} {cleanup_map['consensus_entries']}"
-            )
+            if isinstance(adaptive_evidence, dict):
+                full = adaptive_evidence["profiles"][detail_profile]["maps"][
+                    map_name
+                ]
+                crop = adaptive_evidence["crops"][map_name]["profiles"][
+                    detail_profile
+                ]
+                detail_captions.append(
+                    f"full {100.0 * full['fixed_v1_outlier_fraction']:.2f}% → "
+                    f"{100.0 * full['adaptive_v1_outlier_fraction']:.2f}%\n"
+                    f"crop removed {crop['removed']} · introduced {crop['introduced']}"
+                )
+            else:
+                cleanup_map = frequency_profile_cleanup["maps"][map_name]
+                count_labels = frequency_profile_cleanup.get(
+                    "annotation_labels",
+                    {"updated": "updates", "consensus": "consensus"},
+                )
+                detail_captions.append(
+                    f"{count_labels['updated']} {cleanup_map['updated_entries']}\n"
+                    f"{count_labels['consensus']} {cleanup_map['consensus_entries']}"
+                )
         else:
             detail_captions.append(
                 "gradient magnitude ratio "
@@ -6950,15 +7815,41 @@ def _write_overview(
     draw = ImageDraw.Draw(canvas)
     draw.text((36, 24), summary["title"], font=_font(58, bold=True), fill="white")
     contract = summary["comparison_contract"]
-    draw.text(
-        (42, 92),
-        (
+    if contract.get("active_frequency_upgrade"):
+        baseline_weight = float(contract["baseline_tv_weight"])
+        regularized_weight = float(contract["regularized_tv_weight"])
+        weight_text = (
+            f"λ={baseline_weight:g} both"
+            if math.isclose(
+                baseline_weight,
+                regularized_weight,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+            else f"λ={baseline_weight:g} → {regularized_weight:g}"
+        )
+        contract_text = (
+            "Controlled A/B · fixed frequency consensus v1 → Adaptive v1 · "
+            f"{weight_text}"
+        )
+    else:
+        contract_text = (
             "Controlled A/B · "
             f"{_display_regularizer(contract['regularization_kind'])} λ "
             f"{contract['baseline_tv_weight']:g} → "
             f"{contract['regularized_tv_weight']:g}"
+        )
+    draw.text(
+        (42, 92),
+        contract_text,
+        font=_font_for_width(
+            draw,
+            contract_text,
+            max_width=width - 84,
+            preferred_size=30,
+            minimum_size=24,
+            bold=True,
         ),
-        font=_font(30, bold=True),
         fill=(151, 205, 255),
     )
     spatial = summary["aggregate_map_spatial_statistics"]
@@ -7052,6 +7943,11 @@ def _write_overview(
             _frequency_overview_headlines(
                 gate_report,
                 relighting_line,
+                adaptive_evidence=(
+                    adaptive_evidence
+                    if isinstance(adaptive_evidence, dict)
+                    else None
+                ),
             )
         )
     else:
@@ -7076,16 +7972,28 @@ def _write_overview(
             scope_line,
         ]
     for index, line in enumerate(lines):
+        line_font = _font_for_width(
+            draw,
+            line,
+            max_width=width - 84,
+            preferred_size=27,
+            minimum_size=22,
+            bold=True,
+        )
         draw.text(
             (42, 140 + index * 52),
             line,
-            font=_font(27, bold=True),
+            font=line_font,
             fill="white",
         )
 
     draw.text(
         (36, material_top + 10),
-        "Material maps · baseline and regularized side by side",
+        (
+            "Material maps · Fixed v1 and Adaptive v1 side by side"
+            if isinstance(adaptive_evidence, dict)
+            else "Material maps · baseline and regularized side by side"
+        ),
         font=_font(43, bold=True),
         fill="white",
     )
@@ -7098,7 +8006,12 @@ def _write_overview(
             _font(27, bold=True),
             "white",
         )
-        for variant_index, variant_label in enumerate(("Baseline", "Regularized")):
+        variant_labels = (
+            ("Fixed v1", "Adaptive v1")
+            if isinstance(adaptive_evidence, dict)
+            else ("Baseline", "Regularized")
+        )
+        for variant_index, variant_label in enumerate(variant_labels):
             _draw_centered_text(
                 draw,
                 (
@@ -7226,11 +8139,18 @@ def _write_overview(
         fill="white",
     )
     if frequency_profile_cleanup is not None:
-        detail_description = (
-            "Fixed 96×96 crop x=96:192, y=160:256 enlarged 2× with "
-            "nearest-neighbor (1 source pixel = 2×2 display pixels).\n"
-            "Native 1:1 crop and full-map audit sheets remain separate."
-        )
+        if isinstance(adaptive_evidence, dict):
+            detail_description = (
+                "Focused-map 96×96 crops are selected across all profiles by "
+                "net removed → removed → fewest introduced → quiet support → top/left.\n"
+                "Algorithmic shared crops; no manual cherry-picking. See material/adaptive_cleanup_evidence.png."
+            )
+        else:
+            detail_description = (
+                "Fixed 96×96 crop x=96:192, y=160:256 enlarged 2× with "
+                "nearest-neighbor (1 source pixel = 2×2 display pixels).\n"
+                "Native 1:1 crop and full-map audit sheets remain separate."
+            )
     elif impulse_artifact is not None:
         detail_description = (
             f"Each {detail_source_size}×{detail_source_size} native crop is "
@@ -7274,7 +8194,11 @@ def _write_overview(
             width=2,
         )
         if frequency_profile_cleanup is not None:
-            crop_box = FREQUENCY_DETAIL_CROP_BOX
+            crop_box = (
+                tuple(adaptive_evidence["crops"][map_name]["crop_box_xyxy"])
+                if isinstance(adaptive_evidence, dict)
+                else FREQUENCY_DETAIL_CROP_BOX
+            )
         elif impulse_artifact is not None:
             crop_box = _densest_flagged_crop_box(
                 impulse_artifact["maps"][map_name]["mask"],
@@ -7307,7 +8231,11 @@ def _write_overview(
             width=2,
         )
         for variant_index, (variant_label, camera) in enumerate(
-            (("Baseline", baseline_camera), ("Regularized", regularized_camera))
+            (
+                (("Fixed v1", baseline_camera), ("Adaptive v1", regularized_camera))
+                if isinstance(adaptive_evidence, dict)
+                else (("Baseline", baseline_camera), ("Regularized", regularized_camera))
+            )
         ):
             slot_x, _, slot_width, _ = group["variant_slots"][variant_index]
             image_x, _, _, _ = group["image_boxes"][variant_index]
@@ -7586,6 +8514,7 @@ def _validate_report(
     profiles: Sequence[str],
     *,
     require_frequency_detail: bool = False,
+    require_adaptive_cleanup_evidence: bool = False,
 ) -> None:
     required = [stage / "overview.png", stage / "summary.json", stage / "metrics.csv"]
     required.extend(stage / "material" / f"{profile}.png" for profile in profiles)
@@ -7600,9 +8529,60 @@ def _validate_report(
                 stage / "material" / "frequency_fullmaps_1to1.png",
             )
         )
+    if require_adaptive_cleanup_evidence:
+        evidence_path = stage / "material" / "adaptive_cleanup_evidence.png"
+        required.append(evidence_path)
+        summary = json.loads((stage / "summary.json").read_text(encoding="utf-8"))
+        cleanup = summary.get("frequency_cleanup")
+        evidence = (
+            cleanup.get("adaptive_cleanup_evidence")
+            if isinstance(cleanup, dict)
+            else None
+        )
+        artifact = (
+            summary.get("artifacts", {})
+            .get("frequency_diagnostics", {})
+            .get("adaptive_cleanup_evidence")
+        )
+        if (
+            not isinstance(evidence, dict)
+            or evidence.get("schema") != FREQUENCY_ADAPTIVE_EVIDENCE_SCHEMA
+            or evidence.get("available") is not True
+            or artifact != "material/adaptive_cleanup_evidence.png"
+        ):
+            raise RuntimeError(
+                "adaptive cleanup report metadata is incomplete or inconsistent"
+            )
     missing = [str(path) for path in required if not path.is_file()]
     if missing:
         raise RuntimeError(f"regularization report is incomplete: {missing}")
+    if require_adaptive_cleanup_evidence:
+        with Image.open(stage / "material" / "adaptive_cleanup_evidence.png") as image:
+            expected_width = (
+                350
+                + 5
+                * FREQUENCY_ADAPTIVE_EVIDENCE_CROP_SIZE
+                * FREQUENCY_ADAPTIVE_EVIDENCE_SCALE
+                + 40
+            )
+            expected_height = 430 + len(FREQUENCY_ADAPTIVE_FOCUSED_MAPS) * (
+                130
+                + 64
+                + len(profiles)
+                * (
+                    FREQUENCY_ADAPTIVE_EVIDENCE_CROP_SIZE
+                    * FREQUENCY_ADAPTIVE_EVIDENCE_SCALE
+                    + 26
+                )
+                + 28
+            ) + 164
+            if image.mode != "RGB" or image.size != (
+                expected_width,
+                expected_height,
+            ):
+                raise RuntimeError(
+                    "adaptive cleanup evidence sheet has an invalid image contract"
+                )
 
 
 if __name__ == "__main__":

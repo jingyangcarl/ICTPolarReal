@@ -165,6 +165,32 @@ def test_overview_pixel_detail_cards_keep_labels_and_captions_separate():
     assert first["caption_bounds"][2] < second["caption_bounds"][0]
 
 
+def test_adaptive_cleanup_crop_selector_uses_auditable_lexicographic_rule():
+    removed = np.zeros((12, 12), dtype=bool)
+    introduced = np.zeros_like(removed)
+    quiet = np.zeros_like(removed)
+    # Crop A has six removed and one introduced (net five). Crop B has five
+    # removed and none introduced (also net five), so removed count selects A.
+    for y, x in ((1, 1), (1, 2), (1, 3), (2, 1), (2, 3), (3, 2)):
+        removed[y, x] = True
+    introduced[2, 2] = True
+    for y, x in ((7, 7), (7, 8), (7, 9), (8, 7), (8, 8)):
+        removed[y, x] = True
+    quiet[:] = True
+
+    selected = compare_regularization._select_adaptive_cleanup_crop(
+        [removed], [introduced], [quiet], crop_size=3
+    )
+
+    assert selected["crop_box_xyxy"] == [1, 1, 4, 4]
+    assert selected["aggregate_net_removed"] == 5
+    assert selected["aggregate_removed"] == 6
+    assert selected["aggregate_introduced"] == 1
+    assert selected["aggregate_quiet_pixels"] == 9
+    assert selected["manual_selection"] is False
+    assert selected["selection_rule"].startswith("maximize aggregate net removed")
+
+
 def test_hdri_thumbnail_contain_fit_preserves_aspect_and_centers_bars():
     source = Image.new("RGB", (12, 4), (240, 20, 10))
 
@@ -2261,6 +2287,7 @@ def test_compose_frequency_report_validates_writer_artifact_gates_and_native_pan
     ]
     cleanup = summary["frequency_cleanup"]
     assert cleanup["available"] is True
+    assert "adaptive_cleanup_evidence" not in cleanup
     assert cleanup["aggregate"]["updated"]["map_entries"] > 0
     assert cleanup["profiles"]["olat"]["artifact"]["validated"] is True
     assert cleanup["profiles"]["olat"]["evaluation_guard"]["validated"] is True
@@ -2321,6 +2348,7 @@ def test_compose_frequency_report_validates_writer_artifact_gates_and_native_pan
     fullmaps = report / "material" / "frequency_fullmaps_1to1.png"
     assert hotspot.is_file()
     assert fullmaps.is_file()
+    assert not (report / "material" / "adaptive_cleanup_evidence.png").exists()
     with Image.open(report / "evaluation" / "olat.png") as sheet:
         assert sheet.size == (1360, 1976)
     with Image.open(report / "evaluation" / "hdri.png") as sheet:
@@ -2681,6 +2709,39 @@ def test_compose_active_frequency_to_adaptive_report_validates_schema_and_keeps_
     assert cleanup["profiles"]["olat"]["consensus"][
         "map_entries"
     ] == expected_incremental_strong_changed
+    evidence = cleanup["adaptive_cleanup_evidence"]
+    assert evidence["schema"] == (
+        compare_regularization.FREQUENCY_ADAPTIVE_EVIDENCE_SCHEMA
+    )
+    assert evidence["focused_maps"] == list(
+        compare_regularization.FREQUENCY_ADAPTIVE_FOCUSED_MAPS
+    )
+    assert evidence["definition"]["threshold_operator"] == ">"
+    assert evidence["definition"]["outlier"] == (
+        "abs(map - own median5_nearest) > 0.05"
+    )
+    assert evidence["presentation"]["manual_selection"] is False
+    for map_name in compare_regularization.FREQUENCY_ADAPTIVE_FOCUSED_MAPS:
+        selected = evidence["crops"][map_name]
+        left, top, right, bottom = selected["crop_box_xyxy"]
+        assert right - left == 96
+        assert bottom - top == 96
+        assert selected["manual_selection"] is False
+        crop_counts = selected["profiles"]["olat"]
+        assert crop_counts["fixed_v1_outliers"] == (
+            crop_counts["removed"] + crop_counts["persistent"]
+        )
+        assert crop_counts["adaptive_v1_outliers"] == (
+            crop_counts["introduced"] + crop_counts["persistent"]
+        )
+    for map_name, counts in evidence["profiles"]["olat"]["maps"].items():
+        assert map_name in compare_regularization.SCALAR_MAPS
+        assert counts["fixed_v1_outliers"] == (
+            counts["removed"] + counts["persistent"]
+        )
+        assert counts["adaptive_v1_outliers"] == (
+            counts["introduced"] + counts["persistent"]
+        )
     assert summary["scalar_map_cleanup_qualification"][
         "qualification_status"
     ] == "FAIL"
@@ -2688,6 +2749,16 @@ def test_compose_active_frequency_to_adaptive_report_validates_schema_and_keeps_
     assert (
         tmp_path / "comparison" / "material" / "frequency_hotspot_1to1.png"
     ).is_file()
+    evidence_path = (
+        tmp_path / "comparison" / "material" / "adaptive_cleanup_evidence.png"
+    )
+    assert evidence_path.is_file()
+    assert summary["artifacts"]["frequency_diagnostics"][
+        "adaptive_cleanup_evidence"
+    ] == "material/adaptive_cleanup_evidence.png"
+    with Image.open(evidence_path) as sheet:
+        assert sheet.mode == "RGB"
+        assert sheet.size == (1830, 1666)
 
     acquisition_path = candidate / "material" / "olat" / "acquisition.json"
     acquisition = json.loads(acquisition_path.read_text(encoding="utf-8"))
