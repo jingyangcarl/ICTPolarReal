@@ -49,6 +49,16 @@ FREQUENCY_FROZEN_ARTIFACT_SCHEMA = (
     "ictpolarreal.frequency-frozen-artifact.v1"
 )
 FREQUENCY_FROZEN_ARTIFACT_NAME = "frequency_consensus_frozen.npz"
+FREQUENCY_BUNDLE_SCHEMA = "ictpolarreal.frequency-consensus-bundle.v1"
+FREQUENCY_ADAPTIVE_BUNDLE_SCHEMA = (
+    "ictpolarreal.frequency-consensus-adaptive-bundle.v1"
+)
+FREQUENCY_ADAPTIVE_CONSENSUS_ENTRY_SEMANTICS = (
+    "strong_policy_eligible_and_final_target_differs_from_source"
+)
+FREQUENCY_DIAGNOSTIC_SCHEMA = (
+    "ictpolarreal.frequency-consensus-diagnostic.v1"
+)
 FREQUENCY_DETAIL_CROP_BOX = (96, 160, 192, 256)
 FREQUENCY_DETAIL_MAPS = (
     "subsurface",
@@ -75,6 +85,11 @@ FREQUENCY_ALBEDO_SIGMA = 0.05
 FREQUENCY_NORMAL_SIGMA = 0.02
 FREQUENCY_EDGE_PERCENTILE = 80.0
 FREQUENCY_GUIDE_BAND_THRESHOLD = 0.35
+FREQUENCY_ADAPTIVE_STRONG_MEDIAN3_WEIGHT = 0.50
+FREQUENCY_ADAPTIVE_STRONG_MEDIAN7_WEIGHT = 0.50
+FREQUENCY_ADAPTIVE_HALO_V1_BLEND = 0.84
+FREQUENCY_ADAPTIVE_FOCUSED_MAPS = ("anisotropic", "subsurface")
+FREQUENCY_ADAPTIVE_GUIDE_SCALE_PERCENTILE = 90.0
 FREQUENCY_EVALUATION_GUARD_SCHEMA = (
     "ictpolarreal.frequency-consensus-evaluation-guard.v1"
 )
@@ -124,6 +139,10 @@ _FREQUENCY_ADAPTER = (
     "ictpolarreal.profile-acquisition-adapter.v7",
     "ictpolarreal-frequency-consensus-v1",
 )
+_FREQUENCY_ADAPTIVE_ADAPTER = (
+    "ictpolarreal.profile-acquisition-adapter.v7",
+    "ictpolarreal-frequency-consensus-adaptive-v1",
+)
 _LEGACY_IDENTITY = (_LEGACY_CHECKPOINT_SCHEMA, _LEGACY_ADAPTER)
 _EDGE_IDENTITY = (_EDGE_CHECKPOINT_SCHEMA, _EDGE_ADAPTER)
 _STAGED_IMPULSE_IDENTITY = (
@@ -142,6 +161,10 @@ _FREQUENCY_IDENTITY = (
     _FREQUENCY_CHECKPOINT_SCHEMA,
     _FREQUENCY_ADAPTER,
 )
+_FREQUENCY_ADAPTIVE_IDENTITY = (
+    _FREQUENCY_CHECKPOINT_SCHEMA,
+    _FREQUENCY_ADAPTIVE_ADAPTER,
+)
 _SUPPORTED_REGULARIZERS_BY_IDENTITY = {
     _LEGACY_IDENTITY: frozenset({"l1"}),
     _EDGE_IDENTITY: frozenset({"l1", "edge-charbonnier"}),
@@ -156,6 +179,14 @@ _SUPPORTED_REGULARIZERS_BY_IDENTITY = {
     ),
     _FREQUENCY_IDENTITY: frozenset(
         {"l1", "edge-charbonnier", "impulse-median", "frequency-consensus"}
+    ),
+    _FREQUENCY_ADAPTIVE_IDENTITY: frozenset(
+        {"frequency-consensus-adaptive"}
+    ),
+}
+_ACTIVE_REGULARIZER_TRANSITIONS = {
+    (_FREQUENCY_IDENTITY, _FREQUENCY_ADAPTIVE_IDENTITY): (
+        "active-frequency-v1-to-adaptive-v1"
     ),
 }
 _ZERO_WEIGHT_TRANSITIONS = {
@@ -278,7 +309,11 @@ def compose_regularization_comparison(
         "baseline": (
             "Baseline · regularizer inactive (λ=0)"
             if baseline_weight == 0.0
-            else f"Baseline · λ={baseline_weight:g}"
+            else (
+                "Baseline · "
+                f"{_display_regularizer(contract['baseline_regularization_kind'])} "
+                f"λ={baseline_weight:g}"
+            )
         ),
         "regularized": (
             f"Regularized · {_display_regularizer(contract['regularization_kind'])} "
@@ -581,12 +616,27 @@ def _validate_comparison_contract(
     ) = configurations["regularized"]
     if baseline_parameters != regularized_parameters:
         raise ValueError("baseline and regularized runs regularize different maps")
-    if baseline_weight == regularized_weight:
+    active_frequency_upgrade = (
+        baseline_kind == "frequency-consensus"
+        and regularized_kind == "frequency-consensus-adaptive"
+        and baseline_weight > 0.0
+        and regularized_weight > 0.0
+    )
+    if active_frequency_upgrade:
+        if baseline_weight != regularized_weight:
+            raise ValueError(
+                "active frequency-consensus comparison requires equal weights"
+            )
+        if baseline_stage_plan != regularized_stage_plan:
+            raise ValueError(
+                "active frequency-consensus comparison requires an equal stage plan"
+            )
+    elif baseline_weight == regularized_weight:
         raise ValueError(
             "baseline and regularized runs use the same regularization weight"
         )
     baseline_regularizer_inactive = baseline_weight == 0.0
-    if not baseline_regularizer_inactive and (
+    if not baseline_regularizer_inactive and not active_frequency_upgrade and (
         baseline_kind,
         baseline_settings,
         baseline_stage_plan,
@@ -608,8 +658,16 @@ def _validate_comparison_contract(
             baseline,
             regularized,
             allow_legacy_transition=baseline_regularizer_inactive,
+            allow_active_frequency_transition=active_frequency_upgrade,
         )
         transition_modes.add(transition)
+        if active_frequency_upgrade and transition != (
+            "active-frequency-v1-to-adaptive-v1"
+        ):
+            raise ValueError(
+                "active frequency-consensus comparison requires the known "
+                "v1-to-adaptive-v1 adapter transition"
+            )
         if baseline_regularizer_inactive and regularizer_configuration_variable:
             _validate_variable_regularizer_transition(
                 baseline,
@@ -621,11 +679,13 @@ def _validate_comparison_contract(
         baseline_signature = _normalized_comparison_signature(
             baseline,
             variable_regularizer=baseline_regularizer_inactive,
+            active_frequency_upgrade=active_frequency_upgrade,
             transition=transition,
         )
         regularized_signature = _normalized_comparison_signature(
             regularized,
             variable_regularizer=baseline_regularizer_inactive,
+            active_frequency_upgrade=active_frequency_upgrade,
             transition=transition,
         )
         if baseline_signature != regularized_signature:
@@ -654,7 +714,12 @@ def _validate_comparison_contract(
             "active scalar-map regularizer kind/settings/stage plan/weight; the "
             "baseline regularizer has zero weight"
             if baseline_regularizer_inactive
-            else "scalar-map regularization weight λ"
+            else (
+                "post-fit target-selection policy at equal regularization weight; "
+                "the full data fit and stage plan are matched"
+                if active_frequency_upgrade
+                else "scalar-map regularization weight λ"
+            )
         ),
         "base_color_source": "dataset_albedo",
         "baseline_regularization_kind": baseline_kind,
@@ -663,6 +728,14 @@ def _validate_comparison_contract(
         "baseline_tv_weight": baseline_weight,
         "regularized_tv_weight": regularized_weight,
         "baseline_regularizer_inactive": baseline_regularizer_inactive,
+        "active_frequency_upgrade": active_frequency_upgrade,
+        "comparison_mode": (
+            "frequency-consensus-v1-to-adaptive-v1"
+            if active_frequency_upgrade
+            else "zero-weight-to-active"
+            if baseline_regularizer_inactive
+            else "regularization-weight"
+        ),
         "regularizer_configuration_variable": regularizer_configuration_variable,
         "regularized_settings": json.loads(regularized_settings),
         "regularized_stage_plan": json.loads(regularized_stage_plan),
@@ -735,6 +808,7 @@ def _canonical_regularization_kind(kind: str) -> str:
         "edge-charbonnier": "edge-charbonnier",
         "impulse-median": "impulse-median",
         "frequency-consensus": "frequency-consensus",
+        "frequency-consensus-adaptive": "frequency-consensus-adaptive",
     }.get(kind, kind)
 
 
@@ -743,6 +817,7 @@ def _comparison_signature_transition(
     regularized: dict[str, Any],
     *,
     allow_legacy_transition: bool,
+    allow_active_frequency_transition: bool = False,
 ) -> str:
     baseline_signature = baseline.get("checkpoint_signature")
     regularized_signature = regularized.get("checkpoint_signature")
@@ -765,6 +840,11 @@ def _comparison_signature_transition(
         (baseline_identity, regularized_identity)
     )
     if allow_legacy_transition and transition is not None:
+        return transition
+    transition = _ACTIVE_REGULARIZER_TRANSITIONS.get(
+        (baseline_identity, regularized_identity)
+    )
+    if allow_active_frequency_transition and transition is not None:
         return transition
     raise ValueError(
         "comparison is not controlled; checkpoint signatures use an unsupported "
@@ -845,6 +925,7 @@ def _normalized_comparison_signature(
     acquisition: dict[str, Any],
     *,
     variable_regularizer: bool = False,
+    active_frequency_upgrade: bool = False,
     transition: str = "exact-schema",
 ) -> dict[str, Any]:
     signature = acquisition.get("checkpoint_signature")
@@ -863,6 +944,9 @@ def _normalized_comparison_signature(
         regularization["kind"] = "<active-regularizer-variable>"
         regularization.pop("settings", None)
         regularization.pop("stage_plan", None)
+    elif active_frequency_upgrade:
+        regularization["kind"] = "<frequency-consensus-policy-variable>"
+        regularization.pop("settings", None)
     if transition != "exact-schema":
         normalized["schema"] = "<compatible-regularizer-schema>"
         adapter = normalized.get("adapter")
@@ -1584,10 +1668,22 @@ def _load_frequency_frozen_artifact(
     if not isinstance(stage_plan, dict) or stage_plan.get("enabled") is not True:
         raise ValueError("frequency candidate does not record an enabled stage plan")
     frozen_bundle = regularization.get("frozen_bundle")
+    expected_bundle_schema = (
+        FREQUENCY_ADAPTIVE_BUNDLE_SCHEMA
+        if regularization.get("kind") == "frequency-consensus-adaptive"
+        else FREQUENCY_BUNDLE_SCHEMA
+    )
     if not isinstance(frozen_bundle, dict) or frozen_bundle.get("schema") != (
-        "ictpolarreal.frequency-consensus-bundle.v1"
+        expected_bundle_schema
     ):
         raise ValueError("frequency candidate is missing frozen-bundle provenance")
+    if expected_bundle_schema == FREQUENCY_ADAPTIVE_BUNDLE_SCHEMA:
+        return _load_frequency_adaptive_frozen_artifact(
+            material_dir,
+            regularization,
+            frozen_bundle,
+            expected_shape,
+        )
     artifact = frozen_bundle.get("artifact")
     if not isinstance(artifact, dict):
         raise ValueError("frequency candidate is missing frozen-artifact provenance")
@@ -1915,6 +2011,7 @@ def _load_frequency_frozen_artifact(
     ):
         raise ValueError("frequency frozen total entry counts do not match artifact")
     return {
+        "bundle_schema": FREQUENCY_BUNDLE_SCHEMA,
         "path": artifact_path,
         "sha256": actual_file_hash,
         "bytes": expected_bytes,
@@ -1923,6 +2020,439 @@ def _load_frequency_frozen_artifact(
         "median_chunk_rows": dict(median_chunk_rows),
         "edge_threshold_full_precision": float(edge_threshold_full),
         "edge_threshold_png_quantized": float(edge_threshold_png),
+        **roots,
+        "maps": maps,
+        "total_updated_entries": total_updated,
+        "total_consensus_entries": total_consensus,
+    }
+
+
+def _load_frequency_adaptive_frozen_artifact(
+    material_dir: Path,
+    regularization: dict[str, Any],
+    frozen_bundle: dict[str, Any],
+    expected_shape: tuple[int, int],
+) -> dict[str, Any]:
+    stage_plan = regularization["stage_plan"]
+    artifact = frozen_bundle.get("artifact")
+    if not isinstance(artifact, dict):
+        raise ValueError("adaptive frequency candidate is missing frozen artifact")
+    if artifact.get("schema") != FREQUENCY_FROZEN_ARTIFACT_SCHEMA:
+        raise ValueError("adaptive frequency frozen artifact has unsupported schema")
+    if artifact.get("format") != "numpy_npz_compressed":
+        raise ValueError("adaptive frequency frozen artifact has unsupported format")
+    relative_path = artifact.get("path")
+    if relative_path != FREQUENCY_FROZEN_ARTIFACT_NAME:
+        raise ValueError("adaptive frequency artifact path is not canonical")
+    relative = Path(relative_path)
+    if relative.is_absolute() or len(relative.parts) != 1:
+        raise ValueError("adaptive frequency artifact path must be a filename")
+    artifact_path = (material_dir / relative).resolve()
+    if artifact_path.parent != material_dir.resolve():
+        raise ValueError("adaptive frequency artifact path escapes its material folder")
+    if not artifact_path.is_file():
+        raise FileNotFoundError(
+            f"adaptive frequency frozen artifact is missing: {artifact_path}"
+        )
+    expected_bytes = artifact.get("bytes")
+    if (
+        not isinstance(expected_bytes, int)
+        or isinstance(expected_bytes, bool)
+        or expected_bytes <= 0
+        or artifact_path.stat().st_size != expected_bytes
+    ):
+        raise ValueError("adaptive frequency artifact byte size differs from provenance")
+    actual_file_hash = _file_sha256(artifact_path)
+    if (
+        not isinstance(artifact.get("sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", artifact["sha256"])
+        or artifact["sha256"] != actual_file_hash
+    ):
+        raise ValueError("adaptive frequency artifact SHA-256 differs from provenance")
+
+    root_names = (
+        "fit_foreground",
+        "full_foreground5",
+        "edge_protected_full_precision",
+        "edge_protected_png_quantized",
+        "edge_protected",
+        "update_safe",
+        "guide_texture_full_precision",
+        "guide_texture_png_quantized",
+        "guide_texture_core",
+        "guide_texture_halo",
+    )
+    float_names = (
+        "source",
+        "median3",
+        "median7",
+        "fixed_target",
+        "policy_target",
+        "target",
+    )
+    mask_names = ("mask", "consensus_mask")
+    expected_keys = {"metadata", *root_names}
+    for map_name in SCALAR_MAPS:
+        expected_keys.update(
+            f"{map_name}__{name}" for name in (*float_names, *mask_names)
+        )
+    try:
+        with np.load(artifact_path, allow_pickle=False) as payload:
+            if set(payload.files) != expected_keys:
+                raise ValueError(
+                    "adaptive frequency frozen artifact has an unexpected array set"
+                )
+            metadata_array = payload["metadata"]
+            if metadata_array.shape != ():
+                raise ValueError(
+                    "adaptive frequency frozen artifact metadata must be scalar"
+                )
+            try:
+                metadata = json.loads(str(metadata_array.item()))
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "adaptive frequency frozen artifact metadata is invalid"
+                ) from exc
+            roots = {
+                name: np.array(payload[name], copy=True) for name in root_names
+            }
+            maps = {
+                map_name: {
+                    name: np.array(payload[f"{map_name}__{name}"], copy=True)
+                    for name in (*float_names, *mask_names)
+                }
+                for map_name in SCALAR_MAPS
+            }
+    except (OSError, ValueError) as exc:
+        if isinstance(exc, ValueError) and str(exc).startswith(
+            "adaptive frequency"
+        ):
+            raise
+        raise ValueError(
+            f"could not read adaptive frequency frozen artifact: {exc}"
+        ) from exc
+
+    created_after_step = frozen_bundle.get("created_after_step")
+    strength = frozen_bundle.get("strength")
+    median_chunk_rows = frozen_bundle.get("median_chunk_rows")
+    edge_threshold_full = frozen_bundle.get("edge_threshold_full_precision")
+    edge_threshold_png = frozen_bundle.get("edge_threshold_png_quantized")
+    guide_scales = frozen_bundle.get("guide_texture", {}).get("scales")
+    metadata_maps = metadata.get("maps") if isinstance(metadata, dict) else None
+    if frozen_bundle.get("consensus_entry_semantics") != (
+        FREQUENCY_ADAPTIVE_CONSENSUS_ENTRY_SEMANTICS
+    ):
+        raise ValueError(
+            "adaptive frequency frozen-bundle consensus semantics are invalid"
+        )
+    if not isinstance(metadata, dict) or metadata.get(
+        "consensus_entry_semantics"
+    ) != FREQUENCY_ADAPTIVE_CONSENSUS_ENTRY_SEMANTICS:
+        raise ValueError(
+            "adaptive frequency artifact metadata consensus semantics are invalid"
+        )
+    if (
+        not isinstance(metadata, dict)
+        or metadata.get("schema") != FREQUENCY_FROZEN_ARTIFACT_SCHEMA
+        or metadata.get("bundle_schema") != FREQUENCY_ADAPTIVE_BUNDLE_SCHEMA
+        or metadata.get("created_after_step") != created_after_step
+        or metadata.get("strength") != strength
+        or metadata.get("median_chunk_rows") != median_chunk_rows
+        or metadata.get("edge_threshold_full_precision") != edge_threshold_full
+        or metadata.get("edge_threshold_png_quantized") != edge_threshold_png
+        or metadata.get("guide_texture_scales") != guide_scales
+        or not isinstance(metadata_maps, list)
+        or len(metadata_maps) != len(set(metadata_maps))
+        or set(metadata_maps) != set(SCALAR_MAPS)
+    ):
+        raise ValueError(
+            "adaptive frequency artifact metadata differs from acquisition provenance"
+        )
+    if (
+        not isinstance(created_after_step, int)
+        or isinstance(created_after_step, bool)
+        or stage_plan.get("detector_after_data_step") != created_after_step
+    ):
+        raise ValueError("adaptive frequency artifact has a stale stage boundary")
+    if (
+        not isinstance(strength, (int, float))
+        or isinstance(strength, bool)
+        or not math.isfinite(float(strength))
+        or not 0.0 < float(strength) <= 1.0
+        or stage_plan.get("strength") != strength
+    ):
+        raise ValueError("adaptive frequency artifact has invalid strength provenance")
+    if (
+        not isinstance(median_chunk_rows, dict)
+        or set(median_chunk_rows) != {"3x3", "7x7"}
+        or any(
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value <= 0
+            or value > expected_shape[0]
+            for value in median_chunk_rows.values()
+        )
+    ):
+        raise ValueError("adaptive frequency artifact has an invalid chunk plan")
+    for label, value in (
+        ("full-precision", edge_threshold_full),
+        ("PNG-quantized", edge_threshold_png),
+    ):
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+            or float(value) < 0.0
+        ):
+            raise ValueError(
+                f"adaptive frequency artifact has invalid {label} edge threshold"
+            )
+    expected_scale_keys = {
+        "full_precision_albedo_scale",
+        "full_precision_normal_scale",
+        "png_quantized_albedo_scale",
+        "png_quantized_normal_scale",
+    }
+    if (
+        not isinstance(guide_scales, dict)
+        or set(guide_scales) != expected_scale_keys
+        or any(
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+            or float(value) <= 0.0
+            for value in guide_scales.values()
+        )
+    ):
+        raise ValueError("adaptive frequency guide scales are invalid")
+
+    for name in root_names:
+        if roots[name].shape != expected_shape or roots[name].dtype != np.bool_:
+            raise ValueError(
+                f"adaptive frequency {name} must be bool {expected_shape}"
+            )
+    if not np.array_equal(
+        roots["full_foreground5"],
+        _erode_mask(roots["fit_foreground"], radius=2),
+    ):
+        raise ValueError("adaptive frequency full foreground is stale")
+    if not np.array_equal(
+        roots["edge_protected"],
+        roots["edge_protected_full_precision"]
+        | roots["edge_protected_png_quantized"],
+    ):
+        raise ValueError("adaptive frequency edge-protection union is stale")
+    if not np.array_equal(
+        roots["update_safe"],
+        roots["full_foreground5"] & ~roots["edge_protected"],
+    ):
+        raise ValueError("adaptive frequency update-safe mask is stale")
+    expected_core = (
+        roots["guide_texture_full_precision"]
+        | roots["guide_texture_png_quantized"]
+    )
+    if not np.array_equal(roots["guide_texture_core"], expected_core):
+        raise ValueError("adaptive frequency guide-texture core is stale")
+    if np.any(expected_core & ~roots["full_foreground5"]):
+        raise ValueError("adaptive frequency guide texture leaves the interior")
+    padded = np.pad(expected_core, 1, mode="constant", constant_values=False)
+    expected_halo = np.zeros(expected_shape, dtype=bool)
+    for row_offset in range(3):
+        for column_offset in range(3):
+            expected_halo |= padded[
+                row_offset : row_offset + expected_shape[0],
+                column_offset : column_offset + expected_shape[1],
+            ]
+    expected_halo &= roots["full_foreground5"]
+    if not np.array_equal(roots["guide_texture_halo"], expected_halo):
+        raise ValueError("adaptive frequency guide-texture halo is stale")
+
+    tensor_hashes = {
+        "root": {name: _array_sha256(roots[name]) for name in root_names},
+        "maps": {
+            map_name: {
+                name: _array_sha256(maps[map_name][name])
+                for name in (*float_names, *mask_names)
+            }
+            for map_name in SCALAR_MAPS
+        },
+    }
+    if (
+        metadata.get("tensor_hashes") != tensor_hashes
+        or frozen_bundle.get("tensor_hashes") != tensor_hashes
+    ):
+        raise ValueError(
+            "adaptive frequency frozen tensor hashes differ from artifact arrays"
+        )
+    root_provenance = {
+        "fit_foreground": "fit_foreground_sha256",
+        "edge_protected_full_precision": "edge_protected_full_precision_sha256",
+        "edge_protected_png_quantized": "edge_protected_png_quantized_sha256",
+        "edge_protected": "edge_protected_sha256",
+        "update_safe": "update_safe_sha256",
+    }
+    for name, provenance_name in root_provenance.items():
+        if frozen_bundle.get(provenance_name) != tensor_hashes["root"][name]:
+            raise ValueError(f"adaptive frequency {name} hash is stale")
+    guide_provenance = frozen_bundle.get("guide_texture")
+    guide_masks = (
+        guide_provenance.get("masks")
+        if isinstance(guide_provenance, dict)
+        else None
+    )
+    if (
+        not isinstance(guide_masks, dict)
+        or set(guide_masks) != set(root_names[-4:])
+    ):
+        raise ValueError("adaptive frequency guide-mask provenance is invalid")
+    for name in root_names[-4:]:
+        record = guide_masks[name]
+        if (
+            not isinstance(record, dict)
+            or record.get("pixels") != int(np.count_nonzero(roots[name]))
+            or record.get("sha256") != tensor_hashes["root"][name]
+        ):
+            raise ValueError(f"adaptive frequency {name} provenance is stale")
+
+    map_provenance = frozen_bundle.get("maps")
+    if not isinstance(map_provenance, dict) or set(map_provenance) != set(
+        SCALAR_MAPS
+    ):
+        raise ValueError("adaptive frequency map provenance is invalid")
+    total_updated = 0
+    total_consensus = 0
+    for map_name, arrays in maps.items():
+        for name in float_names:
+            values = arrays[name]
+            if values.shape != expected_shape or values.dtype != np.float32:
+                raise ValueError(
+                    f"adaptive frequency {name} {map_name} must be float32 "
+                    f"{expected_shape}"
+                )
+            if not np.all(np.isfinite(values)) or np.any(
+                (values < 0.0) | (values > 1.0)
+            ):
+                raise ValueError(
+                    f"adaptive frequency {name} {map_name} is outside [0,1]"
+                )
+        for name in mask_names:
+            values = arrays[name]
+            if values.shape != expected_shape or values.dtype != np.bool_:
+                raise ValueError(
+                    f"adaptive frequency {name} {map_name} must be bool "
+                    f"{expected_shape}"
+                )
+        provenance = map_provenance[map_name]
+        updated_count = int(np.count_nonzero(arrays["mask"]))
+        consensus_count = int(np.count_nonzero(arrays["consensus_mask"]))
+        if (
+            not isinstance(provenance, dict)
+            or provenance.get("updated_entries") != updated_count
+            or provenance.get("consensus_entries") != consensus_count
+        ):
+            raise ValueError(f"adaptive frequency {map_name} counts are stale")
+        for name in (*float_names, *mask_names):
+            if provenance.get(f"{name}_sha256") != tensor_hashes["maps"][
+                map_name
+            ][name]:
+                raise ValueError(
+                    f"adaptive frequency {name} {map_name} hash is stale"
+                )
+        total_updated += updated_count
+        total_consensus += consensus_count
+
+    v1_evidence = np.sum(
+        np.stack(
+            [
+                np.abs(maps[name]["source"] - maps[name]["median7"])
+                > FREQUENCY_EVIDENCE_THRESHOLD
+                for name in SCALAR_MAPS
+            ],
+            axis=0,
+        ),
+        axis=0,
+        dtype=np.int64,
+    )
+    for map_name, arrays in maps.items():
+        source = arrays["source"]
+        median3 = arrays["median3"]
+        median7 = arrays["median7"]
+        fixed_consensus = (
+            (v1_evidence >= FREQUENCY_MIN_EVIDENCE_MAPS)
+            & (np.abs(source - median7) > FREQUENCY_OWN_DEVIATION)
+            & roots["update_safe"]
+        )
+        fixed_base = source + FREQUENCY_BASE_BLEND * (median3 - source)
+        fixed_consensus_target = (
+            FREQUENCY_MEDIAN3_TARGET_WEIGHT * median3
+            + FREQUENCY_MEDIAN7_TARGET_WEIGHT * median7
+        )
+        fixed_desired = np.where(
+            fixed_consensus,
+            fixed_consensus_target,
+            fixed_base,
+        )
+        expected_fixed = np.where(
+            roots["update_safe"], fixed_desired, source
+        )
+        if not np.array_equal(arrays["fixed_target"], expected_fixed):
+            raise ValueError(f"adaptive frequency fixed v1 target is stale: {map_name}")
+        strong = (
+            FREQUENCY_ADAPTIVE_STRONG_MEDIAN3_WEIGHT * median3
+            + FREQUENCY_ADAPTIVE_STRONG_MEDIAN7_WEIGHT * median7
+        )
+        if map_name in FREQUENCY_ADAPTIVE_FOCUSED_MAPS:
+            expected_policy = np.where(
+                roots["guide_texture_core"], expected_fixed, strong
+            )
+            strong_policy_eligible = (
+                roots["update_safe"] & ~roots["guide_texture_core"]
+            )
+        else:
+            halo_target = source + FREQUENCY_ADAPTIVE_HALO_V1_BLEND * (
+                expected_fixed - source
+            )
+            expected_policy = np.where(
+                roots["guide_texture_halo"], halo_target, strong
+            )
+            strong_policy_eligible = (
+                roots["update_safe"] & ~roots["guide_texture_halo"]
+            )
+        expected_policy = np.where(
+            roots["update_safe"], expected_policy, source
+        )
+        expected_target = source + float(strength) * (expected_policy - source)
+        expected_consensus = strong_policy_eligible & (
+            expected_target != source
+        )
+        expected_mask = roots["update_safe"] & (expected_target != source)
+        if not np.array_equal(arrays["policy_target"], expected_policy):
+            raise ValueError(f"adaptive frequency policy target is stale: {map_name}")
+        if not np.array_equal(arrays["consensus_mask"], expected_consensus):
+            raise ValueError(f"adaptive frequency strong mask is stale: {map_name}")
+        if not np.array_equal(arrays["target"], expected_target):
+            raise ValueError(f"adaptive frequency target is stale: {map_name}")
+        if not np.array_equal(arrays["mask"], expected_mask):
+            raise ValueError(f"adaptive frequency update mask is stale: {map_name}")
+    if (
+        frozen_bundle.get("total_updated_entries") != total_updated
+        or frozen_bundle.get("total_consensus_entries") != total_consensus
+    ):
+        raise ValueError("adaptive frequency aggregate counts are stale")
+    return {
+        "bundle_schema": FREQUENCY_ADAPTIVE_BUNDLE_SCHEMA,
+        "consensus_entry_semantics": (
+            FREQUENCY_ADAPTIVE_CONSENSUS_ENTRY_SEMANTICS
+        ),
+        "path": artifact_path,
+        "sha256": actual_file_hash,
+        "bytes": expected_bytes,
+        "created_after_step": int(created_after_step),
+        "strength": float(strength),
+        "median_chunk_rows": dict(median_chunk_rows),
+        "edge_threshold_full_precision": float(edge_threshold_full),
+        "edge_threshold_png_quantized": float(edge_threshold_png),
+        "guide_texture_scales": dict(guide_scales),
         **roots,
         "maps": maps,
         "total_updated_entries": total_updated,
@@ -2320,6 +2850,48 @@ def _validate_frequency_baseline_state(regularization: Any) -> None:
         raise ValueError("frequency baseline must not apply post-fit cleanup")
 
 
+def _validate_active_frequency_baseline_state(regularization: Any) -> None:
+    if not isinstance(regularization, dict):
+        raise ValueError("active frequency comparison requires baseline provenance")
+    if regularization.get("kind") != "frequency-consensus":
+        raise ValueError(
+            "active frequency comparison requires a frequency-consensus v1 baseline"
+        )
+    try:
+        weight = float(regularization["weight"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "active frequency comparison requires a positive baseline weight"
+        ) from exc
+    if not math.isfinite(weight) or weight <= 0.0:
+        raise ValueError(
+            "active frequency comparison requires a positive baseline weight"
+        )
+    _validate_frequency_settings(regularization.get("settings"))
+    stage_plan = regularization.get("stage_plan")
+    if (
+        not isinstance(stage_plan, dict)
+        or stage_plan.get("enabled") is not True
+        or stage_plan.get("cleanup_optimizer_steps") != 0
+        or stage_plan.get("post_fit_updates") != 1
+    ):
+        raise ValueError("active frequency baseline has an invalid post-fit plan")
+    if regularization.get("cleanup_applied") is not True:
+        raise ValueError("active frequency baseline did not apply its post-fit update")
+    if regularization.get("data_objective_only") is not True:
+        raise ValueError("active frequency baseline must keep data fitting unchanged")
+    diagnostic = regularization.get("cleanup_diagnostic")
+    if not isinstance(diagnostic, dict) or diagnostic.get("schema") != (
+        FREQUENCY_DIAGNOSTIC_SCHEMA
+    ):
+        raise ValueError("active frequency baseline has invalid cleanup diagnostics")
+    bundle = regularization.get("frozen_bundle")
+    if not isinstance(bundle, dict) or bundle.get("schema") != (
+        FREQUENCY_BUNDLE_SCHEMA
+    ):
+        raise ValueError("active frequency baseline has invalid frozen provenance")
+
+
 def _validate_frequency_settings(settings: Any) -> None:
     expected = {
         "map_domain": "constrained_0_1_full_precision",
@@ -2352,6 +2924,109 @@ def _validate_frequency_settings(settings: Any) -> None:
             "frequency candidate algorithm settings differ from the report "
             f"contract: {mismatched}"
         )
+
+
+def _validate_frequency_adaptive_settings(settings: Any) -> None:
+    expected = {
+        "map_domain": "constrained_0_1_full_precision",
+        "stage": "full_data_fit_then_one_frozen_adaptive_consensus_update",
+        "weighted_median_windows": [3, 7],
+        "spatial_sigma3": FREQUENCY_SPATIAL_SIGMA3,
+        "spatial_sigma7": FREQUENCY_SPATIAL_SIGMA7,
+        "albedo_sigma": FREQUENCY_ALBEDO_SIGMA,
+        "normal_sigma": FREQUENCY_NORMAL_SIGMA,
+        "edge_percentile": FREQUENCY_EDGE_PERCENTILE,
+        "guide_texture_band_sigmas": [0.8, 2.4],
+        "guide_texture_scale_percentile": (
+            FREQUENCY_ADAPTIVE_GUIDE_SCALE_PERCENTILE
+        ),
+        "guide_texture_threshold": FREQUENCY_GUIDE_BAND_THRESHOLD,
+        "guide_texture_sources": [
+            "full_precision_normalized_baseColor_and_normal",
+            "exact_png_quantized_baseColor_and_normal",
+        ],
+        "guide_texture_core": "union_of_full_precision_and_png_masks",
+        "guide_texture_halo": (
+            "3x3_square_dilation_of_core_clipped_to_full5"
+        ),
+        "focused_maps": list(FREQUENCY_ADAPTIVE_FOCUSED_MAPS),
+        "strong_target": (
+            f"{FREQUENCY_ADAPTIVE_STRONG_MEDIAN3_WEIGHT:g}*median3+"
+            f"{FREQUENCY_ADAPTIVE_STRONG_MEDIAN7_WEIGHT:g}*median7"
+        ),
+        "focused_policy": "v1_in_core_else_strong_within_update_safe",
+        "other_policy": (
+            f"source+{FREQUENCY_ADAPTIVE_HALO_V1_BLEND:g}*(v1-source)_in_"
+            "halo_else_strong_within_update_safe"
+        ),
+        "base_target": "exact_full_strength_frequency_consensus_v1_target",
+        "cleanup_optimizer_steps": 0,
+    }
+    if not isinstance(settings, dict):
+        raise ValueError("adaptive frequency candidate has invalid algorithm settings")
+    mismatched = [
+        name for name, value in expected.items() if settings.get(name) != value
+    ]
+    if mismatched:
+        raise ValueError(
+            "adaptive frequency candidate algorithm settings differ from the "
+            f"report contract: {mismatched}"
+        )
+
+
+def _validate_frequency_artifact_upgrade_pair(
+    baseline: dict[str, Any],
+    adaptive: dict[str, Any],
+    *,
+    profile: str,
+) -> None:
+    if baseline.get("bundle_schema") != FREQUENCY_BUNDLE_SCHEMA:
+        raise ValueError(f"{profile} baseline does not contain the v1 frozen bundle")
+    if adaptive.get("bundle_schema") != FREQUENCY_ADAPTIVE_BUNDLE_SCHEMA:
+        raise ValueError(
+            f"{profile} candidate does not contain the adaptive frozen bundle"
+        )
+    scalar_fields = (
+        "created_after_step",
+        "median_chunk_rows",
+        "edge_threshold_full_precision",
+        "edge_threshold_png_quantized",
+    )
+    mismatched = [name for name in scalar_fields if baseline.get(name) != adaptive.get(name)]
+    if mismatched:
+        raise ValueError(
+            f"{profile} adaptive and v1 frozen data-fit state differs: {mismatched}"
+        )
+    if baseline.get("strength") != 1.0 or adaptive.get("strength") != 1.0:
+        raise ValueError(
+            "active frequency comparison requires the full reference strength"
+        )
+    for name in (
+        "fit_foreground",
+        "full_foreground5",
+        "edge_protected_full_precision",
+        "edge_protected_png_quantized",
+        "edge_protected",
+        "update_safe",
+    ):
+        if not np.array_equal(baseline.get(name), adaptive.get(name)):
+            raise ValueError(
+                f"{profile} adaptive and v1 frozen {name} differs"
+            )
+    for map_name in SCALAR_MAPS:
+        baseline_map = baseline["maps"][map_name]
+        adaptive_map = adaptive["maps"][map_name]
+        for name in ("source", "median3", "median7"):
+            if not np.array_equal(baseline_map[name], adaptive_map[name]):
+                raise ValueError(
+                    f"{profile}/{map_name} adaptive and v1 frozen {name} differs"
+                )
+        if not np.array_equal(
+            baseline_map["target"], adaptive_map["fixed_target"]
+        ):
+            raise ValueError(
+                f"{profile}/{map_name} adaptive frozen v1 target differs from baseline"
+            )
 
 
 def _validate_frequency_evaluation_guard(
@@ -2511,8 +3186,25 @@ def _measure_frequency_cleanup(
     acquisitions: dict[str, dict[str, dict[str, Any]]],
     contract: dict[str, Any],
 ) -> dict[str, Any] | None:
-    if contract["regularization_kind"] != "frequency-consensus":
+    regularization_kind = contract["regularization_kind"]
+    if regularization_kind not in {
+        "frequency-consensus",
+        "frequency-consensus-adaptive",
+    }:
         return None
+    adaptive_comparison = bool(contract.get("active_frequency_upgrade"))
+    if adaptive_comparison != (
+        regularization_kind == "frequency-consensus-adaptive"
+    ):
+        raise ValueError(
+            "adaptive frequency cleanup requires an active frequency-consensus "
+            "baseline and the controlled adapter transition"
+        )
+    expected_candidate_identity = (
+        _FREQUENCY_ADAPTIVE_IDENTITY
+        if adaptive_comparison
+        else _FREQUENCY_IDENTITY
+    )
     candidate_identities = {
         (
             acquisitions["regularized"][profile]["checkpoint_signature"].get(
@@ -2524,9 +3216,9 @@ def _measure_frequency_cleanup(
         )
         for profile in profiles
     }
-    if candidate_identities != {_FREQUENCY_IDENTITY}:
+    if candidate_identities != {expected_candidate_identity}:
         raise ValueError(
-            "frequency cleanup report requires the v13 frequency-consensus "
+            "frequency cleanup report requires the expected v13 adapter "
             f"identity; found {candidate_identities}"
         )
     if fit_mask.ndim != 2 or not np.any(fit_mask):
@@ -2559,7 +3251,10 @@ def _measure_frequency_cleanup(
         baseline_regularization = acquisitions["baseline"][profile].get(
             "regularization"
         )
-        _validate_frequency_baseline_state(baseline_regularization)
+        if adaptive_comparison:
+            _validate_active_frequency_baseline_state(baseline_regularization)
+        else:
+            _validate_frequency_baseline_state(baseline_regularization)
         acquisition = acquisitions["regularized"][profile]
         if acquisition.get("schema") != "ictpolarreal.end2end-disney.v13":
             raise ValueError(
@@ -2577,7 +3272,10 @@ def _measure_frequency_cleanup(
         )
         settings = regularization.get("settings")
         stage_plan = regularization.get("stage_plan")
-        _validate_frequency_settings(settings)
+        if adaptive_comparison:
+            _validate_frequency_adaptive_settings(settings)
+        else:
+            _validate_frequency_settings(settings)
         if (
             not isinstance(stage_plan, dict)
             or stage_plan.get("enabled") is not True
@@ -2615,7 +3313,7 @@ def _measure_frequency_cleanup(
 
         diagnostic = regularization.get("cleanup_diagnostic")
         if not isinstance(diagnostic, dict) or diagnostic.get("schema") != (
-            "ictpolarreal.frequency-consensus-diagnostic.v1"
+            FREQUENCY_DIAGNOSTIC_SCHEMA
         ):
             raise ValueError("frequency candidate has invalid cleanup diagnostics")
         artifact = _load_frequency_frozen_artifact(
@@ -2623,6 +3321,30 @@ def _measure_frequency_cleanup(
             acquisition,
             fit_mask.shape,
         )
+        baseline_artifact = None
+        if adaptive_comparison:
+            baseline_acquisition = acquisitions["baseline"][profile]
+            if baseline_acquisition.get("schema") != (
+                "ictpolarreal.end2end-disney.v13"
+            ):
+                raise ValueError(
+                    "active frequency baseline acquisition schema does not match "
+                    "its checkpoint/adapter identity"
+                )
+            baseline_artifact = _load_frequency_frozen_artifact(
+                baseline_camera / "material" / profile,
+                baseline_acquisition,
+                fit_mask.shape,
+            )
+            _validate_frequency_artifact_upgrade_pair(
+                baseline_artifact,
+                artifact,
+                profile=profile,
+            )
+            _validate_frequency_evaluation_guard(
+                baseline_acquisition,
+                profile=profile,
+            )
         if not np.array_equal(artifact["fit_foreground"], fit_mask):
             raise ValueError(
                 "frequency frozen fit foreground does not match the comparison mask"
@@ -2683,19 +3405,32 @@ def _measure_frequency_cleanup(
             ):
                 raise ValueError("frequency cleanup maps do not match the fit-mask shape")
             arrays = artifact["maps"][map_name]
-            update_mask = arrays["mask"]
+            artifact_update_mask = arrays["mask"]
+            update_mask = (
+                arrays["target"] != arrays["fixed_target"]
+                if adaptive_comparison
+                else artifact_update_mask
+            )
             consensus_mask = arrays["consensus_mask"]
             if np.any(update_mask & ~fit_mask):
                 raise ValueError(
                     f"frequency frozen updates fall outside the fit mask: {map_name}"
                 )
             updated_count = int(np.count_nonzero(update_mask))
-            consensus_count = int(np.count_nonzero(consensus_mask))
+            artifact_consensus_count = int(np.count_nonzero(consensus_mask))
+            consensus_count = int(
+                np.count_nonzero(consensus_mask & update_mask)
+                if adaptive_comparison
+                else artifact_consensus_count
+            )
+            artifact_updated_count = int(np.count_nonzero(artifact_update_mask))
             diagnostic_entry = diagnostic_maps.get(map_name)
             if (
                 not isinstance(diagnostic_entry, dict)
-                or diagnostic_entry.get("updated_entries") != updated_count
-                or diagnostic_entry.get("consensus_entries") != consensus_count
+                or diagnostic_entry.get("updated_entries")
+                != artifact_updated_count
+                or diagnostic_entry.get("consensus_entries")
+                != artifact_consensus_count
             ):
                 raise ValueError(
                     f"frequency diagnostic counts differ for {map_name}"
@@ -2704,15 +3439,20 @@ def _measure_frequency_cleanup(
             if (
                 not isinstance(moved_entries, int)
                 or isinstance(moved_entries, bool)
-                or not 0 <= moved_entries <= updated_count
+                or not 0 <= moved_entries <= artifact_updated_count
             ):
                 raise ValueError(
                     f"frequency diagnostic moved count is invalid for {map_name}"
                 )
             diagnostic_moved_total += moved_entries
 
+            baseline_reference = (
+                arrays["fixed_target"]
+                if adaptive_comparison
+                else arrays["source"]
+            )
             source_alignment = np.abs(
-                baseline_values[fit_mask] - arrays["source"][fit_mask]
+                baseline_values[fit_mask] - baseline_reference[fit_mask]
             )
             target_alignment = np.abs(
                 candidate_values[fit_mask] - arrays["target"][fit_mask]
@@ -2722,7 +3462,8 @@ def _measure_frequency_cleanup(
             tolerance = EXPORT_QUANTIZATION_TOLERANCE + 1e-7
             if source_max > tolerance:
                 raise ValueError(
-                    f"baseline export does not match frozen source for {map_name}"
+                    "baseline export does not match its frozen reference for "
+                    f"{map_name}"
                 )
             if target_max > tolerance:
                 raise ValueError(
@@ -2736,10 +3477,13 @@ def _measure_frequency_cleanup(
                 candidate_values[update_mask] - arrays["target"][update_mask]
             )
             full_before = np.abs(
-                arrays["source"][update_mask] - arrays["target"][update_mask]
+                arrays["source"][artifact_update_mask]
+                - arrays["target"][artifact_update_mask]
             )
             full_precision_before.append(full_before)
-            expected_before = float(full_before.mean()) if updated_count else 0.0
+            expected_before = (
+                float(full_before.mean()) if artifact_updated_count else 0.0
+            )
             try:
                 recorded_before = float(diagnostic_entry["mean_distance_before"])
                 recorded_after = float(diagnostic_entry["mean_distance_after"])
@@ -2801,7 +3545,12 @@ def _measure_frequency_cleanup(
                         else None
                     ),
                 },
-                "baseline_export_alignment_to_frozen_source": {
+                "baseline_export_alignment_to_frozen_reference": {
+                    "reference": (
+                        "frequency_consensus_v1_fixed_target"
+                        if adaptive_comparison
+                        else "data_fit_source"
+                    ),
                     "mean_absolute": _optional_mean(source_sum, fit_pixels),
                     "maximum_absolute": source_max,
                 },
@@ -2880,12 +3629,26 @@ def _measure_frequency_cleanup(
         union_pixels = int(np.count_nonzero(spatial_union))
         profile_fit_entries = fit_pixels * len(SCALAR_MAPS)
         per_profile[profile] = {
+            "annotation_labels": (
+                {"updated": "changed", "consensus": "strong changed"}
+                if adaptive_comparison
+                else {"updated": "updates", "consensus": "consensus"}
+            ),
             "artifact": {
                 "validated": True,
                 "path": str(artifact["path"]),
                 "sha256": artifact["sha256"],
                 "bytes": artifact["bytes"],
                 "created_after_step": artifact["created_after_step"],
+                **(
+                    {
+                        "consensus_entry_semantics": artifact[
+                            "consensus_entry_semantics"
+                        ]
+                    }
+                    if adaptive_comparison
+                    else {}
+                ),
             },
             "fit_foreground_pixels": fit_pixels,
             "evaluation_guard": evaluation_guard,
@@ -2928,7 +3691,12 @@ def _measure_frequency_cleanup(
                     else None
                 ),
             },
-            "baseline_export_alignment_to_frozen_source": {
+            "baseline_export_alignment_to_frozen_reference": {
+                "reference": (
+                    "frequency_consensus_v1_fixed_target"
+                    if adaptive_comparison
+                    else "data_fit_source"
+                ),
                 "mean_absolute": _optional_mean(
                     profile_accumulator["source_sum"], profile_fit_entries
                 ),
@@ -3025,7 +3793,12 @@ def _measure_frequency_cleanup(
                 else None
             ),
         },
-        "baseline_export_alignment_to_frozen_source": {
+        "baseline_export_alignment_to_frozen_reference": {
+            "reference": (
+                "frequency_consensus_v1_fixed_target"
+                if adaptive_comparison
+                else "data_fit_source"
+            ),
             "mean_absolute": _optional_mean(
                 aggregate["source_alignment_sum"],
                 aggregate["source_alignment_count"],
@@ -3058,12 +3831,29 @@ def _measure_frequency_cleanup(
     return {
         "schema": "ictpolarreal.frequency-cleanup-comparison.v1",
         "available": True,
+        "comparison_mode": (
+            "frequency-consensus-v1-to-adaptive-v1"
+            if adaptive_comparison
+            else "data-fit-source-to-frequency-consensus-v1"
+        ),
+        "regularizer_label": _display_regularizer(regularization_kind),
+        "update_count_semantics": (
+            "map entries whose adaptive target differs from the frozen v1 target"
+            if adaptive_comparison
+            else "map entries whose v1 target differs from the data-fit source"
+        ),
+        "consensus_count_semantics": (
+            "entries whose adaptive target differs from frozen v1 and whose "
+            "strong-policy target also differs from the data-fit source"
+            if adaptive_comparison
+            else "cross-map consensus entries"
+        ),
         "scope": (
-            "Artifact integrity, source/target alignment, update coverage, and "
+            "Artifact integrity, frozen-reference/target alignment, update coverage, and "
             "outside-mask changes are measured from hash-validated float32 frozen "
-            "state and 8-bit exported maps. Evidence, consensus, and target formulas "
+            "state and 8-bit exported maps. Target formulas and stored mask semantics "
             "are recomputed, but the report does not independently recompute the "
-            "weighted medians or guide-derived edge masks. These diagnostics do not "
+            "weighted medians. These diagnostics do not "
             "establish material quality or texture preservation."
         ),
         "presentation": {
@@ -3972,25 +4762,43 @@ def _build_frequency_diagnostic_gates(
         regularized: float | None,
         threshold: float = 0.20,
     ) -> dict[str, Any]:
+        zero_epsilon = 1e-12
         valid = (
             baseline is not None
             and regularized is not None
             and math.isfinite(float(baseline))
             and math.isfinite(float(regularized))
-            and float(baseline) > 1e-12
+            and float(baseline) >= 0.0
             and float(regularized) >= 0.0
         )
-        observed = (
-            float((float(baseline) - float(regularized)) / float(baseline))
-            if valid
-            else None
-        )
+        denominator_policy = "invalid_input"
+        observed = None
+        if valid:
+            baseline_value = float(baseline)
+            regularized_value = float(regularized)
+            if baseline_value > zero_epsilon:
+                observed = float(
+                    (baseline_value - regularized_value) / baseline_value
+                )
+                denominator_policy = "baseline"
+            elif regularized_value <= zero_epsilon:
+                # A perfect active baseline leaves no measurable room for the
+                # candidate to earn the positive relative-improvement gate.
+                observed = 0.0
+                denominator_policy = "zero_baseline_and_candidate_no_reduction"
+            else:
+                # Keep a zero-baseline regression finite so report composition
+                # can record a failed gate instead of aborting the comparison.
+                observed = float(-regularized_value / zero_epsilon)
+                denominator_policy = "zero_baseline_epsilon_regression"
         gate = lower_gate(observed, threshold)
         gate.update(
             {
                 "quantity": "relative_reduction_from_baseline",
                 "baseline_value": baseline,
                 "regularized_value": regularized,
+                "zero_baseline_epsilon": zero_epsilon,
+                "denominator_policy": denominator_policy,
             }
         )
         return gate
@@ -5467,6 +6275,12 @@ def _frequency_annotation_layout(
     spacing = 5
     measurement = Image.new("RGB", (1, 1))
     draw = ImageDraw.Draw(measurement)
+    labels = profile_cleanup.get(
+        "annotation_labels",
+        {"updated": "updates", "consensus": "consensus"},
+    )
+    if not isinstance(labels, dict) or set(labels) != {"updated", "consensus"}:
+        raise ValueError("frequency annotation layout has invalid count labels")
     rows = []
     maximum_right = FREQUENCY_ANNOTATION_LEFT
     for map_name in FREQUENCY_DETAIL_MAPS:
@@ -5477,8 +6291,8 @@ def _frequency_annotation_layout(
             )
         text = (
             f"{_display_name(map_name)}\n"
-            f"updates {map_cleanup['updated_entries']}\n"
-            f"consensus {map_cleanup['consensus_entries']}"
+            f"{labels['updated']} {map_cleanup['updated_entries']}\n"
+            f"{labels['consensus']} {map_cleanup['consensus_entries']}"
         )
         bounds = draw.multiline_textbbox(
             (FREQUENCY_ANNOTATION_LEFT, 0),
@@ -5565,7 +6379,10 @@ def _write_frequency_detail(
     draw = ImageDraw.Draw(canvas)
     draw.text(
         (18, 12),
-        f"{profile.upper()} frequency-consensus detail · native 1:1",
+        (
+            f"{profile.upper()} {frequency_cleanup['regularizer_label']} "
+            "detail · native 1:1"
+        ),
         font=_font(25, bold=True),
         fill="white",
     )
@@ -5685,7 +6502,10 @@ def _write_frequency_full_maps(
     draw = ImageDraw.Draw(canvas)
     draw.text(
         (18, 12),
-        f"{profile.upper()} frequency-consensus full maps · native 1:1",
+        (
+            f"{profile.upper()} {frequency_cleanup['regularizer_label']} "
+            "full maps · native 1:1"
+        ),
         font=_font(25, bold=True),
         fill="white",
     )
@@ -6071,9 +6891,13 @@ def _write_overview(
             )
         elif frequency_profile_cleanup is not None:
             cleanup_map = frequency_profile_cleanup["maps"][map_name]
+            count_labels = frequency_profile_cleanup.get(
+                "annotation_labels",
+                {"updated": "updates", "consensus": "consensus"},
+            )
             detail_captions.append(
-                f"updates {cleanup_map['updated_entries']}\n"
-                f"consensus {cleanup_map['consensus_entries']}"
+                f"{count_labels['updated']} {cleanup_map['updated_entries']}\n"
+                f"{count_labels['consensus']} {cleanup_map['consensus_entries']}"
             )
         else:
             detail_captions.append(
@@ -6741,6 +7565,7 @@ def _display_regularizer(kind: str) -> str:
         "edge-charbonnier": "edge-aware Charbonnier",
         "impulse-median": "post-fit impulse proximal",
         "frequency-consensus": "post-fit frequency consensus",
+        "frequency-consensus-adaptive": "adaptive frequency consensus",
     }.get(kind, kind)
 
 

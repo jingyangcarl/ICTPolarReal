@@ -74,12 +74,13 @@ def main() -> None:
             "edge-charbonnier",
             "impulse-median",
             "frequency-consensus",
+            "frequency-consensus-adaptive",
         ),
         default="impulse-median",
         help=(
             "Scalar-map regularizer: legacy uniform L1 TV, edge-aware "
             "Charbonnier TV, post-fit impulse-only cleanup, or post-fit "
-            "frequency-consensus cleanup."
+            "frequency-consensus cleanup (fixed or adaptive)."
         ),
     )
     parser.add_argument(

@@ -61,6 +61,7 @@ TV_KINDS = (
     "edge-charbonnier",
     "impulse-median",
     "frequency-consensus",
+    "frequency-consensus-adaptive",
 )
 EDGE_CHARBONNIER_EPSILON = 0.02
 EDGE_CHARBONNIER_ALBEDO_SIGMA = 0.05
@@ -93,6 +94,14 @@ FREQUENCY_CONSENSUS_MAX_CHUNK_SAMPLES = 1 << 22
 FREQUENCY_CONSENSUS_LOGIT_EPSILON = 1e-6
 FREQUENCY_CONSENSUS_EVALUATION_MEAN_MSE_TOLERANCE = 1e-8
 FREQUENCY_FROZEN_ARTIFACT_NAME = "frequency_consensus_frozen.npz"
+FREQUENCY_ADAPTIVE_STRONG_MEDIAN3_WEIGHT = 0.50
+FREQUENCY_ADAPTIVE_STRONG_MEDIAN7_WEIGHT = 0.50
+FREQUENCY_ADAPTIVE_HALO_V1_BLEND = 0.84
+FREQUENCY_ADAPTIVE_FOCUSED_MAPS = ("anisotropic", "subsurface")
+FREQUENCY_ADAPTIVE_GUIDE_FINE_SIGMA = 0.8
+FREQUENCY_ADAPTIVE_GUIDE_COARSE_SIGMA = 2.4
+FREQUENCY_ADAPTIVE_GUIDE_SCALE_PERCENTILE = 90.0
+FREQUENCY_ADAPTIVE_GUIDE_BAND_THRESHOLD = 0.35
 REPORT_PROFILES = ("olat", "hdri", "mix")
 ERROR_HEATMAP_MAX = 0.25
 
@@ -524,7 +533,7 @@ def acquire_disney_material(
         torch.cuda.empty_cache()
 
     provenance = _imaginaire_provenance(root, source_path)
-    adapter_provenance = _adapter_provenance()
+    adapter_provenance = _adapter_provenance(tv_kind)
     profile_results = {}
     for profile in profiles:
         material_dir = material_root / profile
@@ -703,9 +712,10 @@ def _fit_disney_profile(
         enabled=tv_kind == "impulse-median" and tv_weight > 0.0,
         shrink_per_iteration=tv_weight,
     )
+    frequency_kind = _is_frequency_consensus_kind(tv_kind)
     frequency_stage = _frequency_consensus_stage_plan(
         steps,
-        enabled=tv_kind == "frequency-consensus" and tv_weight > 0.0,
+        enabled=frequency_kind and tv_weight > 0.0,
         weight=tv_weight,
     )
     edge_pair_weights = None
@@ -848,7 +858,7 @@ def _fit_disney_profile(
                         else frequency_stage
                     )
                 }
-                if tv_kind in {"impulse-median", "frequency-consensus"}
+                if tv_kind == "impulse-median" or frequency_kind
                 else {}
             ),
         },
@@ -917,6 +927,7 @@ def _fit_disney_profile(
                 frequency_stage,
                 next_step=start_step,
                 expected_shape=(height, width),
+                expected_kind=tv_kind,
                 model=model,
             )
             if frequency_stage["enabled"] and start_step >= steps:
@@ -987,7 +998,12 @@ def _fit_disney_profile(
 
     def freeze_frequency_consensus_bundle() -> None:
         nonlocal frequency_consensus_bundle
-        frequency_consensus_bundle = _build_frequency_consensus_bundle(
+        builder = (
+            _build_frequency_consensus_adaptive_bundle
+            if tv_kind == "frequency-consensus-adaptive"
+            else _build_frequency_consensus_bundle
+        )
+        frequency_consensus_bundle = builder(
             torch,
             model,
             mask_hwc,
@@ -1004,10 +1020,15 @@ def _fit_disney_profile(
             entry["consensus_count"]
             for entry in frequency_consensus_bundle["maps"].values()
         )
+        consensus_label = (
+            "strong-policy entries"
+            if tv_kind == "frequency-consensus-adaptive"
+            else "cross-map consensus"
+        )
         print(
-            f"[end2end:{profile}] frequency-consensus post-fit detector at "
+            f"[end2end:{profile}] {tv_kind} post-fit detector at "
             f"{frequency_stage['detector_after_data_step']}/{steps}: froze "
-            f"{total_updated} updates ({total_consensus} cross-map consensus); "
+            f"{total_updated} updates ({total_consensus} {consensus_label}); "
             f"strength={frequency_stage['strength']:.4f}; data optimization is complete",
             flush=True,
         )
@@ -1067,7 +1088,7 @@ def _fit_disney_profile(
             data_loss = olat_loss(final_index)
         else:
             data_loss = hdri_loss(final_index, evaluation=False)
-        post_fit_kind = tv_kind in {"impulse-median", "frequency-consensus"}
+        post_fit_kind = tv_kind == "impulse-median" or frequency_kind
         stage_label = "data-fit" if post_fit_kind else "joint"
         regularization_active = (
             tv_weight > 0.0 and not post_fit_kind
@@ -1204,7 +1225,7 @@ def _fit_disney_profile(
         else:
             final_loss = float(hdri_loss(final_index, evaluation=False).cpu())
         final_tv = float(scalar_total_variation().cpu())
-        if tv_kind in {"impulse-median", "frequency-consensus"}:
+        if tv_kind == "impulse-median" or frequency_kind:
             final_regularization_loss = 0.0
             final_objective = final_loss
         else:
@@ -1264,7 +1285,7 @@ def _fit_disney_profile(
             "cleanup_diagnostic": impulse_cleanup_diagnostic,
             "data_objective_only": True,
         }
-    elif tv_kind == "frequency-consensus":
+    elif frequency_kind:
         regularization_result = {
             "weight_semantics": "normalized_post_fit_strength",
             "stage_plan": frequency_stage,
@@ -2810,11 +2831,16 @@ def _checkpoint_signatures_match(
     return normalized(existing) == normalized(expected)
 
 
-def _adapter_provenance() -> dict[str, Any]:
+def _adapter_provenance(tv_kind: str = "frequency-consensus") -> dict[str, Any]:
+    algorithm_version = (
+        "ictpolarreal-frequency-consensus-adaptive-v1"
+        if tv_kind == "frequency-consensus-adaptive"
+        else "ictpolarreal-frequency-consensus-v1"
+    )
     lighting_path = Path(__file__).resolve().with_name("lighting_profiles.py")
     return {
         "schema": "ictpolarreal.profile-acquisition-adapter.v7",
-        "algorithm_version": "ictpolarreal-frequency-consensus-v1",
+        "algorithm_version": algorithm_version,
         "lighting_profiles_sha256": hashlib.sha256(
             lighting_path.read_bytes()
         ).hexdigest(),
@@ -2991,6 +3017,19 @@ def _normalize_tv_kind(kind: str) -> str:
     return normalized
 
 
+def _is_frequency_consensus_kind(kind: str) -> bool:
+    return kind in {"frequency-consensus", "frequency-consensus-adaptive"}
+
+
+def _frequency_consensus_bundle_schema(kind: str) -> str:
+    kind = _normalize_tv_kind(kind)
+    if kind == "frequency-consensus-adaptive":
+        return "ictpolarreal.frequency-consensus-adaptive-bundle.v1"
+    if kind == "frequency-consensus":
+        return "ictpolarreal.frequency-consensus-bundle.v1"
+    raise ValueError(f"{kind!r} does not select a frequency-consensus bundle")
+
+
 def _regularization_settings(kind: str) -> dict[str, Any]:
     kind = _normalize_tv_kind(kind)
     pairwise_common = {
@@ -3015,6 +3054,74 @@ def _regularization_settings(kind: str) -> dict[str, Any]:
                 "floor + (1-floor) * exp(-albedo_difference/albedo_sigma "
                 "- normal_difference/normal_sigma)"
             ),
+        }
+    if kind == "frequency-consensus-adaptive":
+        return {
+            "map_domain": "constrained_0_1_full_precision",
+            "stage": "full_data_fit_then_one_frozen_adaptive_consensus_update",
+            "data_optimizer": "original Adam cosine schedule on data loss only",
+            "detector_boundary": "after_all_data_fit_steps",
+            "cleanup_optimizer_steps": 0,
+            "guide": "full_precision_normalized_albedo_and_normal",
+            "foreground": "exact_fit_foreground",
+            "weighted_median_windows": [3, 7],
+            "weighted_median_formula": (
+                "fit_mask*exp(-distance_squared/(2*spatial_sigma_squared)"
+                "-mean_abs_albedo_difference/albedo_sigma"
+                "-(1-normal_cosine)/normal_sigma)"
+            ),
+            "spatial_sigma3": FREQUENCY_CONSENSUS_SPATIAL_SIGMA3,
+            "spatial_sigma7": FREQUENCY_CONSENSUS_SPATIAL_SIGMA7,
+            "albedo_sigma": FREQUENCY_CONSENSUS_ALBEDO_SIGMA,
+            "normal_sigma": FREQUENCY_CONSENSUS_NORMAL_SIGMA,
+            "weighted_median_execution": "deterministic_row_chunked_unfold_sort",
+            "maximum_chunk_samples": FREQUENCY_CONSENSUS_MAX_CHUNK_SAMPLES,
+            "edge_score": (
+                "mean_abs_albedo_difference/albedo_sigma"
+                "+(1-normal_cosine)/normal_sigma"
+            ),
+            "edge_percentile": FREQUENCY_CONSENSUS_EDGE_PERCENTILE,
+            "edge_guides": [
+                "full_precision_normalized_albedo_and_normal",
+                "exact_png_quantized_exported_baseColor_and_normal",
+            ],
+            "edge_rule": (
+                "freeze_union_of_both_endpoints_from_full_precision_and_"
+                "png_quantized_edge_pairs"
+            ),
+            "guide_texture_band_sigmas": [
+                FREQUENCY_ADAPTIVE_GUIDE_FINE_SIGMA,
+                FREQUENCY_ADAPTIVE_GUIDE_COARSE_SIGMA,
+            ],
+            "guide_texture_scale_percentile": (
+                FREQUENCY_ADAPTIVE_GUIDE_SCALE_PERCENTILE
+            ),
+            "guide_texture_threshold": FREQUENCY_ADAPTIVE_GUIDE_BAND_THRESHOLD,
+            "guide_texture_sources": [
+                "full_precision_normalized_baseColor_and_normal",
+                "exact_png_quantized_baseColor_and_normal",
+            ],
+            "guide_texture_core": "union_of_full_precision_and_png_masks",
+            "guide_texture_halo": "3x3_square_dilation_of_core_clipped_to_full5",
+            "focused_maps": list(FREQUENCY_ADAPTIVE_FOCUSED_MAPS),
+            "strong_target": (
+                f"{FREQUENCY_ADAPTIVE_STRONG_MEDIAN3_WEIGHT:g}*median3+"
+                f"{FREQUENCY_ADAPTIVE_STRONG_MEDIAN7_WEIGHT:g}*median7"
+            ),
+            "focused_policy": "v1_in_core_else_strong_within_update_safe",
+            "other_policy": (
+                f"source+{FREQUENCY_ADAPTIVE_HALO_V1_BLEND:g}*(v1-source)_in_"
+                "halo_else_strong_within_update_safe"
+            ),
+            "base_target": "exact_full_strength_frequency_consensus_v1_target",
+            "weight_reference": FREQUENCY_CONSENSUS_REFERENCE_WEIGHT,
+            "strength_formula": "min(max(tv_weight/weight_reference,0),1)",
+            "strength_application": "once_after_complete_adaptive_policy",
+            "update": "one_exact_logit_assignment_to_strength_scaled_policy_target",
+            "consensus_mask": (
+                "strong_policy_eligible_and_final_target_differs_from_source"
+            ),
+            "outside_update_safe": "raw_parameter_bit_identical_to_data_fit",
         }
     if kind == "frequency-consensus":
         return {
@@ -3313,6 +3420,7 @@ def _checkpoint_frequency_consensus_state(
     *,
     next_step: int,
     expected_shape: tuple[int, int],
+    expected_kind: str = "frequency-consensus",
     model=None,
 ):
     bundle = checkpoint.get("frequency_consensus_bundle")
@@ -3333,6 +3441,12 @@ def _checkpoint_frequency_consensus_state(
                 "checkpoint contains frequency-consensus state before data fit completed"
             )
         return None, False, None
+    expected_schema = _frequency_consensus_bundle_schema(expected_kind)
+    if isinstance(bundle, dict) and bundle.get("schema") != expected_schema:
+        raise ValueError(
+            "checkpoint frequency-consensus bundle schema does not match "
+            f"selected kind {expected_kind!r}"
+        )
     _validate_frequency_consensus_bundle(
         torch,
         bundle,
@@ -3731,6 +3845,123 @@ def _frequency_consensus_guide_state(
     }
 
 
+def _frequency_adaptive_gaussian_nearest(torch, values, sigma: float):
+    """Match the report's separable nearest-border Gaussian in torch."""
+    if not math.isfinite(sigma) or sigma <= 0.0:
+        raise ValueError("frequency adaptive Gaussian sigma must be positive")
+    if values.ndim != 3:
+        raise ValueError("frequency adaptive Gaussian input must have shape (H,W,C)")
+    radius = int(4.0 * sigma + 0.5)
+    coordinate = torch.arange(
+        -radius,
+        radius + 1,
+        dtype=torch.float64,
+        device=values.device,
+    )
+    kernel = torch.exp(-0.5 * (coordinate / sigma).square())
+    kernel = kernel / kernel.sum()
+    channels = values.shape[-1]
+    filtered = values.to(dtype=torch.float64).permute(2, 0, 1).unsqueeze(0)
+    horizontal = kernel.reshape(1, 1, 1, -1).expand(channels, 1, 1, -1)
+    vertical = kernel.reshape(1, 1, -1, 1).expand(channels, 1, -1, 1)
+    filtered = torch.nn.functional.conv2d(
+        torch.nn.functional.pad(
+            filtered,
+            (radius, radius, 0, 0),
+            mode="replicate",
+        ),
+        horizontal,
+        groups=channels,
+    )
+    filtered = torch.nn.functional.conv2d(
+        torch.nn.functional.pad(
+            filtered,
+            (0, 0, radius, radius),
+            mode="replicate",
+        ),
+        vertical,
+        groups=channels,
+    )
+    return filtered[0].permute(1, 2, 0)
+
+
+def _frequency_adaptive_guide_texture_state(
+    torch,
+    albedo,
+    normal,
+    interior,
+):
+    """Freeze full/PNG guide-texture masks plus a square one-pixel halo."""
+    expected_shape = (*interior.shape, 3)
+    if tuple(albedo.shape) != expected_shape or tuple(normal.shape) != expected_shape:
+        raise ValueError(
+            f"frequency adaptive guides must have shape {expected_shape}"
+        )
+    if interior.dtype != torch.bool or not bool(interior.any()):
+        raise ValueError("frequency adaptive texture interior must be non-empty boolean")
+
+    def quantize_unit(values):
+        return torch.floor(values.clamp(0.0, 1.0) * 255.0 + 0.5) / 255.0
+
+    png_albedo = quantize_unit(albedo)
+    png_normal = quantize_unit(normal * 0.5 + 0.5) * 2.0 - 1.0
+
+    def band_strength(values):
+        fine = _frequency_adaptive_gaussian_nearest(
+            torch, values, FREQUENCY_ADAPTIVE_GUIDE_FINE_SIGMA
+        )
+        coarse = _frequency_adaptive_gaussian_nearest(
+            torch, values, FREQUENCY_ADAPTIVE_GUIDE_COARSE_SIGMA
+        )
+        return (fine - coarse).square().sum(dim=-1).sqrt()
+
+    quantile = FREQUENCY_ADAPTIVE_GUIDE_SCALE_PERCENTILE / 100.0
+    def texture_mask(guide_albedo, guide_normal):
+        albedo_strength = band_strength(guide_albedo)
+        normal_strength = band_strength(guide_normal)
+        albedo_scale = torch.quantile(
+            albedo_strength[interior], quantile
+        ).clamp_min(1e-6)
+        normal_scale = torch.quantile(
+            normal_strength[interior], quantile
+        ).clamp_min(1e-6)
+        score = torch.maximum(
+            albedo_strength / albedo_scale,
+            normal_strength / normal_scale,
+        )
+        selected = interior & (
+            score >= FREQUENCY_ADAPTIVE_GUIDE_BAND_THRESHOLD
+        )
+        return selected, albedo_scale, normal_scale
+
+    full, full_albedo_scale, full_normal_scale = texture_mask(albedo, normal)
+    png, png_albedo_scale, png_normal_scale = texture_mask(
+        png_albedo, png_normal
+    )
+    core = full | png
+    if not bool(core.any()):
+        raise ValueError("frequency adaptive guide-texture mask is empty")
+    halo = (
+        torch.nn.functional.max_pool2d(
+            core[None, None].to(dtype=torch.float32),
+            kernel_size=3,
+            stride=1,
+            padding=1,
+        )[0, 0]
+        > 0.5
+    ) & interior
+    return {
+        "guide_texture_full_precision": full.detach(),
+        "guide_texture_png_quantized": png.detach(),
+        "guide_texture_core": core.detach(),
+        "guide_texture_halo": halo.detach(),
+        "full_precision_albedo_scale": float(full_albedo_scale.detach().cpu()),
+        "full_precision_normal_scale": float(full_normal_scale.detach().cpu()),
+        "png_quantized_albedo_scale": float(png_albedo_scale.detach().cpu()),
+        "png_quantized_normal_scale": float(png_normal_scale.detach().cpu()),
+    }
+
+
 def _build_frequency_consensus_bundle(
     torch,
     model,
@@ -3860,8 +4091,139 @@ def _build_frequency_consensus_bundle(
     return bundle
 
 
-def _frequency_consensus_tensor_hashes(bundle) -> dict[str, Any]:
-    root = {}
+def _frequency_consensus_adaptive_targets(
+    torch,
+    maps,
+    update_safe,
+    guide_texture_core,
+    guide_texture_halo,
+    *,
+    strength: float,
+):
+    """Refine exact v1 targets with stronger, texture-protected consensus.
+
+    Keeping this policy pure and separate from model/guide extraction lets an
+    offline proxy evaluate candidate constants against the exact production
+    target construction without applying an update or writing an artifact.
+    """
+    if not math.isfinite(strength) or not 0.0 < strength <= 1.0:
+        raise ValueError(
+            "frequency-consensus-adaptive strength must be finite and in (0,1]"
+        )
+    if not isinstance(maps, dict) or set(maps) != set(DISNEY_TV_SCALAR_NAMES):
+        raise ValueError("frequency-consensus-adaptive policy has wrong scalar maps")
+    if tuple(guide_texture_core.shape) != tuple(update_safe.shape) or tuple(
+        guide_texture_halo.shape
+    ) != tuple(update_safe.shape):
+        raise ValueError("frequency-consensus-adaptive policy masks disagree")
+    results = {}
+    for name in DISNEY_TV_SCALAR_NAMES:
+        entry = maps[name]
+        source = entry["source"]
+        median3 = entry["median3"]
+        median7 = entry["median7"]
+        strong_target = (
+            FREQUENCY_ADAPTIVE_STRONG_MEDIAN3_WEIGHT * median3
+            + FREQUENCY_ADAPTIVE_STRONG_MEDIAN7_WEIGHT * median7
+        )
+        fixed_target = entry["fixed_target"]
+        if name in FREQUENCY_ADAPTIVE_FOCUSED_MAPS:
+            policy_target = torch.where(
+                guide_texture_core,
+                fixed_target,
+                strong_target,
+            )
+            strong_policy_eligible = update_safe & ~guide_texture_core
+        else:
+            halo_target = source + FREQUENCY_ADAPTIVE_HALO_V1_BLEND * (
+                fixed_target - source
+            )
+            policy_target = torch.where(
+                guide_texture_halo,
+                halo_target,
+                strong_target,
+            )
+            strong_policy_eligible = update_safe & ~guide_texture_halo
+        policy_target = torch.where(update_safe, policy_target, source)
+        target = source + strength * (policy_target - source)
+        update_mask = update_safe & (target != source)
+        consensus_mask = strong_policy_eligible & (target != source)
+        results[name] = {
+            "policy_target": policy_target.detach(),
+            "target": target.detach(),
+            "mask": update_mask.detach(),
+            "consensus_mask": consensus_mask.detach(),
+            "updated_count": int(update_mask.sum().item()),
+            "consensus_count": int(consensus_mask.sum().item()),
+        }
+    return results
+
+
+def _build_frequency_consensus_adaptive_bundle(
+    torch,
+    model,
+    mask_hwc,
+    albedo_hwc,
+    normal_hwc,
+    *,
+    created_after_step: int,
+    strength: float,
+):
+    """Freeze the accepted v1 target plus a selective stronger override."""
+    fixed = _build_frequency_consensus_bundle(
+        torch,
+        model,
+        mask_hwc,
+        albedo_hwc,
+        normal_hwc,
+        created_after_step=created_after_step,
+        strength=1.0,
+    )
+    expected_shape = tuple(fixed["update_safe"].shape)
+    texture = _frequency_adaptive_guide_texture_state(
+        torch,
+        albedo_hwc.detach(),
+        normal_hwc.detach(),
+        fixed["full_foreground5"],
+    )
+    maps = {}
+    with torch.no_grad():
+        for name in DISNEY_TV_SCALAR_NAMES:
+            entry = fixed["maps"][name]
+            maps[name] = {
+                "source": entry["source"].detach().clone(),
+                "median3": entry["median3"].detach().clone(),
+                "median7": entry["median7"].detach().clone(),
+                "fixed_target": entry["target"].detach().clone(),
+            }
+        adaptive_targets = _frequency_consensus_adaptive_targets(
+            torch,
+            maps,
+            fixed["update_safe"],
+            texture["guide_texture_core"],
+            texture["guide_texture_halo"],
+            strength=strength,
+        )
+        for name in DISNEY_TV_SCALAR_NAMES:
+            maps[name].update(adaptive_targets[name])
+    bundle = {
+        "schema": "ictpolarreal.frequency-consensus-adaptive-bundle.v1",
+        "created_after_step": int(created_after_step),
+        "strength": float(strength),
+        "median_chunk_rows": dict(fixed["median_chunk_rows"]),
+        "edge_threshold_full_precision": fixed["edge_threshold_full_precision"],
+        "edge_threshold_png_quantized": fixed["edge_threshold_png_quantized"],
+        "guide_texture_scales": {
+            key: texture[key]
+            for key in (
+                "full_precision_albedo_scale",
+                "full_precision_normal_scale",
+                "png_quantized_albedo_scale",
+                "png_quantized_normal_scale",
+            )
+        },
+        "maps": maps,
+    }
     for key in (
         "fit_foreground",
         "full_foreground5",
@@ -3869,18 +4231,64 @@ def _frequency_consensus_tensor_hashes(bundle) -> dict[str, Any]:
         "edge_protected_png_quantized",
         "edge_protected",
         "update_safe",
-        "evidence_count",
     ):
+        bundle[key] = fixed[key].detach().clone()
+    for key in (
+        "guide_texture_full_precision",
+        "guide_texture_png_quantized",
+        "guide_texture_core",
+        "guide_texture_halo",
+    ):
+        bundle[key] = texture[key].detach().clone()
+    bundle["tensor_hashes"] = _frequency_consensus_tensor_hashes(bundle)
+    _validate_frequency_consensus_bundle(
+        torch,
+        bundle,
+        expected_shape=expected_shape,
+        expected_strength=strength,
+    )
+    return bundle
+
+
+def _frequency_consensus_tensor_hashes(bundle) -> dict[str, Any]:
+    adaptive = bundle.get("schema") == (
+        "ictpolarreal.frequency-consensus-adaptive-bundle.v1"
+    )
+    root = {}
+    root_keys = [
+        "fit_foreground",
+        "full_foreground5",
+        "edge_protected_full_precision",
+        "edge_protected_png_quantized",
+        "edge_protected",
+        "update_safe",
+    ]
+    if adaptive:
+        root_keys.extend(
+            [
+                "guide_texture_full_precision",
+                "guide_texture_png_quantized",
+                "guide_texture_core",
+                "guide_texture_halo",
+            ]
+        )
+    else:
+        root_keys.append("evidence_count")
+    for key in root_keys:
         root[key] = _array_sha256(bundle[key].detach().cpu().numpy())
     maps = {}
     for name in DISNEY_TV_SCALAR_NAMES:
         entry = bundle["maps"][name]
         maps[name] = {}
-        for key in ("source", "median3", "median7", "target"):
+        float_keys = ["source", "median3", "median7", "target"]
+        mask_keys = ["mask", "consensus_mask"]
+        if adaptive:
+            float_keys.extend(["fixed_target", "policy_target"])
+        for key in float_keys:
             maps[name][key] = _array_sha256(
                 entry[key].detach().float().cpu().numpy()
             )
-        for key in ("mask", "consensus_mask"):
+        for key in mask_keys:
             maps[name][key] = _array_sha256(entry[key].detach().cpu().numpy())
     return {"root": root, "maps": maps}
 
@@ -3894,6 +4302,18 @@ def _validate_frequency_consensus_bundle(
     expected_strength: float | None = None,
     verify_counts: bool = True,
 ) -> None:
+    if isinstance(bundle, dict) and bundle.get("schema") == (
+        "ictpolarreal.frequency-consensus-adaptive-bundle.v1"
+    ):
+        _validate_frequency_consensus_adaptive_bundle(
+            torch,
+            bundle,
+            expected_shape=expected_shape,
+            expected_created_after_step=expected_created_after_step,
+            expected_strength=expected_strength,
+            verify_counts=verify_counts,
+        )
+        return
     if not isinstance(bundle, dict) or bundle.get("schema") != (
         "ictpolarreal.frequency-consensus-bundle.v1"
     ):
@@ -4084,9 +4504,329 @@ def _validate_frequency_consensus_bundle(
         raise ValueError("frequency-consensus frozen bundle tensor hashes do not match")
 
 
+def _validate_frequency_consensus_adaptive_bundle(
+    torch,
+    bundle,
+    *,
+    expected_shape: tuple[int, int],
+    expected_created_after_step: int | None = None,
+    expected_strength: float | None = None,
+    verify_counts: bool = True,
+) -> None:
+    if not isinstance(bundle, dict) or bundle.get("schema") != (
+        "ictpolarreal.frequency-consensus-adaptive-bundle.v1"
+    ):
+        raise ValueError("invalid or missing frequency-consensus-adaptive frozen bundle")
+    if expected_created_after_step is not None and bundle.get(
+        "created_after_step"
+    ) != int(expected_created_after_step):
+        raise ValueError(
+            "frequency-consensus-adaptive frozen bundle was created at the wrong "
+            "stage boundary"
+        )
+    strength = bundle.get("strength")
+    if not isinstance(strength, float) or not 0.0 < strength <= 1.0:
+        raise ValueError(
+            "frequency-consensus-adaptive frozen bundle has invalid strength"
+        )
+    if expected_strength is not None and strength != float(expected_strength):
+        raise ValueError(
+            "frequency-consensus-adaptive frozen bundle has stale strength"
+        )
+    expected_chunks = {
+        "3x3": min(
+            expected_shape[0],
+            _frequency_consensus_chunk_rows(expected_shape[1], 3),
+        ),
+        "7x7": min(
+            expected_shape[0],
+            _frequency_consensus_chunk_rows(expected_shape[1], 7),
+        ),
+    }
+    if bundle.get("median_chunk_rows") != expected_chunks:
+        raise ValueError(
+            "frequency-consensus-adaptive frozen bundle has stale chunk plan"
+        )
+    for key in (
+        "edge_threshold_full_precision",
+        "edge_threshold_png_quantized",
+    ):
+        value = bundle.get(key)
+        if not isinstance(value, float) or not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"frequency-consensus-adaptive {key} is invalid")
+    mask_keys = (
+        "fit_foreground",
+        "full_foreground5",
+        "edge_protected_full_precision",
+        "edge_protected_png_quantized",
+        "edge_protected",
+        "update_safe",
+        "guide_texture_full_precision",
+        "guide_texture_png_quantized",
+        "guide_texture_core",
+        "guide_texture_halo",
+    )
+    for key in mask_keys:
+        value = bundle.get(key)
+        if (
+            not isinstance(value, torch.Tensor)
+            or tuple(value.shape) != expected_shape
+            or value.dtype != torch.bool
+            or value.requires_grad
+        ):
+            raise ValueError(f"frequency-consensus-adaptive {key} mask is invalid")
+    fit_foreground = bundle["fit_foreground"]
+    holes = (~fit_foreground).to(dtype=torch.float32)[None, None]
+    expected_full5 = torch.nn.functional.max_pool2d(
+        torch.nn.functional.pad(holes, (2, 2, 2, 2), value=1.0),
+        kernel_size=5,
+        stride=1,
+    )[0, 0] == 0.0
+    if not torch.equal(bundle["full_foreground5"], expected_full5):
+        raise ValueError("frequency-consensus-adaptive full-foreground mask is stale")
+    expected_edge_union = (
+        bundle["edge_protected_full_precision"]
+        | bundle["edge_protected_png_quantized"]
+    )
+    if not torch.equal(bundle["edge_protected"], expected_edge_union):
+        raise ValueError("frequency-consensus-adaptive edge-protection union is stale")
+    expected_update_safe = expected_full5 & ~expected_edge_union
+    if not torch.equal(bundle["update_safe"], expected_update_safe):
+        raise ValueError("frequency-consensus-adaptive update-safe mask is stale")
+    scales = bundle.get("guide_texture_scales")
+    expected_scale_keys = {
+        "full_precision_albedo_scale",
+        "full_precision_normal_scale",
+        "png_quantized_albedo_scale",
+        "png_quantized_normal_scale",
+    }
+    if (
+        not isinstance(scales, dict)
+        or set(scales) != expected_scale_keys
+        or any(
+            not isinstance(value, float)
+            or not math.isfinite(value)
+            or value <= 0.0
+            for value in scales.values()
+        )
+    ):
+        raise ValueError("frequency-consensus-adaptive guide texture scales invalid")
+    expected_core = (
+        bundle["guide_texture_full_precision"]
+        | bundle["guide_texture_png_quantized"]
+    )
+    if not torch.equal(bundle["guide_texture_core"], expected_core):
+        raise ValueError("frequency-consensus-adaptive guide texture core is stale")
+    if bool((expected_core & ~expected_full5).any()):
+        raise ValueError(
+            "frequency-consensus-adaptive guide-texture mask leaves the interior"
+        )
+    expected_halo = (
+        torch.nn.functional.max_pool2d(
+            expected_core[None, None].to(dtype=torch.float32),
+            kernel_size=3,
+            stride=1,
+            padding=1,
+        )[0, 0]
+        > 0.5
+    ) & expected_full5
+    if not torch.equal(bundle["guide_texture_halo"], expected_halo):
+        raise ValueError(
+            "frequency-consensus-adaptive guide texture halo is stale"
+        )
+    maps = bundle.get("maps")
+    if not isinstance(maps, dict) or set(maps) != set(DISNEY_TV_SCALAR_NAMES):
+        raise ValueError(
+            "frequency-consensus-adaptive bundle has the wrong scalar maps"
+        )
+    unit_float_keys = (
+        "source",
+        "median3",
+        "median7",
+        "fixed_target",
+        "policy_target",
+        "target",
+    )
+    entry_mask_keys = ("mask", "consensus_mask")
+    for name in DISNEY_TV_SCALAR_NAMES:
+        entry = maps[name]
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"frequency-consensus-adaptive frozen map {name} is invalid"
+            )
+        for key in unit_float_keys:
+            value = entry.get(key)
+            if (
+                not isinstance(value, torch.Tensor)
+                or tuple(value.shape) != expected_shape
+                or value.dtype != torch.float32
+                or value.requires_grad
+                or not bool(torch.isfinite(value).all())
+                or bool((value < 0.0).any())
+                or bool((value > 1.0).any())
+            ):
+                raise ValueError(
+                    f"frequency-consensus-adaptive {key} {name} is invalid"
+                )
+        for key in entry_mask_keys:
+            value = entry.get(key)
+            if (
+                not isinstance(value, torch.Tensor)
+                or tuple(value.shape) != expected_shape
+                or value.dtype != torch.bool
+                or value.requires_grad
+            ):
+                raise ValueError(
+                    f"frequency-consensus-adaptive {key} {name} is invalid"
+                )
+        for key in ("updated_count", "consensus_count"):
+            if not isinstance(entry.get(key), int) or entry[key] < 0:
+                raise ValueError(
+                    f"frequency-consensus-adaptive {key} {name} is invalid"
+                )
+        if verify_counts:
+            if entry["updated_count"] != int(entry["mask"].sum().item()):
+                raise ValueError(
+                    f"frequency-consensus-adaptive updated count {name} is stale"
+                )
+            if entry["consensus_count"] != int(
+                entry["consensus_mask"].sum().item()
+            ):
+                raise ValueError(
+                    f"frequency-consensus-adaptive consensus count {name} is stale"
+                )
+    v1_evidence_count = torch.stack(
+        [
+            (maps[name]["source"] - maps[name]["median7"]).abs()
+            > FREQUENCY_CONSENSUS_EVIDENCE_THRESHOLD
+            for name in DISNEY_TV_SCALAR_NAMES
+        ]
+    ).sum(dim=0)
+    for name in DISNEY_TV_SCALAR_NAMES:
+        entry = maps[name]
+        source = entry["source"]
+        median3 = entry["median3"]
+        median7 = entry["median7"]
+        fixed_consensus = (
+            (v1_evidence_count >= FREQUENCY_CONSENSUS_MIN_EVIDENCE_MAPS)
+            & ((source - median7).abs() > FREQUENCY_CONSENSUS_OWN_DEVIATION)
+            & expected_update_safe
+        )
+        fixed_base_target = source + FREQUENCY_CONSENSUS_BASE_BLEND * (
+            median3 - source
+        )
+        fixed_consensus_target = (
+            FREQUENCY_CONSENSUS_MEDIAN3_TARGET_WEIGHT * median3
+            + FREQUENCY_CONSENSUS_MEDIAN7_TARGET_WEIGHT * median7
+        )
+        fixed_desired = torch.where(
+            fixed_consensus,
+            fixed_consensus_target,
+            fixed_base_target,
+        )
+        expected_fixed_target = torch.where(
+            expected_update_safe,
+            fixed_desired,
+            source,
+        )
+        if not torch.equal(entry["fixed_target"], expected_fixed_target):
+            raise ValueError(
+                f"frequency-consensus-adaptive fixed v1 target {name} is stale"
+            )
+        strong_target = (
+            FREQUENCY_ADAPTIVE_STRONG_MEDIAN3_WEIGHT * median3
+            + FREQUENCY_ADAPTIVE_STRONG_MEDIAN7_WEIGHT * median7
+        )
+        if name in FREQUENCY_ADAPTIVE_FOCUSED_MAPS:
+            expected_policy = torch.where(
+                bundle["guide_texture_core"],
+                expected_fixed_target,
+                strong_target,
+            )
+            strong_policy_eligible = (
+                expected_update_safe & ~bundle["guide_texture_core"]
+            )
+        else:
+            halo_target = source + FREQUENCY_ADAPTIVE_HALO_V1_BLEND * (
+                expected_fixed_target - source
+            )
+            expected_policy = torch.where(
+                bundle["guide_texture_halo"],
+                halo_target,
+                strong_target,
+            )
+            strong_policy_eligible = (
+                expected_update_safe & ~bundle["guide_texture_halo"]
+            )
+        expected_policy = torch.where(
+            expected_update_safe, expected_policy, source
+        )
+        if not torch.equal(entry["policy_target"], expected_policy):
+            raise ValueError(
+                f"frequency-consensus-adaptive policy target {name} is stale"
+            )
+        expected_target = source + strength * (expected_policy - source)
+        if not torch.equal(entry["target"], expected_target):
+            raise ValueError(
+                f"frequency-consensus-adaptive frozen target {name} is stale"
+            )
+        expected_consensus = strong_policy_eligible & (
+            expected_target != source
+        )
+        if not torch.equal(entry["consensus_mask"], expected_consensus):
+            raise ValueError(
+                f"frequency-consensus-adaptive consensus mask {name} is stale"
+            )
+        expected_mask = expected_update_safe & (expected_target != source)
+        if not torch.equal(entry["mask"], expected_mask):
+            raise ValueError(
+                f"frequency-consensus-adaptive update mask {name} is stale"
+            )
+    expected_root_hash_keys = {
+        "fit_foreground",
+        "full_foreground5",
+        "edge_protected_full_precision",
+        "edge_protected_png_quantized",
+        "edge_protected",
+        "update_safe",
+        "guide_texture_full_precision",
+        "guide_texture_png_quantized",
+        "guide_texture_core",
+        "guide_texture_halo",
+    }
+    expected_map_hash_keys = {
+        "source",
+        "median3",
+        "median7",
+        "fixed_target",
+        "policy_target",
+        "target",
+        "mask",
+        "consensus_mask",
+    }
+    tensor_hashes = bundle.get("tensor_hashes")
+    if (
+        not isinstance(tensor_hashes, dict)
+        or set(tensor_hashes) != {"root", "maps"}
+        or set(tensor_hashes.get("root", {})) != expected_root_hash_keys
+        or set(tensor_hashes.get("maps", {})) != set(DISNEY_TV_SCALAR_NAMES)
+        or any(
+            set(tensor_hashes["maps"].get(name, {})) != expected_map_hash_keys
+            for name in DISNEY_TV_SCALAR_NAMES
+        )
+        or tensor_hashes != _frequency_consensus_tensor_hashes(bundle)
+    ):
+        raise ValueError(
+            "frequency-consensus-adaptive frozen bundle tensor hashes do not match"
+        )
+
+
 def _frequency_consensus_bundle_provenance(bundle) -> dict[str, Any] | None:
     if bundle is None:
         return None
+    adaptive = bundle.get("schema") == (
+        "ictpolarreal.frequency-consensus-adaptive-bundle.v1"
+    )
     maps = {}
     for name in DISNEY_TV_SCALAR_NAMES:
         entry = bundle["maps"][name]
@@ -4110,7 +4850,14 @@ def _frequency_consensus_bundle_provenance(bundle) -> dict[str, Any] | None:
                 entry["consensus_mask"].detach().cpu().numpy()
             ),
         }
-    return {
+        if adaptive:
+            maps[name]["fixed_target_sha256"] = _array_sha256(
+                entry["fixed_target"].detach().float().cpu().numpy()
+            )
+            maps[name]["policy_target_sha256"] = _array_sha256(
+                entry["policy_target"].detach().float().cpu().numpy()
+            )
+    provenance = {
         "schema": bundle["schema"],
         "created_after_step": int(bundle["created_after_step"]),
         "strength": float(bundle["strength"]),
@@ -4136,9 +4883,6 @@ def _frequency_consensus_bundle_provenance(bundle) -> dict[str, Any] | None:
         "update_safe_sha256": _array_sha256(
             bundle["update_safe"].detach().cpu().numpy()
         ),
-        "evidence_count_sha256": _array_sha256(
-            bundle["evidence_count"].detach().cpu().numpy()
-        ),
         "tensor_hashes": bundle["tensor_hashes"],
         "maps": maps,
         "total_updated_entries": int(
@@ -4148,30 +4892,67 @@ def _frequency_consensus_bundle_provenance(bundle) -> dict[str, Any] | None:
             sum(entry["consensus_entries"] for entry in maps.values())
         ),
     }
+    if adaptive:
+        provenance["consensus_entry_semantics"] = (
+            "strong_policy_eligible_and_final_target_differs_from_source"
+        )
+        provenance["guide_texture"] = {
+            "scales": dict(bundle["guide_texture_scales"]),
+            "masks": {
+                key: {
+                    "pixels": int(bundle[key].sum().item()),
+                    "sha256": _array_sha256(
+                        bundle[key].detach().cpu().numpy()
+                    ),
+                }
+                for key in (
+                    "guide_texture_full_precision",
+                    "guide_texture_png_quantized",
+                    "guide_texture_core",
+                    "guide_texture_halo",
+                )
+            },
+        }
+    else:
+        provenance["evidence_count_sha256"] = _array_sha256(
+            bundle["evidence_count"].detach().cpu().numpy()
+        )
+    return provenance
 
 
 def _write_frequency_frozen_artifact(path: Path, bundle) -> dict[str, Any]:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f"{path.name}.tmp")
+    adaptive = bundle.get("schema") == (
+        "ictpolarreal.frequency-consensus-adaptive-bundle.v1"
+    )
+    metadata = {
+        "schema": "ictpolarreal.frequency-frozen-artifact.v1",
+        "created_after_step": int(bundle["created_after_step"]),
+        "strength": float(bundle["strength"]),
+        "median_chunk_rows": dict(bundle["median_chunk_rows"]),
+        "edge_threshold_full_precision": float(
+            bundle["edge_threshold_full_precision"]
+        ),
+        "edge_threshold_png_quantized": float(
+            bundle["edge_threshold_png_quantized"]
+        ),
+        "maps": list(DISNEY_TV_SCALAR_NAMES),
+        "tensor_hashes": bundle["tensor_hashes"],
+    }
+    if adaptive:
+        metadata.update(
+            {
+                "bundle_schema": bundle["schema"],
+                "consensus_entry_semantics": (
+                    "strong_policy_eligible_and_final_target_differs_from_source"
+                ),
+                "guide_texture_scales": dict(bundle["guide_texture_scales"]),
+            }
+        )
     payload = {
         "metadata": np.asarray(
-            json.dumps(
-                {
-                    "schema": "ictpolarreal.frequency-frozen-artifact.v1",
-                    "created_after_step": int(bundle["created_after_step"]),
-                    "strength": float(bundle["strength"]),
-                    "median_chunk_rows": dict(bundle["median_chunk_rows"]),
-                    "edge_threshold_full_precision": float(
-                        bundle["edge_threshold_full_precision"]
-                    ),
-                    "edge_threshold_png_quantized": float(
-                        bundle["edge_threshold_png_quantized"]
-                    ),
-                    "maps": list(DISNEY_TV_SCALAR_NAMES),
-                    "tensor_hashes": bundle["tensor_hashes"],
-                },
-                sort_keys=True,
-            )
+            json.dumps(metadata, sort_keys=True)
         ),
         "fit_foreground": bundle["fit_foreground"].detach().cpu().numpy(),
         "full_foreground5": bundle["full_foreground5"].detach().cpu().numpy(),
@@ -4183,14 +4964,31 @@ def _write_frequency_frozen_artifact(path: Path, bundle) -> dict[str, Any]:
         ].detach().cpu().numpy(),
         "edge_protected": bundle["edge_protected"].detach().cpu().numpy(),
         "update_safe": bundle["update_safe"].detach().cpu().numpy(),
-        "evidence_count": bundle["evidence_count"].detach().cpu().numpy(),
     }
+    if adaptive:
+        for key in (
+            "guide_texture_full_precision",
+            "guide_texture_png_quantized",
+            "guide_texture_core",
+            "guide_texture_halo",
+        ):
+            payload[key] = bundle[key].detach().cpu().numpy()
+    else:
+        payload["evidence_count"] = bundle[
+            "evidence_count"
+        ].detach().cpu().numpy()
     for name in DISNEY_TV_SCALAR_NAMES:
         entry = bundle["maps"][name]
-        for key in ("source", "median3", "median7", "target", "mask", "consensus_mask"):
-            payload[f"{name}__{key}"] = entry[key].detach().float().cpu().numpy() \
-                if key not in {"mask", "consensus_mask"} \
-                else entry[key].detach().cpu().numpy()
+        float_keys = ["source", "median3", "median7", "target"]
+        mask_keys = ["mask", "consensus_mask"]
+        if adaptive:
+            float_keys.extend(["fixed_target", "policy_target"])
+        for key in float_keys:
+            payload[f"{name}__{key}"] = (
+                entry[key].detach().float().cpu().numpy()
+            )
+        for key in mask_keys:
+            payload[f"{name}__{key}"] = entry[key].detach().cpu().numpy()
     with temporary.open("wb") as stream:
         np.savez_compressed(stream, **payload)
     temporary.replace(path)
@@ -4372,7 +5170,9 @@ def _frequency_frozen_artifact_complete(
     )
 
     def enabled_frequency(value) -> bool:
-        if not isinstance(value, dict) or value.get("kind") != "frequency-consensus":
+        if not isinstance(value, dict) or not _is_frequency_consensus_kind(
+            value.get("kind")
+        ):
             return False
         stage_plan = value.get("stage_plan")
         return isinstance(stage_plan, dict) and stage_plan.get("enabled") is True
@@ -4387,12 +5187,21 @@ def _frequency_frozen_artifact_complete(
         if regularization.get(key) != signature_regularization.get(key):
             return False
     frozen_bundle = regularization.get("frozen_bundle")
+    expected_bundle_schema = (
+        "ictpolarreal.frequency-consensus-adaptive-bundle.v1"
+        if regularization.get("kind") == "frequency-consensus-adaptive"
+        else "ictpolarreal.frequency-consensus-bundle.v1"
+    )
     evaluation = acquisition.get("evaluation")
     evaluations = (
         evaluation.get("evaluations") if isinstance(evaluation, dict) else None
     )
-    if not isinstance(frozen_bundle, dict) or not _frequency_completion_records_valid(
-        regularization, frozen_bundle, evaluations
+    if (
+        not isinstance(frozen_bundle, dict)
+        or frozen_bundle.get("schema") != expected_bundle_schema
+        or not _frequency_completion_records_valid(
+            regularization, frozen_bundle, evaluations
+        )
     ):
         return False
     artifact = frozen_bundle.get("artifact") if isinstance(frozen_bundle, dict) else None

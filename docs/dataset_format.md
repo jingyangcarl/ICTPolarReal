@@ -49,7 +49,7 @@ outputs/material_acquisition_end2end/
       olat/
         acquisition.json
         disney_brdf.pt
-        frequency_consensus_frozen.npz  # only for enabled frequency consensus
+        frequency_consensus_frozen.npz  # enabled fixed/adaptive frequency cleanup
         maps/
           albedo.png
           baseColor.png
@@ -90,10 +90,14 @@ outputs/material_acquisition_end2end/
 
 The default `--end2end-profiles olat,hdri,mix` creates all three profile
 subtrees as independent fits. A subset creates only the requested directories.
-An enabled `frequency-consensus` profile additionally stores the hashed frozen
-sources, targets, masks, and guide state in
-`frequency_consensus_frozen.npz`; its `acquisition.json` records the matching
-artifact provenance and same-checkpoint OLAT/HDRI guard.
+An enabled fixed or adaptive frequency-consensus profile additionally stores
+its hashed frozen state in `frequency_consensus_frozen.npz`; fixed v1 remains a
+supported, distinct mode. The adaptive bundle records the full-precision and
+PNG-quantized guide-texture masks, their core and halo, and each scalar map's
+frozen source, fixed-v1 target, composed policy target, final target, and update
+mask. `acquisition.json` records matching hashes, counts, regularizer settings,
+and the same-checkpoint OLAT/HDRI guard. Bundle semantics and artifacts are
+validated before a completed profile can be reused.
 The camera `manifest.json` lists the available profiles and contains
 `primary_material_dir`, for example `material/olat/maps`. The RGB2X loaders
 resolve this field first, so `--end2end-primary-profile` selects the maps

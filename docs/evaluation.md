@@ -161,9 +161,10 @@ suite to fitted-condition reconstruction, and the summary labels it
 
 ## Controlled regularization report
 
-Compare a completed zero-weight camera result against its regularized result
-with the acquisition-aware report composer. The two runs must use controlled
-data, profile, optimization, lighting, and evaluation settings:
+Compare a completed zero-weight camera result against its regularized result,
+or a fixed-v1 `frequency-consensus` result against an adaptive result, with the
+acquisition-aware report composer. The two runs must use controlled data,
+profile, optimization, lighting, and evaluation settings:
 
 ```bash
 OBJECT=dragondruit
@@ -179,6 +180,16 @@ material sheet per fit profile under `material/`, and OLAT/HDRI relighting
 sheets under `evaluation/`. A frequency-consensus comparison also includes
 `material/frequency_hotspot_1to1.png` and
 `material/frequency_fullmaps_1to1.png` for native-scale inspection.
+
+For a fixed-v1-to-adaptive report, point `--baseline` at the completed
+reference-strength `frequency-consensus` camera and `--regularized` at an
+otherwise identical `frequency-consensus-adaptive` camera. The comparator
+permits this explicit transition while still requiring matching input hashes,
+fit settings, profile coverage, lighting/evaluation cases, and frozen-state
+provenance. It validates the adaptive full/PNG guide core and halo plus the
+fixed, policy, and final target artifacts before composing the report. The
+adaptive mode remains opt-in; this comparison does not reinterpret or replace
+fixed v1.
 
 Qualification requires exactly the `olat`, `hdri`, and `mix` fit profiles and
 all numeric gates. A subset requested with `--profiles` is useful for an early

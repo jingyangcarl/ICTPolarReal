@@ -120,7 +120,20 @@ strength and `0` leaves the data-only result unchanged. The frozen tensors,
 guide state, and hashes are retained in
 `frequency_consensus_frozen.npz` beside `acquisition.json`.
 
-Before a frequency-consensus result can complete, the pipeline evaluates the
+`frequency-consensus-adaptive` is an additional opt-in mode; fixed
+`frequency-consensus` v1 remains available and the default `impulse-median`
+behavior is unchanged. Adaptive cleanup first derives the exact full-strength
+v1 target from the frozen data-fit maps. It then builds fixed-scale band-pass
+guide-texture masks independently from the full-precision and exactly
+PNG-quantized albedo and normal guides, unions them into a core, and protects a
+one-pixel square halo. Anisotropic and subsurface retain the v1 target in the core and use the
+stronger 3x3/7x7 target outside it; the other scalar maps retain a partial v1
+update in the halo and use the stronger target outside the halo. The CLI
+strength is applied exactly once after this policy is composed. Frozen guide
+masks, v1/policy/final targets, hashes, and provenance are validated on resume
+and completion.
+
+Before either frequency-consensus result can complete, the pipeline evaluates the
 same checkpoint immediately before and after the frozen update. It rejects a
 cleanup whose mean MSE regresses by more than the `1e-8` numerical tolerance on
 either the OLAT or HDRI suite. Completion also verifies that each post-cleanup
@@ -177,6 +190,14 @@ bash run.sh process \
   --slurm-account ACCOUNT --slurm-partition PARTITION \
   --slurm-cpus 16 --slurm-mem 128G --slurm-gpus 1
 ```
+
+For a controlled fixed-v1-to-adaptive experiment, use the completed
+reference-strength `frequency-consensus` run as the report baseline and submit
+an otherwise identical candidate with only
+`--end2end-tv-kind frequency-consensus-adaptive` and a separate
+`--material-root`. The acquisition-aware comparator verifies the permitted
+regularizer transition and shared fit/evaluation provenance before reporting
+material and relighting differences.
 
 Use the same data, profile, optimization, lighting, and evaluation settings for
 both roots. Re-submit an identical interrupted command to resume its active
@@ -293,7 +314,7 @@ outputs/material_acquisition_end2end/
       olat/
         acquisition.json
         disney_brdf.pt
-        frequency_consensus_frozen.npz  # only for enabled frequency consensus
+        frequency_consensus_frozen.npz  # enabled fixed/adaptive frequency cleanup
         maps/
           albedo.png
           baseColor.png

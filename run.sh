@@ -117,7 +117,8 @@ Options:
                             Disney BRDF learning rate. Default: ${END2END_LEARNING_RATE}
   --end2end-tv-weight FLOAT
                             Masked scalar-map regularizer weight; 0 disables it. Default: ${END2END_TV_WEIGHT}
-  --end2end-tv-kind KIND    l1, edge-charbonnier, impulse-median, or frequency-consensus. Default: ${END2END_TV_KIND}
+  --end2end-tv-kind KIND    l1, edge-charbonnier, impulse-median, frequency-consensus,
+                            or frequency-consensus-adaptive. Default: ${END2END_TV_KIND}
   --end2end-eval-lights N  OLATs held out for relighting evaluation. Default: ${END2END_EVAL_LIGHTS}
   --end2end-profiles LIST   Independent olat,hdri,mix fits; comma-separated or all. Default: ${END2END_PROFILES}
   --end2end-hdri-root PATH HDR/EXR maps used to synthesize environment targets. Default: ${END2END_HDRI_ROOT}
@@ -288,8 +289,8 @@ parse_args() {
     exit 2
   fi
   case "${END2END_TV_KIND}" in
-    l1|edge-charbonnier|impulse-median|frequency-consensus) ;;
-    *) echo "--end2end-tv-kind must be l1, edge-charbonnier, impulse-median, or frequency-consensus; got: ${END2END_TV_KIND}" >&2; exit 2 ;;
+    l1|edge-charbonnier|impulse-median|frequency-consensus|frequency-consensus-adaptive) ;;
+    *) echo "--end2end-tv-kind must be l1, edge-charbonnier, impulse-median, frequency-consensus, or frequency-consensus-adaptive; got: ${END2END_TV_KIND}" >&2; exit 2 ;;
   esac
   if ! [[ "${END2END_HDRI_COUNT}" =~ ^[1-9][0-9]*$ ]]; then
     echo "--end2end-hdri-count must be a positive integer; got: ${END2END_HDRI_COUNT}" >&2

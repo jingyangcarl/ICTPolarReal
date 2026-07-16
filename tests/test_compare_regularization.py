@@ -731,6 +731,152 @@ def _make_frequency_consensus_pair(
     return provenance["artifact"], bundle
 
 
+def _make_active_frequency_adaptive_pair(
+    baseline,
+    candidate,
+    *,
+    profile="olat",
+    fit_mask=None,
+):
+    torch = pytest.importorskip("torch")
+    source = (
+        baseline.parents[2]
+        / "_adaptive_data_fit_source"
+        / baseline.parent.name
+        / baseline.name
+    )
+    if not source.exists():
+        shutil.copytree(baseline, source)
+    _make_frequency_consensus_pair(
+        source,
+        baseline,
+        profile=profile,
+        fit_mask=fit_mask,
+    )
+
+    baseline_path = baseline / "material" / profile / "acquisition.json"
+    candidate_path = candidate / "material" / profile / "acquisition.json"
+    baseline_acquisition = json.loads(baseline_path.read_text(encoding="utf-8"))
+    candidate_acquisition = copy.deepcopy(baseline_acquisition)
+    producer_maps = tuple(end2end_acquisition.DISNEY_TV_SCALAR_NAMES)
+    source_values = {}
+    for map_name in producer_maps:
+        with Image.open(
+            source / "material" / profile / "maps" / f"{map_name}.png"
+        ) as image:
+            values = np.asarray(image.convert("L"), dtype=np.float32) / 255.0
+        source_values[map_name] = torch.as_tensor(values)
+
+    class ToyDisney(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            for map_name, values in source_values.items():
+                constrained = values.clamp(1e-5, 1.0 - 1e-5)
+                setattr(
+                    self,
+                    f"{map_name}_un",
+                    torch.nn.Parameter(torch.logit(constrained).unsqueeze(0)),
+                )
+
+        def _param_maps(self):
+            return {
+                map_name: torch.sigmoid(getattr(self, f"{map_name}_un"))[0]
+                for map_name in producer_maps
+            }
+
+    model = ToyDisney()
+    with Image.open(
+        source / "material" / profile / "maps" / "baseColor.png"
+    ) as image:
+        albedo = torch.as_tensor(
+            np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
+        )
+    with Image.open(
+        source / "material" / profile / "maps" / "normal.png"
+    ) as image:
+        normal = torch.as_tensor(
+            np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0 * 2.0
+            - 1.0
+        )
+    height, width = albedo.shape[:2]
+    if fit_mask is None:
+        fit_mask = np.ones((height, width), dtype=bool)
+    fit_mask = np.asarray(fit_mask, dtype=bool)
+    mask = torch.as_tensor(fit_mask.astype(np.float32)[..., None])
+    stage_plan = end2end_acquisition._frequency_consensus_stage_plan(
+        100,
+        enabled=True,
+        weight=0.00125,
+    )
+    bundle = end2end_acquisition._build_frequency_consensus_adaptive_bundle(
+        torch,
+        model,
+        mask,
+        albedo,
+        normal,
+        created_after_step=100,
+        strength=stage_plan["strength"],
+    )
+    diagnostic = end2end_acquisition._apply_frequency_consensus_update(
+        torch,
+        model,
+        bundle,
+    )
+    for map_name, values in model._param_maps().items():
+        _write_png(
+            candidate / "material" / profile / "maps" / f"{map_name}.png",
+            np.floor(
+                np.clip(values.detach().numpy(), 0.0, 1.0) * 255.0 + 0.5
+            ).astype(np.uint8),
+        )
+    provenance = end2end_acquisition._finalize_frequency_frozen_artifact(
+        candidate / "material" / profile,
+        bundle,
+    )
+    signature_regularization = {
+        "kind": "frequency-consensus-adaptive",
+        "weight": 0.00125,
+        "parameters": list(compare_regularization.SCALAR_MAPS),
+        "settings": end2end_acquisition._regularization_settings(
+            "frequency-consensus-adaptive"
+        ),
+        "stage_plan": stage_plan,
+    }
+    candidate_signature = copy.deepcopy(
+        baseline_acquisition["checkpoint_signature"]
+    )
+    candidate_signature["regularization"] = copy.deepcopy(
+        signature_regularization
+    )
+    candidate_signature["adapter"]["algorithm_version"] = (
+        "ictpolarreal-frequency-consensus-adaptive-v1"
+    )
+    pre_cleanup = {"olat": [0.10, 0.11], "hdri": [0.20, 0.21]}
+    post_cleanup = {"olat": [0.09, 0.10], "hdri": [0.19, 0.20]}
+    evaluation_guard = end2end_acquisition._frequency_evaluation_guard(
+        pre_cleanup,
+        post_cleanup,
+    )
+    candidate_acquisition["regularization"] = {
+        **signature_regularization,
+        "weight_semantics": "normalized_post_fit_strength",
+        "frozen_bundle": provenance,
+        "cleanup_applied": True,
+        "cleanup_diagnostic": diagnostic,
+        "evaluation_guard": evaluation_guard,
+        "data_objective_only": True,
+    }
+    candidate_acquisition["checkpoint_signature"] = candidate_signature
+    for lighting in compare_regularization.EVALUATION_LIGHTING:
+        suite = candidate_acquisition["evaluation"]["evaluations"][lighting]
+        suite["count"] = len(post_cleanup[lighting])
+        suite["metrics"]["mse"] = evaluation_guard["suites"][lighting][
+            "post_cleanup_mean_mse"
+        ]
+    candidate_path.write_text(json.dumps(candidate_acquisition), encoding="utf-8")
+    return provenance["artifact"], bundle
+
+
 def test_map_spatial_metrics_separate_quiet_outliers_and_edge_correspondence():
     mask = np.ones((9, 9), dtype=bool)
     base_color = np.full((9, 9, 3), 0.2, dtype=np.float32)
@@ -1363,6 +1509,90 @@ def test_frequency_transition_label_settings_and_baseline_state_are_versioned():
     with pytest.raises(ValueError, match="must not apply"):
         compare_regularization._validate_frequency_baseline_state(
             {**baseline_regularization, "cleanup_applied": True}
+        )
+
+
+def test_active_frequency_to_adaptive_contract_requires_equal_fit_and_weight():
+    parameters = list(compare_regularization.SCALAR_MAPS)
+    stage_plan = end2end_acquisition._frequency_consensus_stage_plan(
+        100,
+        enabled=True,
+        weight=0.00125,
+    )
+
+    def acquisition(kind, algorithm_version):
+        regularization = {
+            "kind": kind,
+            "weight": 0.00125,
+            "parameters": parameters,
+            "settings": end2end_acquisition._regularization_settings(kind),
+            "stage_plan": copy.deepcopy(stage_plan),
+        }
+        return {
+            "base_color_source": "dataset_albedo",
+            "regularization": regularization,
+            "checkpoint_signature": {
+                "schema": "ictpolarreal.end2end-checkpoint.v13",
+                "profile": "olat",
+                "normalized_targets_sha256": "same-data-fit",
+                "regularization": copy.deepcopy(regularization),
+                "adapter": {
+                    "schema": "ictpolarreal.profile-acquisition-adapter.v7",
+                    "algorithm_version": algorithm_version,
+                    "optimizer": "Adam with cosine decay",
+                },
+            },
+        }
+
+    baseline = acquisition(
+        "frequency-consensus",
+        "ictpolarreal-frequency-consensus-v1",
+    )
+    adaptive = acquisition(
+        "frequency-consensus-adaptive",
+        "ictpolarreal-frequency-consensus-adaptive-v1",
+    )
+    contract = compare_regularization._validate_comparison_contract(
+        {
+            "baseline": {"olat": baseline},
+            "regularized": {"olat": adaptive},
+        },
+        ("olat",),
+    )
+
+    assert contract["comparison_mode"] == (
+        "frequency-consensus-v1-to-adaptive-v1"
+    )
+    assert contract["signature_compatibility"] == [
+        "active-frequency-v1-to-adaptive-v1"
+    ]
+    assert contract["baseline_tv_weight"] == contract["regularized_tv_weight"]
+    assert contract["active_frequency_upgrade"] is True
+    assert compare_regularization._display_regularizer(
+        "frequency-consensus-adaptive"
+    ) == "adaptive frequency consensus"
+
+    unequal_weight = copy.deepcopy(adaptive)
+    unequal_weight["regularization"]["weight"] = 0.001
+    unequal_weight["checkpoint_signature"]["regularization"]["weight"] = 0.001
+    with pytest.raises(ValueError, match="requires equal weights"):
+        compare_regularization._validate_comparison_contract(
+            {
+                "baseline": {"olat": baseline},
+                "regularized": {"olat": unequal_weight},
+            },
+            ("olat",),
+        )
+
+    changed_fit = copy.deepcopy(adaptive)
+    changed_fit["checkpoint_signature"]["normalized_targets_sha256"] = "changed"
+    with pytest.raises(ValueError, match="checkpoint signatures"):
+        compare_regularization._validate_comparison_contract(
+            {
+                "baseline": {"olat": baseline},
+                "regularized": {"olat": changed_fit},
+            },
+            ("olat",),
         )
 
 
@@ -2270,6 +2500,205 @@ def test_compose_frequency_report_validates_writer_artifact_gates_and_native_pan
             baseline,
             candidate,
             tmp_path / "symmetric-deletion-comparison",
+            mask_path=mask_path,
+        )
+
+
+def test_compose_active_frequency_to_adaptive_report_validates_schema_and_keeps_fail(
+    tmp_path,
+    monkeypatch,
+):
+    baseline = tmp_path / "baseline" / "object" / "cam07"
+    candidate = tmp_path / "candidate" / "object" / "cam07"
+    shape = (260, 200)
+    for camera in (baseline, candidate):
+        _write_synthetic_camera(
+            camera,
+            tv_weight=0.0,
+            noisy=False,
+            shape=shape,
+        )
+    fit_mask = np.ones(shape, dtype=bool)
+    fit_mask[0, 0] = False
+    fit_mask[160, 96] = False
+    _, adaptive_bundle = _make_active_frequency_adaptive_pair(
+        baseline,
+        candidate,
+        fit_mask=fit_mask,
+    )
+    update_safe = adaptive_bundle["update_safe"].detach().cpu().numpy()
+    guide_core = adaptive_bundle["guide_texture_core"].detach().cpu().numpy()
+    guide_halo = adaptive_bundle["guide_texture_halo"].detach().cpu().numpy()
+    unchanged_strong_eligible = 0
+    expected_incremental_strong_changed = 0
+    for map_name, entry in adaptive_bundle["maps"].items():
+        source = entry["source"].detach().cpu().numpy()
+        fixed_target = entry["fixed_target"].detach().cpu().numpy()
+        target = entry["target"].detach().cpu().numpy()
+        consensus_mask = entry["consensus_mask"].detach().cpu().numpy()
+        protected = (
+            guide_core
+            if map_name in compare_regularization.FREQUENCY_ADAPTIVE_FOCUSED_MAPS
+            else guide_halo
+        )
+        strong_eligible = update_safe & ~protected
+        expected_consensus = strong_eligible & (target != source)
+        assert np.array_equal(consensus_mask, expected_consensus)
+        unchanged_strong_eligible += int(
+            np.count_nonzero(strong_eligible & (target == source))
+        )
+        expected_incremental_strong_changed += int(
+            np.count_nonzero(consensus_mask & (target != fixed_target))
+        )
+    assert unchanged_strong_eligible > 0
+    mask_path = tmp_path / "mask.png"
+    _write_png(mask_path, fit_mask.astype(np.uint8) * 255)
+
+    prediction = (
+        candidate
+        / "evaluation"
+        / "olat"
+        / "cases"
+        / "shared_case"
+        / "predictions"
+        / "olat.png"
+    )
+    _write_png(prediction, np.zeros((*shape, 3), dtype=np.uint8))
+    end2end_acquisition._write_scalar_error_heatmap(
+        prediction,
+        baseline
+        / "evaluation"
+        / "olat"
+        / "cases"
+        / "shared_case"
+        / "reference.png",
+        candidate
+        / "evaluation"
+        / "olat"
+        / "cases"
+        / "shared_case"
+        / "errors"
+        / "olat.png",
+    )
+    monkeypatch.setattr(compare_regularization, "QUALIFICATION_PROFILES", ("olat",))
+    summary = compare_regularization.compose_regularization_comparison(
+        baseline,
+        candidate,
+        tmp_path / "comparison",
+        mask_path=mask_path,
+    )
+
+    contract = summary["comparison_contract"]
+    assert contract["comparison_mode"] == (
+        "frequency-consensus-v1-to-adaptive-v1"
+    )
+    assert contract["baseline_tv_weight"] == pytest.approx(0.00125)
+    assert contract["regularized_tv_weight"] == pytest.approx(0.00125)
+    assert summary["labels"]["baseline"].startswith(
+        "Baseline · post-fit frequency consensus"
+    )
+    assert summary["labels"]["regularized"].startswith(
+        "Regularized · adaptive frequency consensus"
+    )
+    cleanup = summary["frequency_cleanup"]
+    assert cleanup["comparison_mode"] == (
+        "frequency-consensus-v1-to-adaptive-v1"
+    )
+    assert "adaptive target differs" in cleanup["update_count_semantics"]
+    assert cleanup["profiles"]["olat"]["artifact"]["validated"] is True
+    assert cleanup["profiles"]["olat"]["artifact"][
+        "consensus_entry_semantics"
+    ] == compare_regularization.FREQUENCY_ADAPTIVE_CONSENSUS_ENTRY_SEMANTICS
+    assert cleanup["profiles"]["olat"]["annotation_labels"] == {
+        "updated": "changed",
+        "consensus": "strong changed",
+    }
+    assert cleanup["profiles"]["olat"]["consensus"][
+        "map_entries"
+    ] == expected_incremental_strong_changed
+    assert summary["scalar_map_cleanup_qualification"][
+        "qualification_status"
+    ] == "FAIL"
+    assert (tmp_path / "comparison" / "overview.png").is_file()
+    assert (
+        tmp_path / "comparison" / "material" / "frequency_hotspot_1to1.png"
+    ).is_file()
+
+    acquisition_path = candidate / "material" / "olat" / "acquisition.json"
+    acquisition = json.loads(acquisition_path.read_text(encoding="utf-8"))
+    bad_bundle = copy.deepcopy(acquisition)
+    bad_bundle["regularization"]["frozen_bundle"]["schema"] = (
+        compare_regularization.FREQUENCY_BUNDLE_SCHEMA
+    )
+    acquisition_path.write_text(json.dumps(bad_bundle), encoding="utf-8")
+    with pytest.raises(ValueError, match="frozen-bundle provenance"):
+        compare_regularization.compose_regularization_comparison(
+            baseline,
+            candidate,
+            tmp_path / "bad-bundle-comparison",
+            mask_path=mask_path,
+        )
+    acquisition_path.write_text(json.dumps(acquisition), encoding="utf-8")
+
+    bad_semantics = copy.deepcopy(acquisition)
+    bad_semantics["regularization"]["frozen_bundle"][
+        "consensus_entry_semantics"
+    ] = "strong_policy_eligible"
+    acquisition_path.write_text(json.dumps(bad_semantics), encoding="utf-8")
+    with pytest.raises(ValueError, match="frozen-bundle consensus semantics"):
+        compare_regularization.compose_regularization_comparison(
+            baseline,
+            candidate,
+            tmp_path / "bad-consensus-semantics-comparison",
+            mask_path=mask_path,
+        )
+    acquisition_path.write_text(json.dumps(acquisition), encoding="utf-8")
+
+    artifact_path = (
+        candidate
+        / "material"
+        / "olat"
+        / compare_regularization.FREQUENCY_FROZEN_ARTIFACT_NAME
+    )
+    original_artifact = artifact_path.read_bytes()
+    with np.load(artifact_path, allow_pickle=False) as payload:
+        artifact_payload = {
+            name: np.array(payload[name], copy=True) for name in payload.files
+        }
+    artifact_metadata = json.loads(str(artifact_payload["metadata"].item()))
+    artifact_metadata["consensus_entry_semantics"] = "strong_policy_eligible"
+    artifact_payload["metadata"] = np.asarray(
+        json.dumps(artifact_metadata, sort_keys=True)
+    )
+    with artifact_path.open("wb") as stream:
+        np.savez_compressed(stream, **artifact_payload)
+    bad_metadata = copy.deepcopy(acquisition)
+    bad_metadata_artifact = bad_metadata["regularization"]["frozen_bundle"][
+        "artifact"
+    ]
+    bad_metadata_artifact["sha256"] = _file_sha256(artifact_path)
+    bad_metadata_artifact["bytes"] = artifact_path.stat().st_size
+    acquisition_path.write_text(json.dumps(bad_metadata), encoding="utf-8")
+    with pytest.raises(ValueError, match="metadata consensus semantics"):
+        compare_regularization.compose_regularization_comparison(
+            baseline,
+            candidate,
+            tmp_path / "bad-metadata-semantics-comparison",
+            mask_path=mask_path,
+        )
+    artifact_path.write_bytes(original_artifact)
+    acquisition_path.write_text(json.dumps(acquisition), encoding="utf-8")
+
+    bad_diagnostic = copy.deepcopy(acquisition)
+    bad_diagnostic["regularization"]["cleanup_diagnostic"]["schema"] = (
+        "ictpolarreal.frequency-consensus-adaptive-diagnostic.invalid"
+    )
+    acquisition_path.write_text(json.dumps(bad_diagnostic), encoding="utf-8")
+    with pytest.raises(ValueError, match="cleanup diagnostics"):
+        compare_regularization.compose_regularization_comparison(
+            baseline,
+            candidate,
+            tmp_path / "bad-diagnostic-comparison",
             mask_path=mask_path,
         )
 

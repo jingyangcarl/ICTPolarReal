@@ -114,13 +114,18 @@ Useful options:
   `end2end`. The default is the sibling folder `../imaginaire`.
 - `--end2end-steps N` and `--end2end-learning-rate FLOAT`: control the Disney
   optimization. Defaults are 33,000 steps and a learning rate of `1e-3`.
-- `--end2end-tv-kind l1|edge-charbonnier|impulse-median|frequency-consensus`:
+- `--end2end-tv-kind l1|edge-charbonnier|impulse-median|frequency-consensus|frequency-consensus-adaptive`:
   choose the scalar-map regularizer. The default remains `impulse-median`, which
   completes the ordinary data fit, freezes a conservative 5x5 median/MAD
   detector away from albedo and normal edges, then applies a post-fit proximal
   update only at isolated score peaks. The optional `frequency-consensus` mode
   also leaves the full data-only fit unchanged, then performs one deterministic
   frozen update guided by albedo, normal, and 3x3/7x7 scalar-map neighborhoods.
+  `frequency-consensus-adaptive` is a separate opt-in refinement of that fixed
+  v1 target. It protects texture detected from both full-precision and exact
+  exported-PNG guides, retains the fixed target for anisotropic/subsurface in
+  the texture core, and applies stronger cleanup outside protected texture
+  regions. Selecting it does not change the default or remove fixed v1.
   `edge-charbonnier` and `l1` retain the broader spatial-TV ablations.
 - `--end2end-tv-weight FLOAT`: set the regularizer strength. For
   `impulse-median`, cumulative constrained-map shrink is the weight multiplied
@@ -130,10 +135,12 @@ Useful options:
   objective coefficient. Unflagged scalar entries, frozen albedo/normal maps,
   and object boundaries are not changed. Each enabled impulse fit records the
   exact frozen targets and masks in a hashed `impulse_median_frozen.npz`
-  artifact. For `frequency-consensus`, the effective update strength is
+  artifact. For either frequency-consensus mode, the effective update strength is
   `min(weight / 0.00125, 1)`: `0.00125` is full reference strength and `0`
-  preserves the data-only result. Its hashed sources, targets, masks, and guide
-  state are written to `frequency_consensus_frozen.npz`.
+  preserves the data-only result. Adaptive construction applies this strength
+  once after composing its frozen policy. Hashed sources, fixed/policy/final
+  targets, masks, and guide state are written to
+  `frequency_consensus_frozen.npz` as applicable.
 - `--end2end-profiles LIST`: choose independent `olat`, `hdri`, and `mix` fits.
   The default is `olat,hdri,mix`; `all` is an alias, and a subset such as
   `--end2end-profiles olat` avoids fitting the other profiles.
@@ -210,6 +217,13 @@ OLAT or HDRI evaluation suite. This guard is a minimum safety check, not proof
 that texture or material quality improved; inspect both the material maps and
 relighting evaluation. See [docs/evaluation.md](docs/evaluation.md) for the
 controlled comparison report.
+
+Use `--end2end-tv-kind frequency-consensus-adaptive` to derive the adaptive
+policy offline from the same completed data fit. Its full-precision and
+PNG-quantized guide-texture masks, core/halo union, fixed v1 target, composed
+policy target, final target, and hashes are validated before reuse. The
+controlled comparator accepts a matching fixed-v1 run as the baseline for a
+fixed-v1-to-adaptive material and relighting comparison.
 
 End-to-end HDRI targets are not separately photographed environment-light
 captures. They are synthesized from the measured ICTPolarReal parallel OLAT

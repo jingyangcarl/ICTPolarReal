@@ -790,6 +790,37 @@ def _frequency_consensus_inputs(
     return model, bundle
 
 
+def _frequency_consensus_adaptive_inputs(
+    torch,
+    values,
+    *,
+    mask=None,
+    albedo=None,
+    normal=None,
+    strength=1.0,
+):
+    model = _toy_disney_scalar_model(torch, values)
+    height, width = next(iter(values.values())).shape
+    if mask is None:
+        mask = torch.ones((height, width, 1), dtype=torch.float32)
+    if albedo is None:
+        albedo = torch.full((height, width, 3), 0.5, dtype=torch.float32)
+        albedo[4:9, 4:9] = torch.tensor([0.4, 0.6, 0.4])
+    if normal is None:
+        normal = torch.zeros((height, width, 3), dtype=torch.float32)
+        normal[..., 2] = 1.0
+    bundle = end2end_acquisition._build_frequency_consensus_adaptive_bundle(
+        torch,
+        model,
+        mask,
+        albedo,
+        normal,
+        created_after_step=90,
+        strength=strength,
+    )
+    return model, bundle
+
+
 def _manual_impulse_bundle(torch, model, targets):
     maps = {}
     constrained = model._param_maps()
@@ -1202,6 +1233,35 @@ def test_frequency_consensus_settings_and_weight_strength_are_versioned():
     assert disabled["post_fit_updates"] == 0
 
 
+def test_frequency_consensus_adaptive_settings_record_swept_policy():
+    settings = end2end_acquisition._regularization_settings(
+        "frequency-consensus-adaptive"
+    )
+    adapter = end2end_acquisition._adapter_provenance(
+        "frequency-consensus-adaptive"
+    )
+
+    assert "frequency-consensus-adaptive" in end2end_acquisition.TV_KINDS
+    assert settings["base_target"] == (
+        "exact_full_strength_frequency_consensus_v1_target"
+    )
+    assert settings["focused_maps"] == ["anisotropic", "subsurface"]
+    assert settings["guide_texture_band_sigmas"] == pytest.approx([0.8, 2.4])
+    assert settings["guide_texture_scale_percentile"] == pytest.approx(90.0)
+    assert settings["guide_texture_threshold"] == pytest.approx(0.35)
+    assert settings["guide_texture_core"].startswith("union_of")
+    assert settings["guide_texture_halo"].startswith("3x3_square")
+    assert settings["strong_target"].startswith("0.5*median3+0.5*median7")
+    assert "0.84" in settings["other_policy"]
+    assert settings["strength_application"].startswith("once_after")
+    assert settings["consensus_mask"] == (
+        "strong_policy_eligible_and_final_target_differs_from_source"
+    )
+    assert adapter["algorithm_version"] == (
+        "ictpolarreal-frequency-consensus-adaptive-v1"
+    )
+
+
 @pytest.mark.parametrize("empty_suite", ["olat", "hdri"])
 def test_frequency_evaluation_guard_rejects_empty_suites(empty_suite):
     pre = {"olat": [0.1], "hdri": [0.2]}
@@ -1263,6 +1323,242 @@ def test_frequency_consensus_removes_joint_fine_noise_but_retains_coherent_detai
             torch,
             duplicate_model,
             bundle,
+        )
+
+
+def test_frequency_consensus_adaptive_refines_v1_only_outside_texture_halo():
+    torch = pytest.importorskip("torch")
+    shape = (29, 29)
+    mask = torch.ones((*shape, 1), dtype=torch.float32)
+    albedo = torch.full((*shape, 3), 0.5, dtype=torch.float32)
+    albedo[4:9, 4:9] = torch.tensor([0.4, 0.6, 0.4])
+    normal = torch.zeros((*shape, 3), dtype=torch.float32)
+    normal[..., 2] = 1.0
+    guide = end2end_acquisition._frequency_consensus_guide_state(
+        torch, mask, albedo, normal
+    )
+    texture = end2end_acquisition._frequency_adaptive_guide_texture_state(
+        torch,
+        albedo,
+        normal,
+        guide["full_foreground5"],
+    )
+    textured_centers = torch.nonzero(
+        texture["guide_texture_core"] & guide["update_safe"]
+    )
+    smooth_centers = torch.nonzero(
+        ~texture["guide_texture_halo"] & guide["update_safe"]
+    )
+    assert textured_centers.numel() > 0
+    assert smooth_centers.numel() > 0
+    textured_row, textured_column = map(int, textured_centers[0])
+    smooth_row, smooth_column = map(int, smooth_centers[-1])
+
+    values = {
+        name: torch.full(shape, 0.3, dtype=torch.float32)
+        for name in end2end_acquisition.DISNEY_TV_SCALAR_NAMES
+    }
+    for name in ("metallic", "anisotropic"):
+        for row, column in (
+            (textured_row, textured_column),
+            (smooth_row, smooth_column),
+        ):
+            values[name][row - 1 : row + 2, column - 1 : column + 2] = 0.4
+            values[name][row, column] = 0.9
+
+    model, adaptive = _frequency_consensus_adaptive_inputs(
+        torch,
+        values,
+        mask=mask,
+        albedo=albedo,
+        normal=normal,
+    )
+    _fixed_model, fixed = _frequency_consensus_inputs(
+        torch,
+        values,
+        mask=mask,
+        albedo=albedo,
+        normal=normal,
+    )
+
+    for key in (
+        "guide_texture_full_precision",
+        "guide_texture_png_quantized",
+        "guide_texture_core",
+        "guide_texture_halo",
+    ):
+        assert torch.equal(adaptive[key], texture[key])
+    for name in end2end_acquisition.DISNEY_TV_SCALAR_NAMES:
+        assert torch.equal(
+            adaptive["maps"][name]["fixed_target"],
+            fixed["maps"][name]["target"],
+        )
+        entry = adaptive["maps"][name]
+        protected = (
+            adaptive["guide_texture_core"]
+            if name in end2end_acquisition.FREQUENCY_ADAPTIVE_FOCUSED_MAPS
+            else adaptive["guide_texture_halo"]
+        )
+        strong_policy_eligible = adaptive["update_safe"] & ~protected
+        expected_consensus = strong_policy_eligible & (
+            entry["target"] != entry["source"]
+        )
+        assert torch.equal(entry["consensus_mask"], expected_consensus)
+        assert not bool((entry["consensus_mask"] & ~entry["mask"]).any())
+        assert entry["consensus_count"] == int(expected_consensus.sum().item())
+
+    unchanged = adaptive["maps"]["specular"]
+    unchanged_eligible = (
+        adaptive["update_safe"] & ~adaptive["guide_texture_halo"]
+    )
+    assert bool(unchanged_eligible.any())
+    assert not bool(unchanged["consensus_mask"].any())
+    assert unchanged["consensus_count"] == 0
+
+    entry = adaptive["maps"]["metallic"]
+    assert entry["consensus_mask"][smooth_row, smooth_column]
+    focused = adaptive["maps"]["anisotropic"]
+    assert not focused["consensus_mask"][textured_row, textured_column]
+    assert focused["policy_target"][textured_row, textured_column] == (
+        focused["fixed_target"][textured_row, textured_column]
+    )
+    expected_halo_target = entry["source"][textured_row, textured_column] + 0.84 * (
+        entry["fixed_target"][textured_row, textured_column]
+        - entry["source"][textured_row, textured_column]
+    )
+    assert entry["policy_target"][textured_row, textured_column] == pytest.approx(
+        float(expected_halo_target), abs=1e-7
+    )
+    expected_smooth_target = (
+        0.5 * entry["median3"][smooth_row, smooth_column]
+        + 0.5 * entry["median7"][smooth_row, smooth_column]
+    )
+    assert entry["target"][smooth_row, smooth_column] == pytest.approx(
+        float(expected_smooth_target), abs=1e-7
+    )
+    assert entry["target"][smooth_row, smooth_column] < entry["fixed_target"][
+        smooth_row, smooth_column
+    ]
+
+    raw_before = {
+        name: getattr(model, f"{name}_un").detach().clone()
+        for name in end2end_acquisition.DISNEY_TV_SCALAR_NAMES
+    }
+    diagnostic = end2end_acquisition._apply_frequency_consensus_update(
+        torch, model, adaptive
+    )
+    assert diagnostic["moved_entries"] > 0
+    for name in end2end_acquisition.DISNEY_TV_SCALAR_NAMES:
+        update_mask = adaptive["maps"][name]["mask"].unsqueeze(0)
+        assert torch.equal(
+            getattr(model, f"{name}_un")[~update_mask],
+            raw_before[name][~update_mask],
+        )
+
+
+def test_frequency_consensus_adaptive_artifact_and_semantics_fail_closed(tmp_path):
+    torch = pytest.importorskip("torch")
+    shape = (21, 21)
+    values = {
+        name: torch.full(shape, 0.3, dtype=torch.float32)
+        for name in end2end_acquisition.DISNEY_TV_SCALAR_NAMES
+    }
+    for name in ("metallic", "roughness"):
+        values[name][14:17, 14:17] = 0.4
+        values[name][15, 15] = 0.9
+    _model, bundle = _frequency_consensus_adaptive_inputs(torch, values)
+
+    bad_fixed = {
+        **bundle,
+        "maps": {
+            **bundle["maps"],
+            "metallic": {
+                **bundle["maps"]["metallic"],
+                "fixed_target": bundle["maps"]["metallic"][
+                    "fixed_target"
+                ].clone(),
+            },
+        },
+    }
+    bad_fixed["maps"]["metallic"]["fixed_target"][15, 15] += 0.01
+    bad_fixed["tensor_hashes"] = (
+        end2end_acquisition._frequency_consensus_tensor_hashes(bad_fixed)
+    )
+    with pytest.raises(ValueError, match="fixed v1 target metallic is stale"):
+        end2end_acquisition._validate_frequency_consensus_bundle(
+            torch, bad_fixed, expected_shape=shape
+        )
+
+    bad_halo = {
+        **bundle,
+        "guide_texture_halo": bundle["guide_texture_halo"].clone(),
+    }
+    bad_halo["guide_texture_halo"][0, 0] = True
+    bad_halo["tensor_hashes"] = (
+        end2end_acquisition._frequency_consensus_tensor_hashes(bad_halo)
+    )
+    with pytest.raises(ValueError, match="guide texture halo is stale"):
+        end2end_acquisition._validate_frequency_consensus_bundle(
+            torch, bad_halo, expected_shape=shape
+        )
+
+    unchanged_eligible = bundle["update_safe"] & ~bundle["guide_texture_halo"]
+    row, column = map(int, torch.nonzero(unchanged_eligible)[0])
+    assert bundle["maps"]["specular"]["target"][row, column] == (
+        bundle["maps"]["specular"]["source"][row, column]
+    )
+    bad_consensus = {
+        **bundle,
+        "maps": {
+            **bundle["maps"],
+            "specular": {
+                **bundle["maps"]["specular"],
+                "consensus_mask": bundle["maps"]["specular"][
+                    "consensus_mask"
+                ].clone(),
+            },
+        },
+    }
+    bad_consensus["maps"]["specular"]["consensus_mask"][row, column] = True
+    bad_consensus["maps"]["specular"]["consensus_count"] += 1
+    bad_consensus["tensor_hashes"] = (
+        end2end_acquisition._frequency_consensus_tensor_hashes(bad_consensus)
+    )
+    with pytest.raises(ValueError, match="consensus mask specular is stale"):
+        end2end_acquisition._validate_frequency_consensus_bundle(
+            torch, bad_consensus, expected_shape=shape
+        )
+
+    provenance = end2end_acquisition._finalize_frequency_frozen_artifact(
+        tmp_path, bundle
+    )
+    assert provenance["schema"] == (
+        "ictpolarreal.frequency-consensus-adaptive-bundle.v1"
+    )
+    assert provenance["consensus_entry_semantics"] == (
+        "strong_policy_eligible_and_final_target_differs_from_source"
+    )
+    assert provenance["maps"]["specular"]["consensus_entries"] == 0
+    assert provenance["guide_texture"]["masks"]["guide_texture_core"][
+        "pixels"
+    ] == int(bundle["guide_texture_core"].sum().item())
+    artifact_path = tmp_path / end2end_acquisition.FREQUENCY_FROZEN_ARTIFACT_NAME
+    with np.load(artifact_path, allow_pickle=False) as archive:
+        metadata = json.loads(str(archive["metadata"].item()))
+        assert metadata["bundle_schema"] == provenance["schema"]
+        assert metadata["consensus_entry_semantics"] == (
+            "strong_policy_eligible_and_final_target_differs_from_source"
+        )
+        assert np.array_equal(
+            archive["guide_texture_core"], bundle["guide_texture_core"].numpy()
+        )
+        assert np.array_equal(
+            archive["metallic__fixed_target"],
+            bundle["maps"]["metallic"]["fixed_target"].numpy(),
+        )
+        assert np.array_equal(
+            archive["metallic__policy_target"],
+            bundle["maps"]["metallic"]["policy_target"].numpy(),
         )
 
 
@@ -1414,6 +1710,42 @@ def test_frequency_consensus_bundle_rejects_nonfinite_and_semantic_tampering():
         end2end_acquisition._validate_frequency_consensus_bundle(
             torch, bad_target, expected_shape=(11, 11)
         )
+
+
+def test_frequency_consensus_checkpoint_rejects_cross_schema_bundles():
+    torch = pytest.importorskip("torch")
+    shape = (11, 11)
+    values = {
+        name: torch.full(shape, 0.3, dtype=torch.float32)
+        for name in end2end_acquisition.DISNEY_TV_SCALAR_NAMES
+    }
+    _fixed_model, fixed_bundle = _frequency_consensus_inputs(torch, values)
+    _adaptive_model, adaptive_bundle = _frequency_consensus_adaptive_inputs(
+        torch, values
+    )
+    stage = end2end_acquisition._frequency_consensus_stage_plan(
+        90,
+        enabled=True,
+        weight=0.00125,
+    )
+
+    for expected_kind, wrong_bundle in (
+        ("frequency-consensus-adaptive", fixed_bundle),
+        ("frequency-consensus", adaptive_bundle),
+    ):
+        with pytest.raises(ValueError, match="schema does not match selected kind"):
+            end2end_acquisition._checkpoint_frequency_consensus_state(
+                torch,
+                {
+                    "frequency_consensus_bundle": wrong_bundle,
+                    "frequency_cleanup_applied": False,
+                    "frequency_cleanup_diagnostic": None,
+                },
+                stage,
+                next_step=90,
+                expected_shape=shape,
+                expected_kind=expected_kind,
+            )
 
 
 def test_frequency_consensus_artifact_and_resume_fail_closed(tmp_path):
