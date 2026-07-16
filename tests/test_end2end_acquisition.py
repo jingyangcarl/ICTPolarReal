@@ -558,6 +558,582 @@ def test_masked_disney_scalar_tv_ignores_differences_outside_fit_mask():
     assert torch.count_nonzero(scalar.grad[:, 2:]) == 0
 
 
+def _edge_regularizer_inputs(torch, scalar, mask=None, albedo=None, normal=None):
+    height, width = scalar.shape
+    if mask is None:
+        mask = torch.ones((height, width, 1), dtype=torch.float32)
+    if albedo is None:
+        albedo = torch.full((height, width, 3), 0.5, dtype=torch.float32)
+    if normal is None:
+        normal = torch.zeros((height, width, 3), dtype=torch.float32)
+        normal[..., 2] = 1.0
+    model = SimpleNamespace(
+        _param_maps=lambda: {
+            name: scalar for name in end2end_acquisition.DISNEY_TV_SCALAR_NAMES
+        }
+    )
+    pair_weights = end2end_acquisition._edge_aware_pair_weights(
+        torch, albedo, normal, mask
+    )
+    return model, mask, pair_weights
+
+
+def test_edge_charbonnier_is_zero_for_constant_scalar_maps():
+    torch = pytest.importorskip("torch")
+    scalar = torch.full((3, 4), 0.4, dtype=torch.float32, requires_grad=True)
+    model, mask, pair_weights = _edge_regularizer_inputs(torch, scalar)
+
+    loss = end2end_acquisition._disney_scalar_regularization(
+        torch,
+        model,
+        mask,
+        kind="edge-charbonnier",
+        edge_pair_weights=pair_weights,
+    )
+    loss.backward()
+
+    assert loss.item() == pytest.approx(0.0)
+    assert torch.count_nonzero(scalar.grad) == 0
+
+
+def test_edge_charbonnier_penalizes_an_interior_spike():
+    torch = pytest.importorskip("torch")
+    scalar = torch.zeros((3, 3), dtype=torch.float32)
+    scalar[1, 1] = 1.0
+    scalar.requires_grad_()
+    model, mask, pair_weights = _edge_regularizer_inputs(torch, scalar)
+
+    loss = end2end_acquisition._disney_scalar_regularization(
+        torch,
+        model,
+        mask,
+        kind="edge-charbonnier",
+        edge_pair_weights=pair_weights,
+    )
+    loss.backward()
+
+    assert loss.item() > 0.0
+    assert scalar.grad[1, 1].item() > 0.0
+
+
+@pytest.mark.parametrize("guide_kind", ["albedo", "normal"])
+def test_edge_charbonnier_preserves_scalar_changes_at_guide_edges(guide_kind):
+    torch = pytest.importorskip("torch")
+    scalar = torch.tensor(
+        [[0.0, 0.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0]],
+        dtype=torch.float32,
+    )
+    flat_albedo = torch.full((2, 4, 3), 0.5, dtype=torch.float32)
+    edge_albedo = flat_albedo.clone()
+    flat_normal = torch.zeros((2, 4, 3), dtype=torch.float32)
+    flat_normal[..., 2] = 1.0
+    edge_normal = flat_normal.clone()
+    if guide_kind == "albedo":
+        edge_albedo[:, 2:] = 1.0
+    else:
+        edge_normal[:, 2:, 0] = 1.0
+        edge_normal[:, 2:, 2] = 0.0
+    model, mask, flat_weights = _edge_regularizer_inputs(
+        torch, scalar, albedo=flat_albedo, normal=flat_normal
+    )
+    _, _, edge_weights = _edge_regularizer_inputs(
+        torch,
+        scalar,
+        mask=mask,
+        albedo=edge_albedo,
+        normal=edge_normal,
+    )
+
+    flat_loss = end2end_acquisition._disney_scalar_regularization(
+        torch,
+        model,
+        mask,
+        kind="edge-charbonnier",
+        edge_pair_weights=flat_weights,
+    )
+    edge_loss = end2end_acquisition._disney_scalar_regularization(
+        torch,
+        model,
+        mask,
+        kind="edge-charbonnier",
+        edge_pair_weights=edge_weights,
+    )
+
+    assert edge_loss.item() < flat_loss.item() * 0.1
+    assert edge_weights["horizontal_weight"][:, 1].max().item() == pytest.approx(
+        end2end_acquisition.EDGE_CHARBONNIER_WEIGHT_FLOOR, abs=1e-4
+    )
+
+
+def test_edge_charbonnier_uses_only_exact_fit_pairs():
+    torch = pytest.importorskip("torch")
+    scalar = torch.tensor(
+        [[0.25, 0.25, 0.0, 1.0], [0.25, 0.25, 1.0, 0.0]],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    mask = torch.zeros((2, 4, 1), dtype=torch.float32)
+    mask[:, :2] = 1.0
+    model, mask, pair_weights = _edge_regularizer_inputs(
+        torch, scalar, mask=mask
+    )
+
+    loss = end2end_acquisition._disney_scalar_regularization(
+        torch,
+        model,
+        mask,
+        kind="edge-charbonnier",
+        edge_pair_weights=pair_weights,
+    )
+    loss.backward()
+
+    assert loss.item() == pytest.approx(0.0)
+    assert torch.count_nonzero(scalar.grad[:, 2:]) == 0
+
+
+def test_edge_guide_pair_weights_are_detached_from_albedo_and_normal():
+    torch = pytest.importorskip("torch")
+    scalar = torch.zeros((2, 3), dtype=torch.float32, requires_grad=True)
+    albedo = torch.rand((2, 3, 3), dtype=torch.float32, requires_grad=True)
+    normal = torch.rand((2, 3, 3), dtype=torch.float32, requires_grad=True)
+    model, mask, pair_weights = _edge_regularizer_inputs(
+        torch, scalar, albedo=albedo, normal=normal
+    )
+
+    assert all(not value.requires_grad for value in pair_weights.values())
+    loss = end2end_acquisition._disney_scalar_regularization(
+        torch,
+        model,
+        mask,
+        kind="edge-charbonnier",
+        edge_pair_weights=pair_weights,
+    )
+    loss.backward()
+
+    assert albedo.grad is None
+    assert normal.grad is None
+
+
+def _impulse_regularizer_inputs(torch, scalar, mask=None, albedo=None, normal=None):
+    height, width = scalar.shape
+    if mask is None:
+        mask = torch.ones((height, width, 1), dtype=torch.float32)
+    if albedo is None:
+        albedo = torch.full((height, width, 3), 0.5, dtype=torch.float32)
+    if normal is None:
+        normal = torch.zeros((height, width, 3), dtype=torch.float32)
+        normal[..., 2] = 1.0
+    model = SimpleNamespace(
+        _param_maps=lambda: {
+            name: scalar for name in end2end_acquisition.DISNEY_TV_SCALAR_NAMES
+        }
+    )
+    bundle = end2end_acquisition._build_impulse_median_bundle(
+        torch,
+        model,
+        mask,
+        albedo,
+        normal,
+        created_after_step=90,
+    )
+    return model, mask, bundle
+
+
+def _toy_disney_scalar_model(torch, values):
+    class ToyDisneyScalarModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            for name in end2end_acquisition.DISNEY_TV_SCALAR_NAMES:
+                constrained = values[name].clamp(1e-5, 1.0 - 1e-5)
+                setattr(
+                    self,
+                    f"{name}_un",
+                    torch.nn.Parameter(torch.logit(constrained).unsqueeze(0)),
+                )
+
+        def _param_maps(self):
+            return {
+                name: torch.sigmoid(getattr(self, f"{name}_un"))[0]
+                for name in end2end_acquisition.DISNEY_TV_SCALAR_NAMES
+            }
+
+    return ToyDisneyScalarModel()
+
+
+def _manual_impulse_bundle(torch, model, targets):
+    maps = {}
+    constrained = model._param_maps()
+    for name in end2end_acquisition.DISNEY_TV_SCALAR_NAMES:
+        target = constrained[name].detach().clone()
+        mask = torch.zeros_like(target, dtype=torch.bool)
+        for row, column, value in targets.get(name, []):
+            mask[row, column] = True
+            target[row, column] = value
+        maps[name] = {
+            "target": target,
+            "mask": mask,
+            "flagged_count": int(mask.sum().item()),
+        }
+    return {
+        "schema": "ictpolarreal.impulse-median-bundle.v1",
+        "created_after_step": 90,
+        "maps": maps,
+    }
+
+
+def test_impulse_median_stage_plan_keeps_full_data_fit_then_derives_proximal():
+    plan = end2end_acquisition._impulse_median_stage_plan(
+        33000,
+        enabled=True,
+        shrink_per_iteration=0.00125,
+    )
+
+    assert plan == {
+        "enabled": True,
+        "data_fit_steps": 33000,
+        "detector_after_data_step": 33000,
+        "cleanup_iterations": 3300,
+        "cleanup_fraction": pytest.approx(0.1),
+        "shrink_per_iteration": pytest.approx(0.00125),
+        "total_shrink": pytest.approx(4.125),
+        "cleanup_optimizer_steps": 0,
+    }
+    assert end2end_acquisition._impulse_median_stage_plan(
+        7, enabled=False
+    ) == {
+        "enabled": False,
+        "data_fit_steps": 7,
+        "detector_after_data_step": None,
+        "cleanup_iterations": 0,
+        "cleanup_fraction": 0.0,
+        "shrink_per_iteration": 0.0,
+        "total_shrink": 0.0,
+        "cleanup_optimizer_steps": 0,
+    }
+
+
+def test_impulse_median_settings_record_frozen_detector_and_schedule():
+    settings = end2end_acquisition._regularization_settings("impulse-median")
+    adapter = end2end_acquisition._adapter_provenance()
+
+    assert "impulse-median" in end2end_acquisition.TV_KINDS
+    assert settings["cleanup_fraction"] == pytest.approx(0.1)
+    assert settings["detector_window"] == 5
+    assert settings["mad_scale"] == pytest.approx(4.0)
+    assert settings["minimum_deviation"] == pytest.approx(0.035)
+    assert settings["dead_zone"] == pytest.approx(0.005)
+    assert settings["cleanup_optimizer_steps"] == 0
+    assert settings["detector_boundary"] == "after_all_data_fit_steps"
+    assert settings["unflagged_parameter_update"].startswith("none_bit_identical")
+    assert settings["local_maximum_tie_policy"] == "retain_all_equal_maxima"
+    assert adapter["schema"] == "ictpolarreal.profile-acquisition-adapter.v6"
+    assert adapter["algorithm_version"] == "ictpolarreal-impulse-proximal-v5"
+
+
+def test_zero_weight_final_regularization_does_not_require_impulse_bundle():
+    def missing_bundle_regularizer():
+        raise ValueError("impulse-median regularization requires a frozen bundle")
+
+    assert end2end_acquisition._final_regularization_value(
+        missing_bundle_regularizer,
+        weight=0.0,
+    ) == pytest.approx(0.0)
+
+
+def test_impulse_median_flags_only_an_isolated_guide_safe_spike():
+    torch = pytest.importorskip("torch")
+    scalar = torch.zeros((9, 9), dtype=torch.float32)
+    scalar[4, 4] = 1.0
+    scalar.requires_grad_()
+    _model, _mask, bundle = _impulse_regularizer_inputs(torch, scalar)
+
+    for entry in bundle["maps"].values():
+        assert entry["flagged_count"] == 1
+        assert entry["mask"][4, 4]
+        assert torch.count_nonzero(entry["mask"]) == 1
+        assert entry["target"][4, 4].item() == pytest.approx(0.0)
+        assert not entry["target"].requires_grad
+        assert not entry["mask"].requires_grad
+
+
+@pytest.mark.parametrize("rejection", ["albedo_edge", "mask_hole"])
+def test_impulse_median_rejects_guide_or_foreground_unsafe_centers(rejection):
+    torch = pytest.importorskip("torch")
+    scalar = torch.zeros((9, 9), dtype=torch.float32)
+    scalar[4, 4] = 1.0
+    mask = torch.ones((9, 9, 1), dtype=torch.float32)
+    albedo = torch.full((9, 9, 3), 0.5, dtype=torch.float32)
+    if rejection == "albedo_edge":
+        albedo[:, 5:] = 1.0
+    else:
+        mask[2, 2] = 0.0
+    scalar.requires_grad_()
+
+    _model, _mask, bundle = _impulse_regularizer_inputs(
+        torch,
+        scalar,
+        mask=mask,
+        albedo=albedo,
+    )
+
+    assert all(entry["flagged_count"] == 0 for entry in bundle["maps"].values())
+
+
+@pytest.mark.parametrize(
+    ("neighbor_value", "expected_columns"),
+    [(0.8, [4]), (1.0, [4, 5])],
+)
+def test_impulse_median_uses_normalized_local_peaks_and_retains_ties(
+    neighbor_value,
+    expected_columns,
+):
+    torch = pytest.importorskip("torch")
+    scalar = torch.zeros((9, 9), dtype=torch.float32)
+    scalar[4, 4] = 1.0
+    scalar[4, 5] = neighbor_value
+    _model, _mask, bundle = _impulse_regularizer_inputs(torch, scalar)
+
+    entry = bundle["maps"]["roughness"]
+    assert entry["flagged_count"] == len(expected_columns)
+    assert torch.nonzero(entry["mask"], as_tuple=False).tolist() == [
+        [4, column] for column in expected_columns
+    ]
+
+
+def test_impulse_proximal_soft_thresholds_only_excess_beyond_dead_zone():
+    torch = pytest.importorskip("torch")
+    values = {
+        name: torch.full((3, 3), 0.5, dtype=torch.float32)
+        for name in end2end_acquisition.DISNEY_TV_SCALAR_NAMES
+    }
+    values["metallic"][1, 1] = 0.8
+    values["roughness"][1, 1] = 0.52
+    model = _toy_disney_scalar_model(torch, values)
+    bundle = _manual_impulse_bundle(
+        torch,
+        model,
+        {
+            "metallic": [(1, 1, 0.2)],
+            "roughness": [(1, 1, 0.5)],
+        },
+    )
+    roughness_raw_before = model.roughness_un.detach().clone()
+
+    diagnostic = end2end_acquisition._apply_impulse_median_proximal(
+        torch,
+        model,
+        bundle,
+        total_shrink=0.1,
+        dead_zone=0.05,
+    )
+
+    assert model._param_maps()["metallic"][1, 1].item() == pytest.approx(0.7)
+    assert torch.equal(model.roughness_un, roughness_raw_before)
+    assert diagnostic["flagged_centers"] == 2
+    assert diagnostic["moved_centers"] == 1
+    assert diagnostic["maps"]["metallic"]["mean_distance_before"] == pytest.approx(
+        0.6
+    )
+    assert diagnostic["maps"]["metallic"]["mean_distance_after"] == pytest.approx(
+        0.5
+    )
+
+
+def test_impulse_proximal_preserves_every_unflagged_raw_entry_and_adam_state():
+    torch = pytest.importorskip("torch")
+    values = {
+        name: torch.linspace(0.2, 0.8, 25, dtype=torch.float32).reshape(5, 5)
+        for name in end2end_acquisition.DISNEY_TV_SCALAR_NAMES
+    }
+    baseline = _toy_disney_scalar_model(torch, values)
+    candidate = _toy_disney_scalar_model(torch, values)
+    candidate.load_state_dict(baseline.state_dict())
+    baseline_optimizer = torch.optim.Adam(baseline.parameters(), lr=1e-3)
+    candidate_optimizer = torch.optim.Adam(candidate.parameters(), lr=1e-3)
+
+    def data_step(model, optimizer):
+        optimizer.zero_grad(set_to_none=True)
+        coupled = torch.stack(list(model._param_maps().values())).sum(dim=0)
+        coupled.square().mean().backward()
+        optimizer.step()
+
+    data_step(baseline, baseline_optimizer)
+    data_step(candidate, candidate_optimizer)
+    bundle = _manual_impulse_bundle(
+        torch,
+        candidate,
+        {"metallic": [(2, 2, 0.1)]},
+    )
+    end2end_acquisition._apply_impulse_median_proximal(
+        torch,
+        candidate,
+        bundle,
+        total_shrink=0.2,
+        dead_zone=0.005,
+    )
+
+    flagged = bundle["maps"]["metallic"]["mask"].unsqueeze(0)
+    assert torch.equal(candidate.metallic_un[~flagged], baseline.metallic_un[~flagged])
+    assert not torch.equal(candidate.metallic_un[flagged], baseline.metallic_un[flagged])
+    for name in end2end_acquisition.DISNEY_TV_SCALAR_NAMES:
+        candidate_parameter = getattr(candidate, f"{name}_un")
+        baseline_parameter = getattr(baseline, f"{name}_un")
+        if name != "metallic":
+            assert torch.equal(candidate_parameter, baseline_parameter)
+        for state_name in ("step", "exp_avg", "exp_avg_sq"):
+            assert torch.equal(
+                candidate_optimizer.state[candidate_parameter][state_name],
+                baseline_optimizer.state[baseline_parameter][state_name],
+            )
+
+
+def test_impulse_frozen_artifact_preserves_exact_masks_targets_and_provenance(
+    tmp_path,
+):
+    torch = pytest.importorskip("torch")
+    scalar = torch.zeros((9, 9), dtype=torch.float32)
+    scalar[4, 4] = 1.0
+    model, _mask, bundle = _impulse_regularizer_inputs(torch, scalar)
+    artifact_path = tmp_path / end2end_acquisition.IMPULSE_FROZEN_ARTIFACT_NAME
+    artifact = end2end_acquisition._write_impulse_frozen_artifact(
+        artifact_path,
+        bundle,
+    )
+    with np.load(artifact_path, allow_pickle=False) as frozen:
+        metadata = json.loads(str(frozen["metadata"].item()))
+        assert metadata["created_after_step"] == 90
+        for name in end2end_acquisition.DISNEY_TV_SCALAR_NAMES:
+            np.testing.assert_array_equal(
+                frozen[f"{name}__target"],
+                bundle["maps"][name]["target"].detach().numpy(),
+            )
+            np.testing.assert_array_equal(
+                frozen[f"{name}__mask"],
+                bundle["maps"][name]["mask"].detach().numpy(),
+            )
+    signature_regularization = {
+        "kind": "impulse-median",
+        "weight": 0.00125,
+        "parameters": list(end2end_acquisition.DISNEY_TV_SCALAR_NAMES),
+        "settings": end2end_acquisition._regularization_settings("impulse-median"),
+        "stage_plan": {"enabled": True},
+    }
+    acquisition = {
+        "regularization": {
+            **signature_regularization,
+            "frozen_bundle": {"artifact": artifact},
+        },
+        "checkpoint_signature": {
+            "regularization": dict(signature_regularization),
+        },
+    }
+    assert end2end_acquisition._impulse_frozen_artifact_complete(
+        tmp_path, acquisition
+    )
+    assert not end2end_acquisition._impulse_frozen_artifact_complete(
+        tmp_path,
+        {"checkpoint_signature": acquisition["checkpoint_signature"]},
+    )
+    tampered_top_level = json.loads(json.dumps(acquisition))
+    tampered_top_level["regularization"]["weight"] = 0.5
+    assert not end2end_acquisition._impulse_frozen_artifact_complete(
+        tmp_path, tampered_top_level
+    )
+    missing_signature = {"regularization": acquisition["regularization"]}
+    assert not end2end_acquisition._impulse_frozen_artifact_complete(
+        tmp_path, missing_signature
+    )
+    assert not (tmp_path / f"{artifact_path.name}.tmp").exists()
+    with artifact_path.open("ab") as stream:
+        stream.write(b"tampered")
+    assert not end2end_acquisition._impulse_frozen_artifact_complete(
+        tmp_path, acquisition
+    )
+    disabled = {
+        "regularization": {
+            "kind": "impulse-median",
+            "stage_plan": {"enabled": False},
+        }
+    }
+    assert end2end_acquisition._impulse_frozen_artifact_complete(tmp_path, disabled)
+    assert model._param_maps()["roughness"][4, 4].item() == pytest.approx(1.0)
+
+
+def test_fit_without_frozen_bundle_unlinks_stale_impulse_artifact(tmp_path):
+    stale = tmp_path / end2end_acquisition.IMPULSE_FROZEN_ARTIFACT_NAME
+    stale.write_bytes(b"stale-enabled-run")
+
+    assert end2end_acquisition._finalize_impulse_frozen_artifact(
+        tmp_path, None
+    ) is None
+    assert not stale.exists()
+
+
+def test_impulse_median_checkpoint_requires_exact_frozen_bundle_after_boundary():
+    torch = pytest.importorskip("torch")
+    scalar = torch.zeros((9, 9), dtype=torch.float32)
+    scalar[4, 4] = 1.0
+    _model, _mask, bundle = _impulse_regularizer_inputs(torch, scalar)
+    stage_plan = end2end_acquisition._impulse_median_stage_plan(
+        90,
+        enabled=True,
+        shrink_per_iteration=0.01,
+    )
+
+    assert end2end_acquisition._checkpoint_impulse_median_state(
+        torch,
+        {"impulse_median_bundle": None},
+        stage_plan,
+        next_step=89,
+        expected_shape=(9, 9),
+    ) == (None, False, None)
+    pending = end2end_acquisition._checkpoint_impulse_median_state(
+        torch,
+        {
+            "impulse_median_bundle": bundle,
+            "impulse_cleanup_applied": False,
+            "impulse_cleanup_diagnostic": None,
+        },
+        stage_plan,
+        next_step=90,
+        expected_shape=(9, 9),
+    )
+    assert pending[0] is bundle
+    assert pending[1:] == (False, None)
+    diagnostic = {"schema": "ictpolarreal.impulse-proximal-diagnostic.v1"}
+    applied = end2end_acquisition._checkpoint_impulse_median_state(
+        torch,
+        {
+            "impulse_median_bundle": bundle,
+            "impulse_cleanup_applied": True,
+            "impulse_cleanup_diagnostic": diagnostic,
+        },
+        stage_plan,
+        next_step=90,
+        expected_shape=(9, 9),
+    )
+    assert applied[0] is bundle
+    assert applied[1:] == (True, diagnostic)
+    with pytest.raises(ValueError, match="missing impulse-median frozen bundle"):
+        end2end_acquisition._checkpoint_impulse_median_state(
+            torch,
+            {"impulse_median_bundle": None},
+            stage_plan,
+            next_step=90,
+            expected_shape=(9, 9),
+        )
+    stale = dict(bundle)
+    stale["created_after_step"] = 89
+    with pytest.raises(ValueError, match="wrong stage boundary"):
+        end2end_acquisition._checkpoint_impulse_median_state(
+            torch,
+            {"impulse_median_bundle": stale},
+            stage_plan,
+            next_step=90,
+            expected_shape=(9, 9),
+        )
+
+
 def test_end2end_view_is_constant_optical_axis(tmp_path):
     camera_dir = tmp_path / "object" / "cam00"
     camera_dir.mkdir(parents=True)
@@ -807,6 +1383,11 @@ def test_camera_report_consolidates_clean_lighting_first_contract(
     profile_results = {}
     image = np.full((6, 10, 3), 0.4, dtype=np.float32)
     metric_names = {"mse": 0.01, "mae": 0.1, "psnr": 20.0, "ssim_global": 0.8}
+    fit_adapter = {
+        "schema": "ictpolarreal.profile-acquisition-adapter.v3",
+        "algorithm_version": "recorded-fit-algorithm",
+        "lighting_profiles_sha256": "recorded-fit-source",
+    }
 
     for profile_index, profile in enumerate(profiles):
         material_dir = tmp_path / "material" / profile
@@ -849,8 +1430,10 @@ def test_camera_report_consolidates_clean_lighting_first_contract(
         )
 
         profile_results[profile] = {
-            "schema": "ictpolarreal.end2end-disney.v8",
+            "schema": "ictpolarreal.end2end-disney.v9",
             "lighting_profile": profile,
+            "adapter": dict(fit_adapter),
+            "checkpoint_signature": {"adapter": dict(fit_adapter)},
             "fit_conditions": {
                 "olat": 8 if profile in {"olat", "mix"} else 0,
                 "hdri": 24 if profile in {"hdri", "mix"} else 0,
@@ -1010,7 +1593,9 @@ def test_camera_report_consolidates_clean_lighting_first_contract(
                 encoding="utf-8"
             )
         )
-        assert acquisition["schema"] == "ictpolarreal.end2end-disney.v8"
+        assert acquisition["schema"] == "ictpolarreal.end2end-disney.v9"
+        assert acquisition["adapter"] == fit_adapter
+        assert acquisition["checkpoint_signature"]["adapter"] == fit_adapter
         assert end2end_acquisition._profile_outputs_complete(
             tmp_path / "material" / profile,
             evaluation_root / ".profiles" / profile,
@@ -1025,6 +1610,66 @@ def test_camera_report_consolidates_clean_lighting_first_contract(
         evaluation_root / ".profiles" / "mix",
         profile_results["mix"],
     )
+
+
+def test_reorganize_preserves_recorded_numerical_adapter(monkeypatch, tmp_path):
+    profiles = ("olat", "hdri", "mix")
+    recorded = {
+        "schema": "ictpolarreal.profile-acquisition-adapter.v3",
+        "algorithm_version": "recorded-fit-v2",
+        "lighting_profiles_sha256": "recorded-lighting",
+    }
+    current = {
+        "schema": "ictpolarreal.profile-acquisition-adapter.v6",
+        "algorithm_version": "current-checkout-v5",
+    }
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps({"profiles": list(profiles), "lighting": {}}),
+        encoding="utf-8",
+    )
+    for profile in profiles:
+        material_dir = tmp_path / "material" / profile
+        material_dir.mkdir(parents=True)
+        (material_dir / "acquisition.json").write_text(
+            json.dumps(
+                {
+                    "adapter": current,
+                    "checkpoint_signature": {"adapter": recorded},
+                }
+            ),
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(
+        end2end_acquisition,
+        "_write_camera_report",
+        lambda *_args: end2end_acquisition._camera_report_artifacts(),
+    )
+    monkeypatch.setattr(
+        end2end_acquisition,
+        "_adapter_provenance",
+        lambda: pytest.fail("reorganization must not stamp the current adapter"),
+    )
+
+    manifest = end2end_acquisition.reorganize_end2end_camera(tmp_path)
+
+    assert manifest["adapter"] == recorded
+    assert json.loads(manifest_path.read_text(encoding="utf-8"))["adapter"] == recorded
+
+
+def test_recorded_profile_adapter_rejects_disagreement():
+    first = {
+        "schema": "ictpolarreal.profile-acquisition-adapter.v3",
+        "algorithm_version": "fit-a",
+    }
+    second = {**first, "algorithm_version": "fit-b"}
+    with pytest.raises(ValueError, match="disagree.*numerical adapter"):
+        end2end_acquisition._recorded_profile_adapter(
+            {
+                "olat": {"checkpoint_signature": {"adapter": first}},
+                "hdri": {"checkpoint_signature": {"adapter": second}},
+            }
+        )
 
 
 def test_end2end_provenance_records_git_state_and_exact_source_hash(
@@ -1057,8 +1702,15 @@ def test_checkpoint_signature_allows_presentation_only_source_hash_change():
     old = {
         "profile": "olat",
         "fit_indices": [0, 1, 2],
+        "regularization": {
+            "kind": "edge-charbonnier",
+            "weight": 0.01,
+            "settings": end2end_acquisition._regularization_settings(
+                "edge-charbonnier"
+            ),
+        },
         "adapter": {
-            "schema": "ictpolarreal.profile-acquisition-adapter.v2",
+            "schema": "ictpolarreal.profile-acquisition-adapter.v3",
             "algorithm_version": "superdimension-parity-v2",
             "end2end_acquisition_sha256": "old-source-hash",
             "lighting_profiles_sha256": "lighting-hash",
@@ -1078,6 +1730,16 @@ def test_checkpoint_signature_allows_presentation_only_source_hash_change():
     changed_fit = json.loads(json.dumps(current))
     changed_fit["fit_indices"] = [0, 2]
     assert not end2end_acquisition._checkpoint_signatures_match(old, changed_fit)
+
+    changed_kind = json.loads(json.dumps(current))
+    changed_kind["regularization"]["kind"] = "l1"
+    assert not end2end_acquisition._checkpoint_signatures_match(old, changed_kind)
+
+    changed_settings = json.loads(json.dumps(current))
+    changed_settings["regularization"]["settings"]["epsilon"] = 0.01
+    assert not end2end_acquisition._checkpoint_signatures_match(
+        old, changed_settings
+    )
 
 
 def test_imaginaire_disney_import_treats_torchvision_as_debug_only(
@@ -1133,9 +1795,10 @@ def test_imaginaire_disney_import_treats_torchvision_as_debug_only(
         "expected_backend",
         "expected_steps",
         "expected_eval_lights",
+        "expected_regularizer",
     ),
     [
-        ([], "default", "auto", 33000, 16),
+        ([], "default", "auto", 33000, 16, "impulse-median"),
         (
             [
                 "--material-acquisition",
@@ -1148,6 +1811,8 @@ def test_imaginaire_disney_import_treats_torchvision_as_debug_only(
                 "0.002",
                 "--end2end-tv-weight",
                 "0.025",
+                "--end2end-tv-kind",
+                "edge-charbonnier",
                 "--end2end-eval-lights",
                 "7",
                 "--end2end-profiles",
@@ -1167,6 +1832,7 @@ def test_imaginaire_disney_import_treats_torchvision_as_debug_only(
             "torch",
             17,
             7,
+            "edge-charbonnier",
         ),
     ],
 )
@@ -1178,6 +1844,7 @@ def test_prepare_materials_dispatches_acquisition_mode(
     expected_backend,
     expected_steps,
     expected_eval_lights,
+    expected_regularizer,
 ):
     sample = SimpleNamespace(object_name="object", camera="cam00")
     calls = []
@@ -1214,8 +1881,9 @@ def test_prepare_materials_dispatches_acquisition_mode(
         0.002 if expected_mode == "end2end" else 1e-3
     )
     assert calls[0]["end2end_tv_weight"] == pytest.approx(
-        0.025 if expected_mode == "end2end" else 1e-2
+        0.025 if expected_mode == "end2end" else 1.25e-3
     )
+    assert calls[0]["end2end_tv_kind"] == expected_regularizer
     if expected_mode == "end2end":
         assert calls[0]["end2end_profiles"] == "hdri,mix"
         assert calls[0]["end2end_hdri_root"] == "/tmp/hdris"
@@ -1304,6 +1972,7 @@ def test_slurm_dry_run_propagates_end2end_selector_and_options(tmp_path):
     assert "--end2end-steps 17" in result.stdout
     assert "--end2end-learning-rate 0.002" in result.stdout
     assert "--end2end-tv-weight 0.025" in result.stdout
+    assert "--end2end-tv-kind impulse-median" in result.stdout
     assert "--end2end-eval-lights 7" in result.stdout
     command = shlex.split(result.stdout.partition(":")[2])
     assert command[command.index("--end2end-profiles") + 1] == "hdri,mix"

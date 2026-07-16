@@ -114,9 +114,20 @@ Useful options:
   `end2end`. The default is the sibling folder `../imaginaire`.
 - `--end2end-steps N` and `--end2end-learning-rate FLOAT`: control the Disney
   optimization. Defaults are 33,000 steps and a learning rate of `1e-3`.
-- `--end2end-tv-weight FLOAT`: control masked L1 total variation on the learned
-  scalar material maps. The default is `1e-2`; use `0` for an unregularized
-  ablation. Frozen albedo/normal maps and object boundaries are not regularized.
+- `--end2end-tv-kind l1|edge-charbonnier|impulse-median`: choose the scalar-map
+  regularizer. The default `impulse-median` mode completes the ordinary data fit,
+  freezes a conservative 5x5 median/MAD detector away from albedo and normal
+  edges, then applies a post-fit proximal update only at isolated score peaks.
+  `edge-charbonnier` and `l1` retain the broader spatial-TV ablations.
+- `--end2end-tv-weight FLOAT`: set the regularizer strength. For
+  `impulse-median`, cumulative constrained-map shrink is the weight multiplied
+  by `round(0.1 * end2end_steps)`; the `1.25e-3` default intentionally resolves
+  selected peaks to the `0.005` dead zone. Use a smaller value for partial
+  shrink or `0` for an unregularized ablation. For the TV modes this remains the
+  objective coefficient. Unflagged scalar entries, frozen albedo/normal maps,
+  and object boundaries are not changed. Each enabled impulse fit records the
+  exact frozen targets and masks in a hashed `impulse_median_frozen.npz`
+  artifact.
 - `--end2end-profiles LIST`: choose independent `olat`, `hdri`, and `mix` fits.
   The default is `olat,hdri,mix`; `all` is an alias, and a subset such as
   `--end2end-profiles olat` avoids fitting the other profiles.
@@ -174,10 +185,14 @@ the selected root.
 ICTPolarReal end-to-end acquisition uses the measured parallel-polarized OLAT
 image as its target and initializes frozen base color from the dataset
 `albedo.exr`, together with the photometric normal and a constant optical-axis
-view. Pixels failing the `n dot v > 0` validity gate are excluded. Masked L1
-total variation regularizes only the learned Disney scalar maps and only across
-neighbor pairs inside that fitting mask. Invalid/background pixels are masked
-before whole-image 99.5th-percentile linear scaling.
+view. Pixels failing the `n dot v > 0` validity gate are excluded. By default,
+the data-only fit completes before the impulse detector freezes local
+median/MAD targets inside that fitting mask and away from measured albedo or
+normal edges. The post-fit proximal step updates only isolated score peaks;
+all unflagged scalar entries remain bit-identical to the data fit. The broader
+edge-aware Charbonnier and uniform L1 TV modes remain explicit ablations.
+Invalid/background pixels are masked before whole-image 99.5th-percentile
+linear scaling.
 
 End-to-end HDRI targets are not separately photographed environment-light
 captures. They are synthesized from the measured ICTPolarReal parallel OLAT

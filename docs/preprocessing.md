@@ -92,10 +92,20 @@ material state, provenance, and evaluation output.
 
 End-to-end optimization defaults to 33,000 steps and a learning rate of
 `1e-3`. Set these with `--end2end-steps` and
-`--end2end-learning-rate`. Learned scalar maps use masked L1 total variation
-with weight `1e-2`; change it with `--end2end-tv-weight`, or set the weight to
-`0` for an unregularized comparison. The regularizer only connects neighboring
-pixels that both belong to the `capture mask × n dot v` fitting region.
+`--end2end-learning-rate`. Scalar maps default to `impulse-median` cleanup with
+weight `1.25e-3`. It first completes the same data-only Adam fit, then detects
+isolated 5x5 median/MAD score peaks inside the exact
+`capture mask × n dot v` fitting region and away from albedo/normal edges. A
+post-fit proximal update changes only those frozen entries; all unflagged
+entries keep the data-fit values. The exact targets and masks are retained in a
+hashed `impulse_median_frozen.npz` artifact. Use `--end2end-tv-kind` to select
+the broader `edge-charbonnier` or legacy uniform `l1` TV ablations, change the
+strength with `--end2end-tv-weight`, or set the weight to `0` for an
+unregularized comparison. For `impulse-median`, cumulative constrained-map
+shrink is `weight * round(0.1 * end2end_steps)`; the default intentionally
+brings selected peaks to the `0.005` dead zone, while smaller weights allow a
+partial correction. For the TV modes the weight remains an objective
+coefficient.
 
 ## HDRI conditions and synthesized targets
 

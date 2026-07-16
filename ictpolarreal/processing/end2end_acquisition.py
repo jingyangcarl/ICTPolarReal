@@ -56,6 +56,22 @@ DISNEY_TV_SCALAR_NAMES = (
     "clearcoat",
     "clearcoatGloss",
 )
+TV_KINDS = ("l1", "edge-charbonnier", "impulse-median")
+EDGE_CHARBONNIER_EPSILON = 0.02
+EDGE_CHARBONNIER_ALBEDO_SIGMA = 0.05
+EDGE_CHARBONNIER_NORMAL_SIGMA = 0.02
+EDGE_CHARBONNIER_WEIGHT_FLOOR = 0.05
+IMPULSE_MEDIAN_CLEANUP_FRACTION = 0.10
+IMPULSE_MEDIAN_WINDOW_SIZE = 5
+IMPULSE_MEDIAN_ISOLATION_WINDOW_SIZE = 3
+IMPULSE_MEDIAN_MAD_NORMALIZATION = 1.4826
+IMPULSE_MEDIAN_MAD_SCALE = 4.0
+IMPULSE_MEDIAN_MIN_DEVIATION = 0.035
+IMPULSE_MEDIAN_DEAD_ZONE = 0.005
+IMPULSE_MEDIAN_ALBEDO_EDGE_THRESHOLD = 0.05
+IMPULSE_MEDIAN_NORMAL_EDGE_THRESHOLD = 0.02
+IMPULSE_PROXIMAL_LOGIT_EPSILON = 1e-6
+IMPULSE_FROZEN_ARTIFACT_NAME = "impulse_median_frozen.npz"
 REPORT_PROFILES = ("olat", "hdri", "mix")
 ERROR_HEATMAP_MAX = 0.25
 
@@ -63,6 +79,14 @@ ERROR_HEATMAP_MAX = 0.25
 def _array_sha256(array: np.ndarray) -> str:
     values = np.ascontiguousarray(array)
     return hashlib.sha256(memoryview(values).cast("B")).hexdigest()
+
+
+def _file_sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _disney_scalar_initialization(torch, model) -> dict[str, dict[str, float]]:
@@ -250,7 +274,8 @@ def acquire_disney_material(
     device: str = "cuda",
     steps: int = 33000,
     learning_rate: float = 1e-3,
-    tv_weight: float = 1e-2,
+    tv_weight: float = 1.25e-3,
+    tv_kind: str = "impulse-median",
     eval_lights: int = 16,
     lighting_profiles: str | Sequence[str] = "olat,hdri,mix",
     hdri_root: str | Path | None = None,
@@ -273,6 +298,7 @@ def acquire_disney_material(
         raise ValueError("end2end learning rate must be positive")
     if not math.isfinite(tv_weight) or tv_weight < 0:
         raise ValueError("end2end TV weight must be finite and non-negative")
+    tv_kind = _normalize_tv_kind(tv_kind)
     if not base_color_source.strip():
         raise ValueError("end2end base color source must be non-empty")
     if eval_lights < 0:
@@ -521,6 +547,7 @@ def acquire_disney_material(
             steps=steps,
             learning_rate=learning_rate,
             tv_weight=tv_weight,
+            tv_kind=tv_kind,
             hdri_rotations=hdri_rotations,
             eval_lights=eval_lights,
             input_hashes=input_hashes,
@@ -612,6 +639,7 @@ def _fit_disney_profile(
     steps: int,
     learning_rate: float,
     tv_weight: float,
+    tv_kind: str,
     hdri_rotations: int,
     eval_lights: int,
     input_hashes: dict[str, str],
@@ -648,6 +676,26 @@ def _fit_disney_profile(
     eval_hdri_weights = torch.as_tensor(
         np.stack([condition.weights for condition in hdri_evaluation_conditions]), device=device
     )
+    regularization_settings = _regularization_settings(tv_kind)
+    impulse_stage = _impulse_median_stage_plan(
+        steps,
+        enabled=tv_kind == "impulse-median" and tv_weight > 0.0,
+        shrink_per_iteration=tv_weight,
+    )
+    edge_pair_weights = None
+    if tv_kind == "edge-charbonnier":
+        edge_pair_weights = _edge_aware_pair_weights(
+            torch,
+            torch.as_tensor(base_color, device=device),
+            torch.as_tensor(normal, device=device),
+            mask_hwc,
+            albedo_sigma=EDGE_CHARBONNIER_ALBEDO_SIGMA,
+            normal_sigma=EDGE_CHARBONNIER_NORMAL_SIGMA,
+            weight_floor=EDGE_CHARBONNIER_WEIGHT_FLOOR,
+        )
+    impulse_median_bundle = None
+    impulse_cleanup_applied = False
+    impulse_cleanup_diagnostic = None
 
     def render_olat(stack_index: int):
         prediction, _, _ = model(
@@ -691,6 +739,15 @@ def _fit_disney_profile(
             mask_hwc,
         )
 
+    def scalar_regularization():
+        return _disney_scalar_regularization(
+            torch,
+            model,
+            mask_hwc,
+            kind=tv_kind,
+            edge_pair_weights=edge_pair_weights,
+        )
+
     environment_hash = _array_sha256(
         np.stack(
             [
@@ -707,7 +764,7 @@ def _fit_disney_profile(
     checkpoint_path = checkpoint_dir / "latest.pt"
     checkpoint_temp_path = checkpoint_dir / "latest.tmp"
     signature = {
-        "schema": "ictpolarreal.end2end-checkpoint.v8",
+        "schema": "ictpolarreal.end2end-checkpoint.v12",
         "profile": profile,
         "model": MODEL_NAME,
         "height": height,
@@ -731,9 +788,15 @@ def _fit_disney_profile(
         "steps": int(steps),
         "learning_rate": float(learning_rate),
         "regularization": {
-            "kind": "masked_l1_total_variation",
+            "kind": tv_kind,
             "weight": float(tv_weight),
             "parameters": list(DISNEY_TV_SCALAR_NAMES),
+            "settings": regularization_settings,
+            **(
+                {"stage_plan": impulse_stage}
+                if tv_kind == "impulse-median"
+                else {}
+            ),
         },
         "disney_brdf_sha256": provenance["disney_brdf_sha256"],
         "adapter": adapter_provenance,
@@ -770,7 +833,28 @@ def _fit_disney_profile(
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         start_step = int(checkpoint["next_step"])
+        if not 0 <= start_step <= steps:
+            raise RuntimeError(
+                f"Checkpoint {checkpoint_path} has invalid next_step={start_step}"
+            )
         initial_evaluation_losses = checkpoint["initial_evaluation_losses"]
+        try:
+            (
+                impulse_median_bundle,
+                impulse_cleanup_applied,
+                impulse_cleanup_diagnostic,
+            ) = _checkpoint_impulse_median_state(
+                torch,
+                checkpoint,
+                impulse_stage,
+                next_step=start_step,
+                expected_shape=(height, width),
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Checkpoint {checkpoint_path} cannot resume the frozen "
+                "impulse-median stage"
+            ) from exc
         print(
             f"[end2end:{profile}] resuming at iteration {start_step}/{steps}", flush=True
         )
@@ -794,10 +878,39 @@ def _fit_disney_profile(
                 "initial_evaluation_losses": initial_evaluation_losses,
                 "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(),
+                "impulse_median_bundle": impulse_median_bundle,
+                "impulse_cleanup_applied": impulse_cleanup_applied,
+                "impulse_cleanup_diagnostic": impulse_cleanup_diagnostic,
             },
             checkpoint_temp_path,
         )
         checkpoint_temp_path.replace(checkpoint_path)
+
+    def freeze_impulse_median_bundle() -> None:
+        nonlocal impulse_median_bundle
+        impulse_median_bundle = _build_impulse_median_bundle(
+            torch,
+            model,
+            mask_hwc,
+            torch.as_tensor(base_color, device=device),
+            torch.as_tensor(normal, device=device),
+            created_after_step=impulse_stage["detector_after_data_step"],
+        )
+        counts = ", ".join(
+            f"{name}={entry['flagged_count']}"
+            for name, entry in impulse_median_bundle["maps"].items()
+        )
+        total_flagged = sum(
+            entry["flagged_count"]
+            for entry in impulse_median_bundle["maps"].values()
+        )
+        print(
+            f"[end2end:{profile}] impulse-median post-fit detector at "
+            f"{impulse_stage['detector_after_data_step']}/{steps}: froze "
+            f"{total_flagged} centers ({counts}); "
+            "data optimization is complete",
+            flush=True,
+        )
 
     def training_condition(step: int) -> tuple[str, int, str]:
         if profile == "olat":
@@ -822,8 +935,18 @@ def _fit_disney_profile(
     checkpoint_every = max(1000, len(train_indices) * 10)
     final_loss = float(np.mean(initial_evaluation_losses["olat"]))
     final_tv = 0.0
+    final_regularization_loss = 0.0
     final_objective = final_loss
     final_kind, final_index, final_label = training_condition(max(start_step - 1, 0))
+    if impulse_stage["enabled"]:
+        print(
+            f"[end2end:{profile}] impulse-proximal plan: {steps} data-only "
+            f"Adam iterations, then one post-fit update equivalent to "
+            f"{impulse_stage['cleanup_iterations']} proximal iterations at "
+            f"shrink={impulse_stage['shrink_per_iteration']:.7g} "
+            f"(total={impulse_stage['total_shrink']:.7g})",
+            flush=True,
+        )
     model.train()
     for step in range(start_step, steps):
         progress = step / max(steps - 1, 1)
@@ -837,12 +960,20 @@ def _fit_disney_profile(
             data_loss = olat_loss(final_index)
         else:
             data_loss = hdri_loss(final_index, evaluation=False)
-        tv_loss = (
-            scalar_total_variation()
-            if tv_weight > 0.0
+        stage_label = "data-fit" if tv_kind == "impulse-median" else "joint"
+        regularization_active = (
+            tv_weight > 0.0 and tv_kind != "impulse-median"
+        )
+        regularization_loss = (
+            scalar_regularization()
+            if regularization_active
             else data_loss.new_zeros(())
         )
-        objective = data_loss + tv_weight * tv_loss
+        objective = (
+            data_loss + tv_weight * regularization_loss
+            if regularization_active
+            else data_loss
+        )
         if not bool(torch.isfinite(objective)):
             raise RuntimeError(
                 f"Non-finite {profile} end2end objective at iteration {step + 1}"
@@ -850,18 +981,57 @@ def _fit_disney_profile(
         objective.backward()
         optimizer.step()
         final_loss = float(data_loss.detach().cpu())
-        final_tv = float(tv_loss.detach().cpu())
+        final_regularization_loss = float(regularization_loss.detach().cpu())
         final_objective = float(objective.detach().cpu())
         if step == 0 or (step + 1) % log_every == 0 or step + 1 == steps:
-            print(
-                f"[end2end:{profile}] iteration {step + 1}/{steps} "
-                f"kind={final_kind} {final_label} mse={final_loss:.7f} "
-                f"tv={final_tv:.7f} objective={final_objective:.7f} "
-                f"lr={optimizer.param_groups[0]['lr']:.3e}",
-                flush=True,
-            )
-        if (step + 1) % checkpoint_every == 0 or step + 1 == steps:
+            if tv_kind == "impulse-median":
+                print(
+                    f"[end2end:{profile}] iteration {step + 1}/{steps} "
+                    f"stage={stage_label} kind={final_kind} {final_label} "
+                    f"data_objective={final_loss:.7f} "
+                    f"lr={optimizer.param_groups[0]['lr']:.3e}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[end2end:{profile}] iteration {step + 1}/{steps} "
+                    f"stage={stage_label} "
+                    f"kind={final_kind} {final_label} mse={final_loss:.7f} "
+                    f"regularizer={tv_kind} reg={final_regularization_loss:.7f} "
+                    f"objective={final_objective:.7f} "
+                    f"lr={optimizer.param_groups[0]['lr']:.3e}",
+                    flush=True,
+                )
+        reached_data_fit_boundary = impulse_stage["enabled"] and step + 1 == steps
+        if reached_data_fit_boundary:
+            freeze_impulse_median_bundle()
             save_checkpoint(step + 1)
+        elif (step + 1) % checkpoint_every == 0 or step + 1 == steps:
+            save_checkpoint(step + 1)
+
+    if impulse_stage["enabled"] and not impulse_cleanup_applied:
+        if impulse_median_bundle is None:
+            raise RuntimeError(
+                f"{profile} impulse cleanup reached post-fit stage without a frozen bundle"
+            )
+        impulse_cleanup_diagnostic = _apply_impulse_median_proximal(
+            torch,
+            model,
+            impulse_median_bundle,
+            total_shrink=impulse_stage["total_shrink"],
+            dead_zone=IMPULSE_MEDIAN_DEAD_ZONE,
+        )
+        impulse_cleanup_applied = True
+        save_checkpoint(steps)
+        print(
+            f"[end2end:{profile}] post-fit impulse cleanup: "
+            f"moved={impulse_cleanup_diagnostic['moved_centers']}/"
+            f"{impulse_cleanup_diagnostic['flagged_centers']} "
+            f"mean_distance={impulse_cleanup_diagnostic['mean_distance_before']:.7f}"
+            f"->{impulse_cleanup_diagnostic['mean_distance_after']:.7f}; "
+            "no data gradients or optimizer steps",
+            flush=True,
+        )
 
     model.eval()
     hdri_support_split = (
@@ -896,7 +1066,15 @@ def _fit_disney_profile(
         else:
             final_loss = float(hdri_loss(final_index, evaluation=False).cpu())
         final_tv = float(scalar_total_variation().cpu())
-        final_objective = final_loss + tv_weight * final_tv
+        if tv_kind == "impulse-median":
+            final_regularization_loss = 0.0
+            final_objective = final_loss
+        else:
+            final_regularization_loss = _final_regularization_value(
+                scalar_regularization,
+                weight=tv_weight,
+            )
+            final_objective = final_loss + tv_weight * final_regularization_loss
 
     maps_dir = material_dir / "maps"
     _write_material_maps(maps_dir, maps, material_foreground)
@@ -913,8 +1091,12 @@ def _fit_disney_profile(
     )
     _write_combined_evaluation_csv(evaluation_dir, profile, olat_summary, hdri_summary)
 
+    impulse_bundle_provenance = _finalize_impulse_frozen_artifact(
+        material_dir,
+        impulse_median_bundle,
+    )
     metrics = {
-        "schema": "ictpolarreal.end2end-disney.v8",
+        "schema": "ictpolarreal.end2end-disney.v12",
         "material_acquisition": "end2end",
         "lighting_profile": profile,
         "model": MODEL_NAME,
@@ -931,11 +1113,29 @@ def _fit_disney_profile(
         "final_training_condition_mse": final_loss,
         "final_training_objective": final_objective,
         "regularization": {
-            "kind": "masked_l1_total_variation",
+            "kind": tv_kind,
             "weight": float(tv_weight),
             "parameters": list(DISNEY_TV_SCALAR_NAMES),
+            "settings": regularization_settings,
             "final_total_variation": final_tv,
-            "weighted_final_total_variation": float(tv_weight * final_tv),
+            **(
+                {
+                    "weight_semantics": "constrained_shrink_per_cleanup_iteration",
+                    "stage_plan": impulse_stage,
+                    "frozen_bundle": impulse_bundle_provenance,
+                    "cleanup_applied": bool(impulse_cleanup_applied),
+                    "cleanup_diagnostic": impulse_cleanup_diagnostic,
+                    "data_objective_only": True,
+                }
+                if tv_kind == "impulse-median"
+                else {
+                    "weight_semantics": "objective_coefficient",
+                    "final_regularization_loss": final_regularization_loss,
+                    "weighted_final_regularization_loss": float(
+                        tv_weight * final_regularization_loss
+                    ),
+                }
+            ),
         },
         "fit_conditions": {
             "olat": int(len(train_indices)) if profile in {"olat", "mix"} else 0,
@@ -1193,6 +1393,8 @@ def _profile_outputs_complete(
     )
     if not all(path.is_file() for path in required):
         return False
+    if not _impulse_frozen_artifact_complete(material_dir, acquisition):
+        return False
 
     staged_required = [evaluation_dir / "summary.json", evaluation_dir / "metrics.csv"]
     try:
@@ -1414,17 +1616,60 @@ def reorganize_end2end_camera(camera_dir: str | Path) -> dict[str, Any]:
         )
         for profile in profiles
     }
+    recorded_adapter = _recorded_profile_adapter(profile_results)
     report = _write_camera_report(camera_dir, profiles, profile_results)
     manifest["schema"] = "ictpolarreal.material-profiles.v3"
     manifest["lighting"]["conditions"] = "evaluation/assets/conditions.json"
     manifest["lighting"]["weights"] = "evaluation/assets/weights.npz"
     manifest["material"] = {"overview": report.pop("material_overview")}
     manifest["evaluation"] = {"status": "complete", **report}
-    manifest["adapter"] = _adapter_provenance()
+    manifest["adapter"] = recorded_adapter
     manifest.pop("report", None)
     manifest.pop("profile_evaluations", None)
     _write_json_atomic(manifest_path, manifest)
     return manifest
+
+
+def _recorded_profile_adapter(
+    profile_results: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Derive one numerical adapter from recorded profile checkpoints."""
+    adapters = {}
+    for profile, acquisition in profile_results.items():
+        signature = acquisition.get("checkpoint_signature")
+        signature_adapter = (
+            signature.get("adapter") if isinstance(signature, dict) else None
+        )
+        top_level_adapter = acquisition.get("adapter")
+        adapter = (
+            signature_adapter
+            if isinstance(signature_adapter, dict)
+            else top_level_adapter
+            if isinstance(top_level_adapter, dict)
+            else None
+        )
+        if adapter is None:
+            raise ValueError(
+                f"profile {profile!r} is missing recorded numerical adapter provenance"
+            )
+        adapters[profile] = adapter
+    if not adapters:
+        raise ValueError("cannot derive numerical adapter without profile acquisitions")
+    canonical = {
+        profile: json.dumps(adapter, sort_keys=True, separators=(",", ":"))
+        for profile, adapter in adapters.items()
+    }
+    if len(set(canonical.values())) != 1:
+        identities = ", ".join(
+            f"{profile}={adapter.get('schema')}/"
+            f"{adapter.get('algorithm_version')}"
+            for profile, adapter in adapters.items()
+        )
+        raise ValueError(
+            "profile acquisitions disagree on recorded numerical adapter "
+            f"provenance: {identities}"
+        )
+    return json.loads(next(iter(canonical.values())))
 
 
 def _camera_report_artifacts() -> dict[str, Any]:
@@ -2104,7 +2349,6 @@ def _update_profile_acquisition_reports(
     profile_results: dict[str, dict[str, Any]],
     suite_reports: dict[str, dict[str, Any]],
 ) -> None:
-    adapter = _adapter_provenance()
     for profile in profiles:
         result = profile_results[profile]
         evaluations = result["evaluation"]["evaluations"]
@@ -2147,7 +2391,6 @@ def _update_profile_acquisition_reports(
                 ),
                 "representative": representative,
             }
-        result["schema"] = "ictpolarreal.end2end-disney.v8"
         result["evaluation"] = {
             "schema": "ictpolarreal.profile-evaluation.v2",
             "profile": profile,
@@ -2158,9 +2401,8 @@ def _update_profile_acquisition_reports(
             "olat": "evaluation/olat",
             "hdri": "evaluation/hdri",
         }
-        result["adapter"] = adapter
-        if isinstance(result.get("checkpoint_signature"), dict):
-            result["checkpoint_signature"]["adapter"] = adapter
+        # Recomposition is presentation-only.  Preserve the adapter recorded by
+        # the numerical fit instead of relabeling it with the current checkout.
         acquisition_path = camera_dir / "material" / profile / "acquisition.json"
         if acquisition_path.is_file():
             _write_json_atomic(acquisition_path, result)
@@ -2366,8 +2608,8 @@ def _checkpoint_signatures_match(
 def _adapter_provenance() -> dict[str, Any]:
     lighting_path = Path(__file__).resolve().with_name("lighting_profiles.py")
     return {
-        "schema": "ictpolarreal.profile-acquisition-adapter.v2",
-        "algorithm_version": "ictpolarreal-masked-tv-v1",
+        "schema": "ictpolarreal.profile-acquisition-adapter.v6",
+        "algorithm_version": "ictpolarreal-impulse-proximal-v5",
         "lighting_profiles_sha256": hashlib.sha256(
             lighting_path.read_bytes()
         ).hexdigest(),
@@ -2531,6 +2773,704 @@ def _foreground_mask(mask: np.ndarray | None, height: int, width: int) -> np.nda
     return (mask[..., :1] > 0.5).astype(np.float32)
 
 
+def _normalize_tv_kind(kind: str) -> str:
+    if not isinstance(kind, str):
+        raise ValueError(
+            f"end2end TV kind must be one of {TV_KINDS}, got {kind!r}"
+        )
+    normalized = kind.strip().lower()
+    if normalized not in TV_KINDS:
+        raise ValueError(
+            f"end2end TV kind must be one of {TV_KINDS}, got {kind!r}"
+        )
+    return normalized
+
+
+def _regularization_settings(kind: str) -> dict[str, Any]:
+    kind = _normalize_tv_kind(kind)
+    pairwise_common = {
+        "map_domain": "constrained_0_1",
+        "pair_mask": "both_pixels_in_exact_fit_foreground",
+        "reduction": "mean_xy_then_mean_parameters",
+    }
+    if kind == "l1":
+        return {**pairwise_common, "penalty": "absolute_difference"}
+    if kind == "edge-charbonnier":
+        return {
+            **pairwise_common,
+            "penalty": "sqrt(difference_squared + epsilon_squared) - epsilon",
+            "epsilon": EDGE_CHARBONNIER_EPSILON,
+            "guide": "normalized_albedo_and_normal",
+            "albedo_difference": "mean_absolute_rgb",
+            "normal_difference": "one_minus_cosine",
+            "albedo_sigma": EDGE_CHARBONNIER_ALBEDO_SIGMA,
+            "normal_sigma": EDGE_CHARBONNIER_NORMAL_SIGMA,
+            "pair_weight_floor": EDGE_CHARBONNIER_WEIGHT_FLOOR,
+            "pair_weight_formula": (
+                "floor + (1-floor) * exp(-albedo_difference/albedo_sigma "
+                "- normal_difference/normal_sigma)"
+            ),
+        }
+    return {
+        "map_domain": "constrained_0_1",
+        "stage": "full_data_fit_then_post_fit_frozen_impulse_proximal",
+        "cleanup_fraction": IMPULSE_MEDIAN_CLEANUP_FRACTION,
+        "data_optimizer": "original Adam cosine schedule on data loss only",
+        "detector_boundary": "after_all_data_fit_steps",
+        "cleanup_optimizer_steps": 0,
+        "detector_window": IMPULSE_MEDIAN_WINDOW_SIZE,
+        "detector": "absolute_center_minus_local_median",
+        "local_scale": "1.4826_times_median_absolute_deviation",
+        "mad_normalization": IMPULSE_MEDIAN_MAD_NORMALIZATION,
+        "mad_scale": IMPULSE_MEDIAN_MAD_SCALE,
+        "minimum_deviation": IMPULSE_MEDIAN_MIN_DEVIATION,
+        "isolation_window": IMPULSE_MEDIAN_ISOLATION_WINDOW_SIZE,
+        "normalized_robust_score": (
+            "absolute_center_minus_median/max(mad_scale*mad_normalization*MAD,"
+            "minimum_deviation)"
+        ),
+        "isolation_rule": "score_gt_1_and_equal_to_3x3_local_maximum",
+        "local_maximum_tie_policy": "retain_all_equal_maxima",
+        "foreground_rule": "entire_detector_window_in_exact_fit_foreground",
+        "guide": "normalized_albedo_and_normal",
+        "guide_window": IMPULSE_MEDIAN_WINDOW_SIZE,
+        "albedo_difference": "maximum_mean_absolute_rgb_from_center",
+        "normal_difference": "maximum_one_minus_cosine_from_center",
+        "albedo_edge_threshold": IMPULSE_MEDIAN_ALBEDO_EDGE_THRESHOLD,
+        "normal_edge_threshold": IMPULSE_MEDIAN_NORMAL_EDGE_THRESHOLD,
+        "target": "frozen_local_median_after_data_fit",
+        "proximal_update": (
+            "sign(value-target)*max(abs(value-target)-total_shrink,dead_zone)"
+        ),
+        "shrink_parameter": "tv_weight_per_derived_cleanup_iteration",
+        "dead_zone": IMPULSE_MEDIAN_DEAD_ZONE,
+        "unflagged_parameter_update": "none_bit_identical_to_data_fit",
+    }
+
+
+def _impulse_median_stage_plan(
+    steps: int,
+    *,
+    enabled: bool,
+    shrink_per_iteration: float = 0.0,
+) -> dict[str, Any]:
+    if steps <= 0:
+        raise ValueError("end2end steps must be a positive integer")
+    if shrink_per_iteration < 0.0 or not math.isfinite(shrink_per_iteration):
+        raise ValueError("impulse proximal shrink must be finite and non-negative")
+    if not enabled:
+        return {
+            "enabled": False,
+            "data_fit_steps": int(steps),
+            "detector_after_data_step": None,
+            "cleanup_iterations": 0,
+            "cleanup_fraction": 0.0,
+            "shrink_per_iteration": 0.0,
+            "total_shrink": 0.0,
+            "cleanup_optimizer_steps": 0,
+        }
+    cleanup_iterations = max(
+        1, int(round(steps * IMPULSE_MEDIAN_CLEANUP_FRACTION))
+    )
+    return {
+        "enabled": True,
+        "data_fit_steps": int(steps),
+        "detector_after_data_step": int(steps),
+        "cleanup_iterations": int(cleanup_iterations),
+        "cleanup_fraction": float(cleanup_iterations / steps),
+        "shrink_per_iteration": float(shrink_per_iteration),
+        "total_shrink": float(shrink_per_iteration * cleanup_iterations),
+        "cleanup_optimizer_steps": 0,
+    }
+
+
+def _final_regularization_value(scalar_regularization, *, weight: float) -> float:
+    """Evaluate a fitted regularizer only when it contributes to the objective."""
+    if weight == 0.0:
+        return 0.0
+    return float(scalar_regularization().cpu())
+
+
+def _checkpoint_impulse_median_state(
+    torch,
+    checkpoint: dict[str, Any],
+    stage_plan: dict[str, Any],
+    *,
+    next_step: int,
+    expected_shape: tuple[int, int],
+):
+    bundle = checkpoint.get("impulse_median_bundle")
+    cleanup_applied = checkpoint.get("impulse_cleanup_applied", False)
+    cleanup_diagnostic = checkpoint.get("impulse_cleanup_diagnostic")
+    if not isinstance(cleanup_applied, bool):
+        raise ValueError("checkpoint impulse cleanup state must be boolean")
+    if not stage_plan["enabled"]:
+        if bundle is not None or cleanup_applied or cleanup_diagnostic is not None:
+            raise ValueError(
+                "checkpoint contains impulse cleanup state for a disabled stage"
+            )
+        return None, False, None
+    boundary = int(stage_plan["data_fit_steps"])
+    if next_step < boundary:
+        if bundle is not None or cleanup_applied or cleanup_diagnostic is not None:
+            raise ValueError(
+                "checkpoint contains impulse cleanup state before data fit completed"
+            )
+        return None, False, None
+    _validate_impulse_median_bundle(
+        torch,
+        bundle,
+        expected_shape=expected_shape,
+        expected_created_after_step=boundary,
+    )
+    if cleanup_applied and not isinstance(cleanup_diagnostic, dict):
+        raise ValueError("applied impulse cleanup is missing its diagnostic")
+    if not cleanup_applied and cleanup_diagnostic is not None:
+        raise ValueError("pending impulse cleanup has a premature diagnostic")
+    return bundle, cleanup_applied, cleanup_diagnostic
+
+
+def _fit_pair_masks(mask_hwc):
+    mask = mask_hwc
+    if mask.ndim == 3 and mask.shape[-1] == 1:
+        mask = mask[..., 0]
+    if mask.ndim != 2:
+        raise ValueError(
+            f"TV mask must have shape (H,W) or (H,W,1), got {mask.shape}"
+        )
+    return mask[:, 1:] * mask[:, :-1], mask[1:, :] * mask[:-1, :]
+
+
+def _edge_aware_pair_weights(
+    torch,
+    albedo_hwc,
+    normal_hwc,
+    mask_hwc,
+    *,
+    albedo_sigma: float = EDGE_CHARBONNIER_ALBEDO_SIGMA,
+    normal_sigma: float = EDGE_CHARBONNIER_NORMAL_SIGMA,
+    weight_floor: float = EDGE_CHARBONNIER_WEIGHT_FLOOR,
+):
+    """Precompute detached albedo/normal affinities for exact fit pairs."""
+    if albedo_sigma <= 0.0 or normal_sigma <= 0.0:
+        raise ValueError("edge-aware guide sigmas must be positive")
+    if not 0.0 <= weight_floor <= 1.0:
+        raise ValueError("edge-aware pair-weight floor must be in [0,1]")
+
+    albedo = albedo_hwc.detach()
+    normal = normal_hwc.detach()
+    if albedo.ndim != 3 or albedo.shape[-1] != 3:
+        raise ValueError(
+            f"edge guide albedo must have shape (H,W,3), got {albedo.shape}"
+        )
+    if normal.shape != albedo.shape:
+        raise ValueError(
+            "edge guide normal must have the same (H,W,3) shape as albedo, "
+            f"got {normal.shape} and {albedo.shape}"
+        )
+    horizontal_mask, vertical_mask = _fit_pair_masks(mask_hwc.detach())
+    expected_shape = tuple(albedo.shape[:2])
+    if tuple(horizontal_mask.shape) != (expected_shape[0], expected_shape[1] - 1):
+        raise ValueError(
+            f"edge guide mask spatial shape must be {expected_shape}, "
+            f"got {tuple(mask_hwc.shape)}"
+        )
+
+    normal = normal / normal.square().sum(dim=-1, keepdim=True).sqrt().clamp_min(1e-8)
+
+    def pair_weights(first, second):
+        albedo_difference = (first[0] - second[0]).abs().mean(dim=-1)
+        normal_difference = (
+            1.0 - (first[1] * second[1]).sum(dim=-1).clamp(-1.0, 1.0)
+        ).clamp_min(0.0)
+        affinity = torch.exp(
+            -albedo_difference / albedo_sigma
+            - normal_difference / normal_sigma
+        )
+        return weight_floor + (1.0 - weight_floor) * affinity
+
+    horizontal_weight = pair_weights(
+        (albedo[:, 1:], normal[:, 1:]),
+        (albedo[:, :-1], normal[:, :-1]),
+    )
+    vertical_weight = pair_weights(
+        (albedo[1:, :], normal[1:, :]),
+        (albedo[:-1, :], normal[:-1, :]),
+    )
+    return {
+        "horizontal_mask": horizontal_mask.detach(),
+        "vertical_mask": vertical_mask.detach(),
+        "horizontal_weight": horizontal_weight.detach(),
+        "vertical_weight": vertical_weight.detach(),
+    }
+
+
+def _window_patches(torch, values, window_size: int):
+    if window_size <= 0 or window_size % 2 != 1:
+        raise ValueError("window size must be a positive odd integer")
+    if values.ndim == 2:
+        values = values[..., None]
+    if values.ndim != 3:
+        raise ValueError(f"window input must have shape (H,W,C), got {values.shape}")
+    height, width, channels = values.shape
+    nchw = values.permute(2, 0, 1).unsqueeze(0).contiguous()
+    unfolded = torch.nn.functional.unfold(
+        nchw,
+        kernel_size=window_size,
+        padding=window_size // 2,
+    )
+    return unfolded[0].transpose(0, 1).reshape(
+        height, width, channels, window_size * window_size
+    )
+
+
+def _impulse_median_guide_support(
+    torch,
+    mask_hwc,
+    albedo_hwc,
+    normal_hwc,
+    *,
+    window_size: int = IMPULSE_MEDIAN_WINDOW_SIZE,
+    albedo_edge_threshold: float = IMPULSE_MEDIAN_ALBEDO_EDGE_THRESHOLD,
+    normal_edge_threshold: float = IMPULSE_MEDIAN_NORMAL_EDGE_THRESHOLD,
+):
+    """Return conservative detached centers eligible for impulse cleanup."""
+    if albedo_edge_threshold < 0.0 or normal_edge_threshold < 0.0:
+        raise ValueError("impulse-median guide thresholds must be non-negative")
+    mask = mask_hwc.detach()
+    if mask.ndim == 3 and mask.shape[-1] == 1:
+        mask = mask[..., 0]
+    if mask.ndim != 2:
+        raise ValueError(
+            f"impulse-median mask must have shape (H,W) or (H,W,1), got {mask_hwc.shape}"
+        )
+    albedo = albedo_hwc.detach()
+    normal = normal_hwc.detach()
+    expected_shape = (*mask.shape, 3)
+    if tuple(albedo.shape) != expected_shape:
+        raise ValueError(
+            f"impulse-median albedo guide must have shape {expected_shape}, "
+            f"got {tuple(albedo.shape)}"
+        )
+    if tuple(normal.shape) != expected_shape:
+        raise ValueError(
+            f"impulse-median normal guide must have shape {expected_shape}, "
+            f"got {tuple(normal.shape)}"
+        )
+
+    mask_patches = _window_patches(torch, mask.float(), window_size)[..., 0, :]
+    full_foreground = (mask_patches > 0.5).all(dim=-1)
+    albedo_patches = _window_patches(torch, albedo, window_size)
+    albedo_difference = (
+        albedo_patches - albedo.unsqueeze(-1)
+    ).abs().mean(dim=2).amax(dim=-1)
+    normal = normal / normal.square().sum(dim=-1, keepdim=True).sqrt().clamp_min(1e-8)
+    normal_patches = _window_patches(torch, normal, window_size)
+    normal_cosine = (normal_patches * normal.unsqueeze(-1)).sum(dim=2).clamp(
+        -1.0, 1.0
+    )
+    normal_difference = (1.0 - normal_cosine).clamp_min(0.0).amax(dim=-1)
+    guide_safe = (
+        full_foreground
+        & (albedo_difference <= albedo_edge_threshold)
+        & (normal_difference <= normal_edge_threshold)
+    )
+    return {
+        "full_foreground": full_foreground.detach(),
+        "guide_safe": guide_safe.detach(),
+        "albedo_difference": albedo_difference.detach(),
+        "normal_difference": normal_difference.detach(),
+    }
+
+
+def _build_impulse_median_bundle(
+    torch,
+    model,
+    mask_hwc,
+    albedo_hwc,
+    normal_hwc,
+    *,
+    created_after_step: int,
+    window_size: int = IMPULSE_MEDIAN_WINDOW_SIZE,
+    isolation_window_size: int = IMPULSE_MEDIAN_ISOLATION_WINDOW_SIZE,
+    mad_normalization: float = IMPULSE_MEDIAN_MAD_NORMALIZATION,
+    mad_scale: float = IMPULSE_MEDIAN_MAD_SCALE,
+    minimum_deviation: float = IMPULSE_MEDIAN_MIN_DEVIATION,
+    albedo_edge_threshold: float = IMPULSE_MEDIAN_ALBEDO_EDGE_THRESHOLD,
+    normal_edge_threshold: float = IMPULSE_MEDIAN_NORMAL_EDGE_THRESHOLD,
+):
+    """Freeze per-map robust-median targets for isolated, guide-safe centers."""
+    if isolation_window_size <= 0 or isolation_window_size % 2 != 1:
+        raise ValueError("impulse-median isolation window must be a positive odd integer")
+    if mad_normalization <= 0.0 or mad_scale <= 0.0:
+        raise ValueError("impulse-median MAD constants must be positive")
+    if minimum_deviation < 0.0:
+        raise ValueError("impulse-median minimum deviation must be non-negative")
+    support = _impulse_median_guide_support(
+        torch,
+        mask_hwc,
+        albedo_hwc,
+        normal_hwc,
+        window_size=window_size,
+        albedo_edge_threshold=albedo_edge_threshold,
+        normal_edge_threshold=normal_edge_threshold,
+    )
+    expected_shape = tuple(support["guide_safe"].shape)
+    maps = {}
+    with torch.no_grad():
+        constrained = model._param_maps()
+        for name in DISNEY_TV_SCALAR_NAMES:
+            scalar = constrained[name].detach()
+            if scalar.ndim == 3 and scalar.shape[-1] == 1:
+                scalar = scalar[..., 0]
+            if scalar.ndim != 2 or tuple(scalar.shape) != expected_shape:
+                raise ValueError(
+                    f"Disney scalar {name} must have shape {expected_shape}, "
+                    f"got {tuple(scalar.shape)}"
+                )
+            patches = _window_patches(torch, scalar, window_size)[..., 0, :]
+            target = patches.median(dim=-1).values
+            mad = (patches - target.unsqueeze(-1)).abs().median(dim=-1).values
+            robust_threshold = mad * (mad_normalization * mad_scale)
+            threshold = torch.maximum(
+                robust_threshold,
+                torch.full_like(robust_threshold, minimum_deviation),
+            )
+            normalized_score = (scalar - target).abs() / threshold
+            local_maximum = torch.nn.functional.max_pool2d(
+                normalized_score.unsqueeze(0).unsqueeze(0),
+                kernel_size=isolation_window_size,
+                stride=1,
+                padding=isolation_window_size // 2,
+            )[0, 0]
+            flagged = (
+                (normalized_score > 1.0)
+                & (normalized_score == local_maximum)
+                & support["full_foreground"]
+                & support["guide_safe"]
+            )
+            maps[name] = {
+                "target": target.detach().clone(),
+                "mask": flagged.detach().clone(),
+                "flagged_count": int(flagged.sum().item()),
+            }
+    bundle = {
+        "schema": "ictpolarreal.impulse-median-bundle.v1",
+        "created_after_step": int(created_after_step),
+        "maps": maps,
+    }
+    _validate_impulse_median_bundle(torch, bundle, expected_shape=expected_shape)
+    return bundle
+
+
+def _validate_impulse_median_bundle(
+    torch,
+    bundle,
+    *,
+    expected_shape: tuple[int, int],
+    expected_created_after_step: int | None = None,
+    verify_counts: bool = True,
+) -> None:
+    if not isinstance(bundle, dict) or bundle.get("schema") != (
+        "ictpolarreal.impulse-median-bundle.v1"
+    ):
+        raise ValueError("invalid or missing impulse-median frozen bundle")
+    if expected_created_after_step is not None and bundle.get(
+        "created_after_step"
+    ) != int(expected_created_after_step):
+        raise ValueError(
+            "impulse-median frozen bundle was created at the wrong stage boundary"
+        )
+    maps = bundle.get("maps")
+    if not isinstance(maps, dict) or set(maps) != set(DISNEY_TV_SCALAR_NAMES):
+        raise ValueError("impulse-median frozen bundle has the wrong scalar maps")
+    for name in DISNEY_TV_SCALAR_NAMES:
+        entry = maps[name]
+        if not isinstance(entry, dict):
+            raise ValueError(f"impulse-median frozen map {name} is invalid")
+        target = entry.get("target")
+        mask = entry.get("mask")
+        flagged_count = entry.get("flagged_count")
+        if not isinstance(target, torch.Tensor) or tuple(target.shape) != expected_shape:
+            raise ValueError(
+                f"impulse-median target {name} must have shape {expected_shape}"
+            )
+        if not isinstance(mask, torch.Tensor) or tuple(mask.shape) != expected_shape:
+            raise ValueError(
+                f"impulse-median mask {name} must have shape {expected_shape}"
+            )
+        if mask.dtype != torch.bool:
+            raise ValueError(f"impulse-median mask {name} must be boolean")
+        if target.requires_grad or mask.requires_grad:
+            raise ValueError(f"impulse-median target and mask {name} must be detached")
+        if not isinstance(flagged_count, int) or flagged_count < 0:
+            raise ValueError(f"impulse-median flagged count {name} is invalid")
+        if verify_counts and flagged_count != int(mask.sum().item()):
+            raise ValueError(f"impulse-median flagged count {name} does not match mask")
+
+
+def _impulse_median_bundle_provenance(bundle) -> dict[str, Any] | None:
+    if bundle is None:
+        return None
+    maps = {}
+    for name in DISNEY_TV_SCALAR_NAMES:
+        target = bundle["maps"][name]["target"].detach().float().cpu().numpy()
+        mask = bundle["maps"][name]["mask"].detach().cpu().numpy()
+        maps[name] = {
+            "flagged_centers": int(bundle["maps"][name]["flagged_count"]),
+            "target_sha256": _array_sha256(target),
+            "mask_sha256": _array_sha256(mask),
+        }
+    return {
+        "schema": bundle["schema"],
+        "created_after_step": int(bundle["created_after_step"]),
+        "maps": maps,
+        "total_flagged_centers": int(
+            sum(entry["flagged_centers"] for entry in maps.values())
+        ),
+    }
+
+
+def _write_impulse_frozen_artifact(path: Path, bundle) -> dict[str, Any]:
+    """Persist the exact frozen detector state in a compressed final artifact."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.tmp")
+    payload = {
+        "metadata": np.asarray(
+            json.dumps(
+                {
+                    "schema": "ictpolarreal.impulse-frozen-artifact.v1",
+                    "created_after_step": int(bundle["created_after_step"]),
+                    "maps": list(DISNEY_TV_SCALAR_NAMES),
+                },
+                sort_keys=True,
+            )
+        )
+    }
+    for name in DISNEY_TV_SCALAR_NAMES:
+        entry = bundle["maps"][name]
+        payload[f"{name}__target"] = (
+            entry["target"].detach().float().cpu().numpy()
+        )
+        payload[f"{name}__mask"] = entry["mask"].detach().cpu().numpy()
+    with temporary.open("wb") as stream:
+        np.savez_compressed(stream, **payload)
+    temporary.replace(path)
+    return {
+        "schema": "ictpolarreal.impulse-frozen-artifact.v1",
+        "path": path.name,
+        "sha256": _file_sha256(path),
+        "bytes": int(path.stat().st_size),
+        "format": "numpy_npz_compressed",
+    }
+
+
+def _finalize_impulse_frozen_artifact(
+    material_dir: Path,
+    bundle,
+) -> dict[str, Any] | None:
+    path = material_dir / IMPULSE_FROZEN_ARTIFACT_NAME
+    if bundle is None:
+        path.unlink(missing_ok=True)
+        return None
+    provenance = _impulse_median_bundle_provenance(bundle)
+    provenance["artifact"] = _write_impulse_frozen_artifact(path, bundle)
+    return provenance
+
+
+def _impulse_frozen_artifact_complete(
+    material_dir: Path,
+    acquisition: dict[str, Any],
+) -> bool:
+    regularization = acquisition.get("regularization")
+    signature = acquisition.get("checkpoint_signature")
+    signature_regularization = (
+        signature.get("regularization") if isinstance(signature, dict) else None
+    )
+
+    def enabled_impulse(value) -> bool:
+        if not isinstance(value, dict) or value.get("kind") != "impulse-median":
+            return False
+        stage_plan = value.get("stage_plan")
+        return isinstance(stage_plan, dict) and stage_plan.get("enabled") is True
+
+    top_level_enabled = enabled_impulse(regularization)
+    signature_enabled = enabled_impulse(signature_regularization)
+    if not top_level_enabled and not signature_enabled:
+        return True
+    if not top_level_enabled or not signature_enabled:
+        return False
+    for key in ("kind", "weight", "parameters", "settings", "stage_plan"):
+        if regularization.get(key) != signature_regularization.get(key):
+            return False
+    frozen_bundle = regularization.get("frozen_bundle")
+    artifact = (
+        frozen_bundle.get("artifact")
+        if isinstance(frozen_bundle, dict)
+        else None
+    )
+    if not isinstance(artifact, dict):
+        return False
+    if (
+        artifact.get("schema") != "ictpolarreal.impulse-frozen-artifact.v1"
+        or artifact.get("path") != IMPULSE_FROZEN_ARTIFACT_NAME
+        or not isinstance(artifact.get("sha256"), str)
+        or not isinstance(artifact.get("bytes"), int)
+    ):
+        return False
+    path = material_dir / IMPULSE_FROZEN_ARTIFACT_NAME
+    if not path.is_file() or path.stat().st_size != artifact["bytes"]:
+        return False
+    return _file_sha256(path) == artifact["sha256"]
+
+
+def _apply_impulse_median_proximal(
+    torch,
+    model,
+    bundle,
+    *,
+    total_shrink: float,
+    dead_zone: float = IMPULSE_MEDIAN_DEAD_ZONE,
+) -> dict[str, Any]:
+    """Apply one exact post-fit proximal update at frozen impulse centers."""
+    if not math.isfinite(total_shrink) or total_shrink < 0.0:
+        raise ValueError("impulse proximal total shrink must be finite and non-negative")
+    if not math.isfinite(dead_zone) or dead_zone < 0.0:
+        raise ValueError("impulse proximal dead zone must be finite and non-negative")
+    constrained = model._param_maps()
+    reference = constrained[DISNEY_TV_SCALAR_NAMES[0]]
+    if reference.ndim == 3 and reference.shape[-1] == 1:
+        reference = reference[..., 0]
+    expected_shape = tuple(reference.shape)
+    _validate_impulse_median_bundle(
+        torch,
+        bundle,
+        expected_shape=expected_shape,
+    )
+
+    per_map = {}
+    all_before = []
+    all_after = []
+    moved_centers = 0
+    with torch.no_grad():
+        for name in DISNEY_TV_SCALAR_NAMES:
+            scalar = constrained[name]
+            if scalar.ndim == 3 and scalar.shape[-1] == 1:
+                scalar = scalar[..., 0]
+            if scalar.ndim != 2 or tuple(scalar.shape) != expected_shape:
+                raise ValueError(
+                    f"Disney scalar {name} must have shape {expected_shape}, "
+                    f"got {tuple(scalar.shape)}"
+                )
+            raw_parameter = getattr(model, f"{name}_un", None)
+            if raw_parameter is None or tuple(raw_parameter.shape) != (
+                1,
+                *expected_shape,
+            ):
+                raise ValueError(
+                    f"Disney unconstrained scalar {name}_un must have shape "
+                    f"{(1, *expected_shape)}"
+                )
+            entry = bundle["maps"][name]
+            flagged = entry["mask"].to(device=scalar.device)
+            count = entry["flagged_count"]
+            if count == 0:
+                per_map[name] = {
+                    "flagged_centers": 0,
+                    "moved_centers": 0,
+                    "mean_distance_before": 0.0,
+                    "mean_distance_after": 0.0,
+                    "max_distance_before": 0.0,
+                    "max_distance_after": 0.0,
+                }
+                continue
+            target = entry["target"].to(device=scalar.device, dtype=scalar.dtype)
+            current_values = scalar[flagged]
+            target_values = target[flagged]
+            residual = current_values - target_values
+            distance_before = residual.abs()
+            active = (distance_before > dead_zone) & (total_shrink > 0.0)
+            distance_after = torch.where(
+                active,
+                (distance_before - total_shrink).clamp_min(dead_zone),
+                distance_before,
+            )
+            desired = target_values + residual.sign() * distance_after
+            active_mask = torch.zeros_like(flagged)
+            active_mask[flagged] = active
+            raw_parameter[0][active_mask] = torch.logit(
+                desired[active].clamp(
+                    IMPULSE_PROXIMAL_LOGIT_EPSILON,
+                    1.0 - IMPULSE_PROXIMAL_LOGIT_EPSILON,
+                )
+            )
+            actual_values = current_values.clone()
+            actual_values[active] = model._param_maps()[name][active_mask]
+            actual_distance = (actual_values - target_values).abs()
+            moved = int(torch.count_nonzero(actual_values != current_values).item())
+            moved_centers += moved
+            all_before.append(distance_before)
+            all_after.append(actual_distance)
+            per_map[name] = {
+                "flagged_centers": int(count),
+                "moved_centers": moved,
+                "mean_distance_before": float(distance_before.mean().cpu()),
+                "mean_distance_after": float(actual_distance.mean().cpu()),
+                "max_distance_before": float(distance_before.max().cpu()),
+                "max_distance_after": float(actual_distance.max().cpu()),
+            }
+
+    if all_before:
+        before = torch.cat(all_before)
+        after = torch.cat(all_after)
+        mean_before = float(before.mean().cpu())
+        mean_after = float(after.mean().cpu())
+        max_before = float(before.max().cpu())
+        max_after = float(after.max().cpu())
+        flagged_centers = int(before.numel())
+    else:
+        mean_before = mean_after = max_before = max_after = 0.0
+        flagged_centers = 0
+    return {
+        "schema": "ictpolarreal.impulse-proximal-diagnostic.v1",
+        "flagged_centers": flagged_centers,
+        "moved_centers": int(moved_centers),
+        "total_shrink": float(total_shrink),
+        "dead_zone": float(dead_zone),
+        "mean_distance_before": mean_before,
+        "mean_distance_after": mean_after,
+        "max_distance_before": max_before,
+        "max_distance_after": max_after,
+        "maps": per_map,
+    }
+
+
+def _disney_scalar_regularization(
+    torch,
+    model,
+    mask_hwc,
+    *,
+    kind: str,
+    edge_pair_weights=None,
+):
+    kind = _normalize_tv_kind(kind)
+    if kind == "l1":
+        return _masked_disney_scalar_total_variation(torch, model, mask_hwc)
+    if kind == "edge-charbonnier":
+        if edge_pair_weights is None:
+            raise ValueError("edge-charbonnier regularization requires guide pair weights")
+        return _masked_disney_scalar_edge_charbonnier(
+            torch,
+            model,
+            mask_hwc,
+            edge_pair_weights,
+            epsilon=EDGE_CHARBONNIER_EPSILON,
+        )
+    raise ValueError(
+        "impulse-median is a post-fit proximal update, not a differentiable loss"
+    )
+
+
 def _masked_disney_scalar_total_variation(torch, model, mask_hwc):
     """Average first-order TV over fitted Disney scalar maps.
 
@@ -2538,14 +3478,8 @@ def _masked_disney_scalar_total_variation(torch, model, mask_hwc):
     considered.  This smooths isolated material noise without pulling the
     object boundary or excluded back-facing pixels toward background values.
     """
-    mask = mask_hwc
-    if mask.ndim == 3 and mask.shape[-1] == 1:
-        mask = mask[..., 0]
-    if mask.ndim != 2:
-        raise ValueError(f"TV mask must have shape (H,W) or (H,W,1), got {mask.shape}")
-
-    horizontal_mask = mask[:, 1:] * mask[:, :-1]
-    vertical_mask = mask[1:, :] * mask[:-1, :]
+    horizontal_mask, vertical_mask = _fit_pair_masks(mask_hwc)
+    mask = mask_hwc[..., 0] if mask_hwc.ndim == 3 else mask_hwc
     horizontal_count = horizontal_mask.sum().clamp_min(1.0)
     vertical_count = vertical_mask.sum().clamp_min(1.0)
     constrained = model._param_maps()
@@ -2565,6 +3499,65 @@ def _masked_disney_scalar_total_variation(torch, model, mask_hwc):
         vertical = (
             (scalar[1:, :] - scalar[:-1, :]).abs() * vertical_mask
         ).sum() / vertical_count
+        terms.append(0.5 * (horizontal + vertical))
+    return torch.stack(terms).mean()
+
+
+def _masked_disney_scalar_edge_charbonnier(
+    torch,
+    model,
+    mask_hwc,
+    pair_weights,
+    *,
+    epsilon: float = EDGE_CHARBONNIER_EPSILON,
+):
+    """Edge-aware Charbonnier penalty over constrained Disney scalar maps."""
+    if epsilon <= 0.0:
+        raise ValueError("Charbonnier epsilon must be positive")
+    horizontal_mask, vertical_mask = _fit_pair_masks(mask_hwc)
+    mask = mask_hwc[..., 0] if mask_hwc.ndim == 3 else mask_hwc
+    for name, expected in (
+        ("horizontal_mask", horizontal_mask),
+        ("vertical_mask", vertical_mask),
+        ("horizontal_weight", horizontal_mask),
+        ("vertical_weight", vertical_mask),
+    ):
+        value = pair_weights.get(name)
+        if value is None or tuple(value.shape) != tuple(expected.shape):
+            raise ValueError(
+                f"edge pair {name} must have shape {tuple(expected.shape)}"
+            )
+
+    # Reapply the caller's exact fit-pair mask even though the precomputed
+    # bundle contains a detached copy.  This makes mask semantics explicit and
+    # prevents a stale/mismatched bundle from admitting excluded pairs.
+    horizontal_weight = pair_weights["horizontal_weight"] * horizontal_mask
+    vertical_weight = pair_weights["vertical_weight"] * vertical_mask
+    horizontal_count = horizontal_mask.sum().clamp_min(1.0)
+    vertical_count = vertical_mask.sum().clamp_min(1.0)
+    constrained = model._param_maps()
+    terms = []
+    for name in DISNEY_TV_SCALAR_NAMES:
+        scalar = constrained[name]
+        if scalar.ndim == 3 and scalar.shape[-1] == 1:
+            scalar = scalar[..., 0]
+        if scalar.ndim != 2 or tuple(scalar.shape) != tuple(mask.shape):
+            raise ValueError(
+                f"Disney scalar {name} must have shape {tuple(mask.shape)}, "
+                f"got {tuple(scalar.shape)}"
+            )
+        horizontal_difference = scalar[:, 1:] - scalar[:, :-1]
+        vertical_difference = scalar[1:, :] - scalar[:-1, :]
+        horizontal_penalty = (
+            horizontal_difference.square() + epsilon * epsilon
+        ).sqrt() - epsilon
+        vertical_penalty = (
+            vertical_difference.square() + epsilon * epsilon
+        ).sqrt() - epsilon
+        horizontal = (
+            horizontal_penalty * horizontal_weight
+        ).sum() / horizontal_count
+        vertical = (vertical_penalty * vertical_weight).sum() / vertical_count
         terms.append(0.5 * (horizontal + vertical))
     return torch.stack(terms).mean()
 

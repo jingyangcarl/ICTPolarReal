@@ -49,7 +49,7 @@ def main() -> None:
         "--material-acquisition",
         choices=["default", "end2end"],
         default="default",
-        help="default polarized Ward fit or Imaginaire Disney end-to-end fit.",
+        help="default polarized Ward fit or ICTPolarReal Disney end-to-end fit.",
     )
     parser.add_argument(
         "--imaginaire-root",
@@ -61,10 +61,19 @@ def main() -> None:
     parser.add_argument(
         "--end2end-tv-weight",
         type=float,
-        default=1e-2,
+        default=1.25e-3,
         help=(
-            "Weight for masked L1 total variation on learned Disney scalar maps; "
-            "set to 0 for an unregularized ablation."
+            "Weight for the selected masked scalar-map regularizer; set to 0 "
+            "for an unregularized ablation."
+        ),
+    )
+    parser.add_argument(
+        "--end2end-tv-kind",
+        choices=("l1", "edge-charbonnier", "impulse-median"),
+        default="impulse-median",
+        help=(
+            "Scalar-map regularizer: legacy uniform L1 TV, edge-aware "
+            "Charbonnier TV, or post-fit impulse-only median cleanup."
         ),
     )
     parser.add_argument(
@@ -150,6 +159,7 @@ def main() -> None:
             "end2end_steps": args.end2end_steps,
             "end2end_learning_rate": args.end2end_learning_rate,
             "end2end_tv_weight": args.end2end_tv_weight,
+            "end2end_tv_kind": args.end2end_tv_kind,
             "end2end_eval_lights": args.end2end_eval_lights,
             "end2end_hdri_root": (
                 str(Path(args.end2end_hdri_root).expanduser().resolve())
@@ -189,6 +199,7 @@ def main() -> None:
                 end2end_steps=args.end2end_steps,
                 end2end_learning_rate=args.end2end_learning_rate,
                 end2end_tv_weight=args.end2end_tv_weight,
+                end2end_tv_kind=args.end2end_tv_kind,
                 end2end_eval_lights=args.end2end_eval_lights,
                 end2end_profiles=args.end2end_profiles,
                 end2end_hdri_root=args.end2end_hdri_root,

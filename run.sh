@@ -23,7 +23,8 @@ fi
 IMAGINAIRE_ROOT="${IMAGINAIRE_ROOT:-${REPO_ROOT}/../imaginaire}"
 END2END_STEPS="${END2END_STEPS:-33000}"
 END2END_LEARNING_RATE="${END2END_LEARNING_RATE:-1e-3}"
-END2END_TV_WEIGHT="${END2END_TV_WEIGHT:-1e-2}"
+END2END_TV_WEIGHT="${END2END_TV_WEIGHT:-1.25e-3}"
+END2END_TV_KIND="${END2END_TV_KIND:-impulse-median}"
 END2END_EVAL_LIGHTS="${END2END_EVAL_LIGHTS:-16}"
 END2END_PROFILES="${END2END_PROFILES:-olat,hdri,mix}"
 END2END_HDRI_ROOT="${END2END_HDRI_ROOT:-/lustre/fsw/portfolios/maxine/projects/maxine_video/VideoRelighting/datasets/HDR/hdr_maps_1k}"
@@ -115,7 +116,8 @@ Options:
   --end2end-learning-rate FLOAT
                             Disney BRDF learning rate. Default: ${END2END_LEARNING_RATE}
   --end2end-tv-weight FLOAT
-                            Masked scalar-map TV weight; 0 disables it. Default: ${END2END_TV_WEIGHT}
+                            Masked scalar-map regularizer weight; 0 disables it. Default: ${END2END_TV_WEIGHT}
+  --end2end-tv-kind KIND    l1, edge-charbonnier, or impulse-median. Default: ${END2END_TV_KIND}
   --end2end-eval-lights N  OLATs held out for relighting evaluation. Default: ${END2END_EVAL_LIGHTS}
   --end2end-profiles LIST   Independent olat,hdri,mix fits; comma-separated or all. Default: ${END2END_PROFILES}
   --end2end-hdri-root PATH HDR/EXR maps used to synthesize environment targets. Default: ${END2END_HDRI_ROOT}
@@ -202,6 +204,7 @@ parse_args() {
       --end2end-steps) END2END_STEPS="$2"; shift 2 ;;
       --end2end-learning-rate) END2END_LEARNING_RATE="$2"; shift 2 ;;
       --end2end-tv-weight) END2END_TV_WEIGHT="$2"; shift 2 ;;
+      --end2end-tv-kind) END2END_TV_KIND="$2"; shift 2 ;;
       --end2end-eval-lights) END2END_EVAL_LIGHTS="$2"; shift 2 ;;
       --end2end-profiles) END2END_PROFILES="$2"; shift 2 ;;
       --end2end-hdri-root) END2END_HDRI_ROOT="$2"; shift 2 ;;
@@ -284,6 +287,10 @@ parse_args() {
     echo "--end2end-tv-weight must be a non-negative number; got: ${END2END_TV_WEIGHT}" >&2
     exit 2
   fi
+  case "${END2END_TV_KIND}" in
+    l1|edge-charbonnier|impulse-median) ;;
+    *) echo "--end2end-tv-kind must be l1, edge-charbonnier, or impulse-median; got: ${END2END_TV_KIND}" >&2; exit 2 ;;
+  esac
   if ! [[ "${END2END_HDRI_COUNT}" =~ ^[1-9][0-9]*$ ]]; then
     echo "--end2end-hdri-count must be a positive integer; got: ${END2END_HDRI_COUNT}" >&2
     exit 2
@@ -681,6 +688,7 @@ process_materials() {
     --end2end-steps "${END2END_STEPS}" \
     --end2end-learning-rate "${END2END_LEARNING_RATE}" \
     --end2end-tv-weight "${END2END_TV_WEIGHT}" \
+    --end2end-tv-kind "${END2END_TV_KIND}" \
     --end2end-eval-lights "${END2END_EVAL_LIGHTS}" \
     --end2end-profiles "${END2END_PROFILES}" \
     --end2end-hdri-root "${END2END_HDRI_ROOT}" \
@@ -764,6 +772,7 @@ submit_process_slurm() {
     --end2end-steps "${END2END_STEPS}"
     --end2end-learning-rate "${END2END_LEARNING_RATE}"
     --end2end-tv-weight "${END2END_TV_WEIGHT}"
+    --end2end-tv-kind "${END2END_TV_KIND}"
     --end2end-eval-lights "${END2END_EVAL_LIGHTS}"
     --end2end-profiles "${END2END_PROFILES}"
     --end2end-hdri-root "${END2END_HDRI_ROOT}"
