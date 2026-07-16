@@ -408,6 +408,7 @@ def test_end2end_initialization_and_optimizer_exclude_same_heldout_lights(
         material_acquisition="end2end",
         imaginaire_root=tmp_path,
         end2end_steps=1,
+        end2end_tv_kind="frequency-consensus-regularizer",
         end2end_eval_lights=2,
     )
 
@@ -418,6 +419,7 @@ def test_end2end_initialization_and_optimizer_exclude_same_heldout_lights(
     np.testing.assert_array_equal(acquisition["light_ids"], np.arange(6))
     np.testing.assert_array_equal(acquisition["frame_ids"], np.arange(6))
     assert acquisition["eval_lights"] == 2
+    assert acquisition["tv_kind"] == "frequency-consensus-regularizer"
 
 
 def test_end2end_prefers_albedo_photometric_inputs_and_constant_view(
@@ -768,6 +770,7 @@ def _frequency_consensus_inputs(
     albedo=None,
     normal=None,
     strength=1.0,
+    created_after_step=90,
 ):
     model = _toy_disney_scalar_model(torch, values)
     height, width = next(iter(values.values())).shape
@@ -784,7 +787,7 @@ def _frequency_consensus_inputs(
         mask,
         albedo,
         normal,
-        created_after_step=90,
+        created_after_step=created_after_step,
         strength=strength,
     )
     return model, bundle
@@ -1260,6 +1263,156 @@ def test_frequency_consensus_adaptive_settings_record_swept_policy():
     assert adapter["algorithm_version"] == (
         "ictpolarreal-frequency-consensus-adaptive-v1"
     )
+
+
+def test_frequency_consensus_regularizer_settings_stage_and_adapter_are_isolated():
+    settings = end2end_acquisition._regularization_settings(
+        "frequency-consensus-regularizer"
+    )
+    enabled = end2end_acquisition._frequency_consensus_regularizer_stage_plan(
+        33000,
+        enabled=True,
+    )
+    disabled = end2end_acquisition._frequency_consensus_regularizer_stage_plan(
+        33000,
+        enabled=False,
+    )
+    adapter = end2end_acquisition._adapter_provenance(
+        "frequency-consensus-regularizer"
+    )
+
+    assert "frequency-consensus-regularizer" in end2end_acquisition.TV_KINDS
+    assert not end2end_acquisition._is_frequency_consensus_cleanup_kind(
+        "frequency-consensus-regularizer"
+    )
+    assert end2end_acquisition._is_frequency_consensus_regularizer_kind(
+        "frequency-consensus-regularizer"
+    )
+    assert settings["target_policy"] == (
+        "exact_full_strength_frequency_consensus_v1_target"
+    )
+    assert settings["penalty"].startswith("sqrt((value-target)^2")
+    assert settings["epsilon"] == pytest.approx(0.005)
+    assert settings["reduction"] == (
+        "mean_selected_pixels_then_mean_nonempty_parameters"
+    )
+    assert enabled == {
+        "enabled": True,
+        "warmup_fraction": pytest.approx(0.8),
+        "data_warmup_steps": 26400,
+        "target_after_data_step": 26400,
+        "regularized_steps": 6600,
+        "target_strength": pytest.approx(1.0),
+        "post_fit_updates": 0,
+        "cleanup_optimizer_steps": 0,
+        "optimizer_reset": False,
+    }
+    assert disabled["data_warmup_steps"] == 33000
+    assert disabled["target_after_data_step"] is None
+    assert disabled["regularized_steps"] == 0
+    with pytest.raises(ValueError, match="at least two optimizer steps"):
+        end2end_acquisition._frequency_consensus_regularizer_stage_plan(
+            1,
+            enabled=True,
+        )
+    assert adapter["schema"] == "ictpolarreal.profile-acquisition-adapter.v8"
+    assert adapter["algorithm_version"] == (
+        "ictpolarreal-frequency-consensus-regularizer-v1"
+    )
+    assert end2end_acquisition._adapter_provenance("frequency-consensus")[
+        "schema"
+    ] == "ictpolarreal.profile-acquisition-adapter.v7"
+
+
+def _manual_frequency_regularizer_bundle(torch, model, active_differences):
+    maps = {}
+    constrained = model._param_maps()
+    shape = tuple(next(iter(constrained.values())).shape)
+    for name in end2end_acquisition.DISNEY_TV_SCALAR_NAMES:
+        target = constrained[name].detach().clone()
+        mask = torch.zeros(shape, dtype=torch.bool)
+        for row, column, difference in active_differences.get(name, []):
+            mask[row, column] = True
+            target[row, column] -= difference
+        maps[name] = {
+            "target": target,
+            "mask": mask,
+            "updated_count": int(mask.sum().item()),
+        }
+    return {"maps": maps}
+
+
+def test_frequency_consensus_regularizer_loss_normalizes_nonempty_maps_and_gradients():
+    torch = pytest.importorskip("torch")
+    values = {
+        name: torch.full((3, 3), 0.5, dtype=torch.float32)
+        for name in end2end_acquisition.DISNEY_TV_SCALAR_NAMES
+    }
+    model = _toy_disney_scalar_model(torch, values)
+    bundle = _manual_frequency_regularizer_bundle(
+        torch,
+        model,
+        {
+            "metallic": [(1, 1, 0.1)],
+            "roughness": [(0, 0, 0.2), (2, 2, 0.2)],
+        },
+    )
+
+    loss = end2end_acquisition._frequency_consensus_regularizer_loss(
+        torch,
+        model,
+        bundle,
+    )
+    epsilon = end2end_acquisition.FREQUENCY_REGULARIZER_EPSILON
+    expected = 0.5 * sum(
+        (difference * difference + epsilon * epsilon) ** 0.5 - epsilon
+        for difference in (0.1, 0.2)
+    )
+    assert float(loss.detach()) == pytest.approx(expected)
+    assert (
+        end2end_acquisition._frequency_consensus_regularizer_active_map_count(
+            bundle
+        )
+        == 2
+    )
+
+    loss.backward()
+    metallic_gradient = model.metallic_un.grad[0]
+    roughness_gradient = model.roughness_un.grad[0]
+    assert torch.count_nonzero(metallic_gradient) == 1
+    assert metallic_gradient[1, 1] > 0.0
+    assert torch.count_nonzero(roughness_gradient) == 2
+    assert roughness_gradient[0, 0] > 0.0
+    assert roughness_gradient[2, 2] > 0.0
+    for name in set(end2end_acquisition.DISNEY_TV_SCALAR_NAMES) - {
+        "metallic",
+        "roughness",
+    }:
+        gradient = getattr(model, f"{name}_un").grad
+        assert gradient is None or torch.count_nonzero(gradient) == 0
+
+
+def test_frequency_consensus_regularizer_all_empty_maps_return_differentiable_zero():
+    torch = pytest.importorskip("torch")
+    values = {
+        name: torch.full((2, 2), 0.5, dtype=torch.float32)
+        for name in end2end_acquisition.DISNEY_TV_SCALAR_NAMES
+    }
+    model = _toy_disney_scalar_model(torch, values)
+    bundle = _manual_frequency_regularizer_bundle(torch, model, {})
+
+    loss = end2end_acquisition._frequency_consensus_regularizer_loss(
+        torch,
+        model,
+        bundle,
+    )
+    assert loss.requires_grad
+    assert float(loss) == pytest.approx(0.0)
+    loss.backward()
+    for name in end2end_acquisition.DISNEY_TV_SCALAR_NAMES:
+        gradient = getattr(model, f"{name}_un").grad
+        assert gradient is not None
+        assert torch.count_nonzero(gradient) == 0
 
 
 @pytest.mark.parametrize("empty_suite", ["olat", "hdri"])
@@ -1824,6 +1977,135 @@ def test_frequency_consensus_checkpoint_rejects_cross_schema_bundles():
             )
 
 
+def test_frequency_consensus_regularizer_checkpoint_boundary_is_fail_closed():
+    torch = pytest.importorskip("torch")
+    shape = (11, 11)
+    values = {
+        name: torch.full(shape, 0.3, dtype=torch.float32)
+        for name in end2end_acquisition.DISNEY_TV_SCALAR_NAMES
+    }
+    values["metallic"][5, 5] = 0.9
+    values["roughness"][5, 5] = 0.9
+    stage = end2end_acquisition._frequency_consensus_regularizer_stage_plan(
+        100,
+        enabled=True,
+    )
+    model, bundle = _frequency_consensus_inputs(
+        torch,
+        values,
+        created_after_step=stage["target_after_data_step"],
+    )
+    boundary_losses = {"olat": [0.1], "hdri": [0.2]}
+    with torch.no_grad():
+        initial_loss = float(
+            end2end_acquisition._frequency_consensus_regularizer_loss(
+                torch,
+                model,
+                bundle,
+            )
+        )
+    boundary_state = (
+        end2end_acquisition._frequency_consensus_regularizer_checkpoint_record(
+            stage,
+            bundle,
+            boundary_losses,
+            initial_loss,
+            next_step=80,
+        )
+    )
+
+    assert boundary_state["regularized_steps_completed"] == 0
+    restored = (
+        end2end_acquisition._checkpoint_frequency_consensus_regularizer_state(
+            torch,
+            {"frequency_regularizer_state": boundary_state},
+            stage,
+            next_step=80,
+            expected_shape=shape,
+            model=model,
+        )
+    )
+    assert restored[0] is bundle
+    assert restored[1] == boundary_losses
+    assert restored[2] == pytest.approx(initial_loss)
+    with pytest.raises(ValueError, match="before warmup completed"):
+        end2end_acquisition._checkpoint_frequency_consensus_regularizer_state(
+            torch,
+            {"frequency_regularizer_state": boundary_state},
+            stage,
+            next_step=79,
+            expected_shape=shape,
+            model=model,
+        )
+    with pytest.raises(ValueError, match="missing valid"):
+        end2end_acquisition._checkpoint_frequency_consensus_regularizer_state(
+            torch,
+            {"frequency_regularizer_state": None},
+            stage,
+            next_step=80,
+            expected_shape=shape,
+            model=model,
+        )
+
+    continued_state = (
+        end2end_acquisition._frequency_consensus_regularizer_checkpoint_record(
+            stage,
+            bundle,
+            boundary_losses,
+            initial_loss,
+            next_step=81,
+        )
+    )
+    with torch.no_grad():
+        model.metallic_un[0, 5, 5] += 0.01
+    # Once joint optimization has started, divergence from the frozen source is
+    # expected and must not be mistaken for checkpoint corruption.
+    end2end_acquisition._checkpoint_frequency_consensus_regularizer_state(
+        torch,
+        {"frequency_regularizer_state": continued_state},
+        stage,
+        next_step=81,
+        expected_shape=shape,
+        model=model,
+    )
+    with pytest.raises(ValueError, match="boundary source metallic is stale"):
+        end2end_acquisition._checkpoint_frequency_consensus_regularizer_state(
+            torch,
+            {"frequency_regularizer_state": boundary_state},
+            stage,
+            next_step=80,
+            expected_shape=shape,
+            model=model,
+        )
+    stale_completed = {
+        **continued_state,
+        "regularized_steps_completed": 0,
+    }
+    with pytest.raises(ValueError, match="completed-step count is stale"):
+        end2end_acquisition._checkpoint_frequency_consensus_regularizer_state(
+            torch,
+            {"frequency_regularizer_state": stale_completed},
+            stage,
+            next_step=81,
+            expected_shape=shape,
+            model=model,
+        )
+    stale_strength_bundle = {**bundle, "strength": 0.5}
+    stale_strength_state = {
+        **continued_state,
+        "frozen_bundle": stale_strength_bundle,
+    }
+    with pytest.raises(ValueError, match="stale strength"):
+        end2end_acquisition._checkpoint_frequency_consensus_regularizer_state(
+            torch,
+            {"frequency_regularizer_state": stale_strength_state},
+            stage,
+            next_step=81,
+            expected_shape=shape,
+            model=model,
+        )
+
+
 def test_frequency_consensus_artifact_and_resume_fail_closed(tmp_path):
     torch = pytest.importorskip("torch")
     values = {
@@ -2117,6 +2399,112 @@ def test_frequency_consensus_artifact_and_resume_fail_closed(tmp_path):
     )
 
 
+def test_frequency_consensus_regularizer_artifact_completion_is_fail_closed(tmp_path):
+    torch = pytest.importorskip("torch")
+    shape = (11, 11)
+    values = {
+        name: torch.full(shape, 0.3, dtype=torch.float32)
+        for name in end2end_acquisition.DISNEY_TV_SCALAR_NAMES
+    }
+    values["metallic"][5, 5] = 0.9
+    values["roughness"][5, 5] = 0.9
+    stage = end2end_acquisition._frequency_consensus_regularizer_stage_plan(
+        100,
+        enabled=True,
+    )
+    model, bundle = _frequency_consensus_inputs(
+        torch,
+        values,
+        created_after_step=stage["target_after_data_step"],
+    )
+    provenance = end2end_acquisition._finalize_frequency_frozen_artifact(
+        tmp_path,
+        bundle,
+    )
+    provenance["role"] = "train_time_frozen_target"
+    with torch.no_grad():
+        regularization_loss = float(
+            end2end_acquisition._frequency_consensus_regularizer_loss(
+                torch,
+                model,
+                bundle,
+            )
+        )
+    boundary_losses = {"olat": [0.1], "hdri": [0.2]}
+    signature_regularization = {
+        "kind": "frequency-consensus-regularizer",
+        "weight": 0.00125,
+        "parameters": list(end2end_acquisition.DISNEY_TV_SCALAR_NAMES),
+        "settings": end2end_acquisition._regularization_settings(
+            "frequency-consensus-regularizer"
+        ),
+        "stage_plan": stage,
+    }
+    regularization = {
+        **signature_regularization,
+        "frozen_bundle": provenance,
+        "boundary_evaluation_losses": boundary_losses,
+        "initial_regularization_loss": regularization_loss,
+        "final_regularization_loss": regularization_loss,
+        "weighted_final_regularization_loss": 0.00125 * regularization_loss,
+        "active_map_count": sum(
+            int(entry["updated_count"] > 0)
+            for entry in bundle["maps"].values()
+        ),
+        "post_fit_updates": 0,
+        "cleanup_applied": False,
+        "regularized_steps_completed": stage["regularized_steps"],
+        "data_objective_only": False,
+        "weight_semantics": "objective_coefficient",
+    }
+    acquisition = {
+        "schema": "ictpolarreal.end2end-disney.v14",
+        "regularization": regularization,
+        "checkpoint_signature": {
+            "schema": "ictpolarreal.end2end-checkpoint.v14",
+            "regularization": signature_regularization,
+        },
+    }
+
+    assert end2end_acquisition._frequency_frozen_artifact_complete(
+        tmp_path,
+        acquisition,
+    )
+    bad_role = json.loads(json.dumps(acquisition))
+    bad_role["regularization"]["frozen_bundle"]["role"] = "post_fit_cleanup"
+    assert not end2end_acquisition._frequency_frozen_artifact_complete(
+        tmp_path,
+        bad_role,
+    )
+    bad_cleanup = json.loads(json.dumps(acquisition))
+    bad_cleanup["regularization"]["cleanup_applied"] = True
+    assert not end2end_acquisition._frequency_frozen_artifact_complete(
+        tmp_path,
+        bad_cleanup,
+    )
+    bad_completed_steps = json.loads(json.dumps(acquisition))
+    bad_completed_steps["regularization"]["regularized_steps_completed"] -= 1
+    assert not end2end_acquisition._frequency_frozen_artifact_complete(
+        tmp_path,
+        bad_completed_steps,
+    )
+    bad_weighted_loss = json.loads(json.dumps(acquisition))
+    bad_weighted_loss["regularization"][
+        "weighted_final_regularization_loss"
+    ] += 1e-9
+    assert not end2end_acquisition._frequency_frozen_artifact_complete(
+        tmp_path,
+        bad_weighted_loss,
+    )
+    artifact_path = tmp_path / end2end_acquisition.FREQUENCY_FROZEN_ARTIFACT_NAME
+    with artifact_path.open("ab") as stream:
+        stream.write(b"tampered")
+    assert not end2end_acquisition._frequency_frozen_artifact_complete(
+        tmp_path,
+        acquisition,
+    )
+
+
 def test_v13_model_artifact_completion_validates_hash_and_size(tmp_path):
     model_path = tmp_path / "disney_brdf.pt"
     model_path.write_bytes(b"exact-fitted-state")
@@ -2136,13 +2524,21 @@ def test_v13_model_artifact_completion_validates_hash_and_size(tmp_path):
     }
 
     assert end2end_acquisition._model_artifact_complete(tmp_path, acquisition)
+    v14 = {
+        **acquisition,
+        "schema": "ictpolarreal.end2end-disney.v14",
+        "checkpoint_signature": {
+            "schema": "ictpolarreal.end2end-checkpoint.v14"
+        },
+    }
+    assert end2end_acquisition._model_artifact_complete(tmp_path, v14)
     assert not end2end_acquisition._model_artifact_complete(
         tmp_path,
         {key: value for key, value in acquisition.items() if key != "model_artifact"},
     )
     model_path.write_bytes(b"tampered-fitted-state")
     assert not end2end_acquisition._model_artifact_complete(tmp_path, acquisition)
-    # Recorded pre-v13 runs remain reorganizable; only v13 is fail-closed on hashes.
+    # Recorded pre-v13 runs remain reorganizable; v13/v14 are fail-closed on hashes.
     assert end2end_acquisition._model_artifact_complete(
         tmp_path,
         {"schema": "ictpolarreal.end2end-disney.v12"},
@@ -2827,7 +3223,7 @@ def test_imaginaire_disney_import_treats_torchvision_as_debug_only(
                 "--end2end-tv-weight",
                 "0.025",
                 "--end2end-tv-kind",
-                "edge-charbonnier",
+                "frequency-consensus-regularizer",
                 "--end2end-eval-lights",
                 "7",
                 "--end2end-profiles",
@@ -2847,7 +3243,7 @@ def test_imaginaire_disney_import_treats_torchvision_as_debug_only(
             "torch",
             17,
             7,
-            "edge-charbonnier",
+            "frequency-consensus-regularizer",
         ),
     ],
 )
@@ -3071,6 +3467,8 @@ def test_slurm_dry_run_propagates_end2end_selector_and_options(tmp_path):
             "0.002",
             "--end2end-tv-weight",
             "0.025",
+            "--end2end-tv-kind",
+            "frequency-consensus-regularizer",
             "--end2end-eval-lights",
             "7",
             "--end2end-profiles",
@@ -3112,7 +3510,7 @@ def test_slurm_dry_run_propagates_end2end_selector_and_options(tmp_path):
     assert "--end2end-steps 17" in result.stdout
     assert "--end2end-learning-rate 0.002" in result.stdout
     assert "--end2end-tv-weight 0.025" in result.stdout
-    assert "--end2end-tv-kind impulse-median" in result.stdout
+    assert "--end2end-tv-kind frequency-consensus-regularizer" in result.stdout
     assert "--end2end-eval-lights 7" in result.stdout
     command = shlex.split(result.stdout.partition(":")[2])
     assert command[command.index("--end2end-profiles") + 1] == "hdri,mix"

@@ -62,6 +62,7 @@ TV_KINDS = (
     "impulse-median",
     "frequency-consensus",
     "frequency-consensus-adaptive",
+    "frequency-consensus-regularizer",
 )
 EDGE_CHARBONNIER_EPSILON = 0.02
 EDGE_CHARBONNIER_ALBEDO_SIGMA = 0.05
@@ -102,6 +103,12 @@ FREQUENCY_ADAPTIVE_GUIDE_FINE_SIGMA = 0.8
 FREQUENCY_ADAPTIVE_GUIDE_COARSE_SIGMA = 2.4
 FREQUENCY_ADAPTIVE_GUIDE_SCALE_PERCENTILE = 90.0
 FREQUENCY_ADAPTIVE_GUIDE_BAND_THRESHOLD = 0.35
+FREQUENCY_REGULARIZER_WARMUP_FRACTION = 0.80
+FREQUENCY_REGULARIZER_EPSILON = 0.005
+FREQUENCY_REGULARIZER_TARGET_STRENGTH = 1.0
+FREQUENCY_REGULARIZER_STATE_SCHEMA = (
+    "ictpolarreal.frequency-consensus-regularizer-state.v1"
+)
 REPORT_PROFILES = ("olat", "hdri", "mix")
 ERROR_HEATMAP_MAX = 0.25
 
@@ -712,11 +719,16 @@ def _fit_disney_profile(
         enabled=tv_kind == "impulse-median" and tv_weight > 0.0,
         shrink_per_iteration=tv_weight,
     )
-    frequency_kind = _is_frequency_consensus_kind(tv_kind)
+    frequency_kind = _is_frequency_consensus_cleanup_kind(tv_kind)
     frequency_stage = _frequency_consensus_stage_plan(
         steps,
         enabled=frequency_kind and tv_weight > 0.0,
         weight=tv_weight,
+    )
+    frequency_regularizer_kind = _is_frequency_consensus_regularizer_kind(tv_kind)
+    frequency_regularizer_stage = _frequency_consensus_regularizer_stage_plan(
+        steps,
+        enabled=frequency_regularizer_kind and tv_weight > 0.0,
     )
     edge_pair_weights = None
     if tv_kind == "edge-charbonnier":
@@ -736,6 +748,9 @@ def _fit_disney_profile(
     frequency_cleanup_applied = False
     frequency_cleanup_diagnostic = None
     pre_cleanup_evaluation_losses = None
+    frequency_regularizer_bundle = None
+    frequency_regularizer_boundary_evaluation_losses = None
+    frequency_regularizer_initial_loss = None
 
     def render_olat(stack_index: int):
         prediction, _, _ = model(
@@ -798,6 +813,16 @@ def _fit_disney_profile(
         )
 
     def scalar_regularization():
+        if frequency_regularizer_kind:
+            if frequency_regularizer_bundle is None:
+                raise ValueError(
+                    "frequency-consensus regularizer target is not frozen yet"
+                )
+            return _frequency_consensus_regularizer_loss(
+                torch,
+                model,
+                frequency_regularizer_bundle,
+            )
         return _disney_scalar_regularization(
             torch,
             model,
@@ -822,7 +847,11 @@ def _fit_disney_profile(
     checkpoint_path = checkpoint_dir / "latest.pt"
     checkpoint_temp_path = checkpoint_dir / "latest.tmp"
     signature = {
-        "schema": "ictpolarreal.end2end-checkpoint.v13",
+        "schema": (
+            "ictpolarreal.end2end-checkpoint.v14"
+            if frequency_regularizer_kind
+            else "ictpolarreal.end2end-checkpoint.v13"
+        ),
         "profile": profile,
         "model": MODEL_NAME,
         "height": height,
@@ -855,10 +884,18 @@ def _fit_disney_profile(
                     "stage_plan": (
                         impulse_stage
                         if tv_kind == "impulse-median"
-                        else frequency_stage
+                        else (
+                            frequency_regularizer_stage
+                            if frequency_regularizer_kind
+                            else frequency_stage
+                        )
                     )
                 }
-                if tv_kind == "impulse-median" or frequency_kind
+                if (
+                    tv_kind == "impulse-median"
+                    or frequency_kind
+                    or frequency_regularizer_kind
+                )
                 else {}
             ),
         },
@@ -930,6 +967,18 @@ def _fit_disney_profile(
                 expected_kind=tv_kind,
                 model=model,
             )
+            (
+                frequency_regularizer_bundle,
+                frequency_regularizer_boundary_evaluation_losses,
+                frequency_regularizer_initial_loss,
+            ) = _checkpoint_frequency_consensus_regularizer_state(
+                torch,
+                checkpoint,
+                frequency_regularizer_stage,
+                next_step=start_step,
+                expected_shape=(height, width),
+                model=model,
+            )
             if frequency_stage["enabled"] and start_step >= steps:
                 _validate_frequency_evaluation_snapshot(
                     pre_cleanup_evaluation_losses,
@@ -951,6 +1000,15 @@ def _fit_disney_profile(
         initial_evaluation_losses = evaluation_loss_snapshot()
 
     def save_checkpoint(next_step: int) -> None:
+        frequency_regularizer_state = (
+            _frequency_consensus_regularizer_checkpoint_record(
+                frequency_regularizer_stage,
+                frequency_regularizer_bundle,
+                frequency_regularizer_boundary_evaluation_losses,
+                frequency_regularizer_initial_loss,
+                next_step=next_step,
+            )
+        )
         torch.save(
             {
                 "signature": signature,
@@ -965,6 +1023,7 @@ def _fit_disney_profile(
                 "frequency_cleanup_applied": frequency_cleanup_applied,
                 "frequency_cleanup_diagnostic": frequency_cleanup_diagnostic,
                 "pre_cleanup_evaluation_losses": pre_cleanup_evaluation_losses,
+                "frequency_regularizer_state": frequency_regularizer_state,
             },
             checkpoint_temp_path,
         )
@@ -1033,6 +1092,48 @@ def _fit_disney_profile(
             flush=True,
         )
 
+    def freeze_frequency_regularizer_bundle() -> None:
+        nonlocal frequency_regularizer_bundle
+        nonlocal frequency_regularizer_boundary_evaluation_losses
+        nonlocal frequency_regularizer_initial_loss
+        boundary = frequency_regularizer_stage["target_after_data_step"]
+        frequency_regularizer_boundary_evaluation_losses = (
+            evaluation_loss_snapshot()
+        )
+        frequency_regularizer_bundle = _build_frequency_consensus_bundle(
+            torch,
+            model,
+            mask_hwc,
+            torch.as_tensor(base_color, device=device),
+            torch.as_tensor(normal, device=device),
+            created_after_step=boundary,
+            strength=FREQUENCY_REGULARIZER_TARGET_STRENGTH,
+        )
+        with torch.no_grad():
+            frequency_regularizer_initial_loss = float(
+                _frequency_consensus_regularizer_loss(
+                    torch,
+                    model,
+                    frequency_regularizer_bundle,
+                ).cpu()
+            )
+        total_updated = sum(
+            entry["updated_count"]
+            for entry in frequency_regularizer_bundle["maps"].values()
+        )
+        total_consensus = sum(
+            entry["consensus_count"]
+            for entry in frequency_regularizer_bundle["maps"].values()
+        )
+        print(
+            f"[end2end:{profile}] frequency-consensus regularizer target at "
+            f"{boundary}/{steps}: froze {total_updated} updates "
+            f"({total_consensus} cross-map consensus); "
+            f"initial_loss={frequency_regularizer_initial_loss:.7f}; "
+            "continuing joint optimization without an optimizer reset",
+            flush=True,
+        )
+
     def training_condition(step: int) -> tuple[str, int, str]:
         if profile == "olat":
             position = step % len(train_indices)
@@ -1075,6 +1176,15 @@ def _fit_disney_profile(
             f"strength={frequency_stage['strength']:.4f}; no cleanup optimizer steps",
             flush=True,
         )
+    if frequency_regularizer_stage["enabled"]:
+        print(
+            f"[end2end:{profile}] frequency-consensus regularizer plan: "
+            f"{frequency_regularizer_stage['data_warmup_steps']} data-only "
+            f"Adam iterations, freeze one full-strength target, then "
+            f"{frequency_regularizer_stage['regularized_steps']} joint iterations "
+            f"at lambda={tv_weight:.7g}; original optimizer and cosine schedule continue",
+            flush=True,
+        )
     model.train()
     for step in range(start_step, steps):
         progress = step / max(steps - 1, 1)
@@ -1089,10 +1199,15 @@ def _fit_disney_profile(
         else:
             data_loss = hdri_loss(final_index, evaluation=False)
         post_fit_kind = tv_kind == "impulse-median" or frequency_kind
-        stage_label = "data-fit" if post_fit_kind else "joint"
-        regularization_active = (
-            tv_weight > 0.0 and not post_fit_kind
-        )
+        if frequency_regularizer_kind:
+            regularization_active = (
+                frequency_regularizer_stage["enabled"]
+                and step >= frequency_regularizer_stage["data_warmup_steps"]
+            )
+            stage_label = "joint-frozen-target" if regularization_active else "data-warmup"
+        else:
+            regularization_active = tv_weight > 0.0 and not post_fit_kind
+            stage_label = "data-fit" if post_fit_kind else "joint"
         regularization_loss = (
             scalar_regularization()
             if regularization_active
@@ -1113,7 +1228,7 @@ def _fit_disney_profile(
         final_regularization_loss = float(regularization_loss.detach().cpu())
         final_objective = float(objective.detach().cpu())
         if step == 0 or (step + 1) % log_every == 0 or step + 1 == steps:
-            if post_fit_kind:
+            if post_fit_kind or not regularization_active:
                 print(
                     f"[end2end:{profile}] iteration {step + 1}/{steps} "
                     f"stage={stage_label} kind={final_kind} {final_label} "
@@ -1131,11 +1246,19 @@ def _fit_disney_profile(
                     f"lr={optimizer.param_groups[0]['lr']:.3e}",
                     flush=True,
                 )
+        reached_regularizer_boundary = (
+            frequency_regularizer_stage["enabled"]
+            and step + 1
+            == frequency_regularizer_stage["target_after_data_step"]
+        )
         reached_data_fit_boundary = (
             (impulse_stage["enabled"] or frequency_stage["enabled"])
             and step + 1 == steps
         )
-        if reached_data_fit_boundary:
+        if reached_regularizer_boundary:
+            freeze_frequency_regularizer_bundle()
+            save_checkpoint(step + 1)
+        elif reached_data_fit_boundary:
             if impulse_stage["enabled"]:
                 freeze_impulse_median_bundle()
             else:
@@ -1262,10 +1385,17 @@ def _fit_disney_profile(
         material_dir,
         impulse_median_bundle,
     )
+    frequency_artifact_bundle = (
+        frequency_regularizer_bundle
+        if frequency_regularizer_kind
+        else frequency_consensus_bundle
+    )
     frequency_bundle_provenance = _finalize_frequency_frozen_artifact(
         material_dir,
-        frequency_consensus_bundle,
+        frequency_artifact_bundle,
     )
+    if frequency_regularizer_kind and frequency_bundle_provenance is not None:
+        frequency_bundle_provenance["role"] = "train_time_frozen_target"
     frequency_evaluation_guard = None
     if frequency_stage["enabled"]:
         frequency_evaluation_guard = _frequency_evaluation_guard(
@@ -1295,6 +1425,36 @@ def _fit_disney_profile(
             "evaluation_guard": frequency_evaluation_guard,
             "data_objective_only": True,
         }
+    elif frequency_regularizer_kind:
+        active_map_count = (
+            _frequency_consensus_regularizer_active_map_count(
+                frequency_regularizer_bundle
+            )
+            if frequency_regularizer_bundle is not None
+            else 0
+        )
+        regularization_result = {
+            "weight_semantics": "objective_coefficient",
+            "stage_plan": frequency_regularizer_stage,
+            "frozen_bundle": frequency_bundle_provenance,
+            "boundary_evaluation_losses": (
+                frequency_regularizer_boundary_evaluation_losses
+            ),
+            "initial_regularization_loss": frequency_regularizer_initial_loss,
+            "final_regularization_loss": final_regularization_loss,
+            "weighted_final_regularization_loss": float(
+                tv_weight * final_regularization_loss
+            ),
+            "active_map_count": int(active_map_count),
+            "post_fit_updates": 0,
+            "cleanup_applied": False,
+            "regularized_steps_completed": int(
+                frequency_regularizer_stage["regularized_steps"]
+                if frequency_regularizer_stage["enabled"]
+                else 0
+            ),
+            "data_objective_only": not frequency_regularizer_stage["enabled"],
+        }
     else:
         regularization_result = {
             "weight_semantics": "objective_coefficient",
@@ -1304,7 +1464,11 @@ def _fit_disney_profile(
             ),
         }
     metrics = {
-        "schema": "ictpolarreal.end2end-disney.v13",
+        "schema": (
+            "ictpolarreal.end2end-disney.v14"
+            if frequency_regularizer_kind
+            else "ictpolarreal.end2end-disney.v13"
+        ),
         "material_acquisition": "end2end",
         "lighting_profile": profile,
         "model": MODEL_NAME,
@@ -1566,11 +1730,18 @@ def _model_artifact_complete(
 ) -> bool:
     checkpoint_signature = acquisition.get("checkpoint_signature")
     requires_hashed_model = (
-        acquisition.get("schema") == "ictpolarreal.end2end-disney.v13"
+        acquisition.get("schema")
+        in {
+            "ictpolarreal.end2end-disney.v13",
+            "ictpolarreal.end2end-disney.v14",
+        }
         or (
             isinstance(checkpoint_signature, dict)
             and checkpoint_signature.get("schema")
-            == "ictpolarreal.end2end-checkpoint.v13"
+            in {
+                "ictpolarreal.end2end-checkpoint.v13",
+                "ictpolarreal.end2end-checkpoint.v14",
+            }
         )
     )
     if not requires_hashed_model:
@@ -2832,14 +3003,19 @@ def _checkpoint_signatures_match(
 
 
 def _adapter_provenance(tv_kind: str = "frequency-consensus") -> dict[str, Any]:
-    algorithm_version = (
-        "ictpolarreal-frequency-consensus-adaptive-v1"
-        if tv_kind == "frequency-consensus-adaptive"
-        else "ictpolarreal-frequency-consensus-v1"
-    )
+    if _is_frequency_consensus_regularizer_kind(tv_kind):
+        schema = "ictpolarreal.profile-acquisition-adapter.v8"
+        algorithm_version = "ictpolarreal-frequency-consensus-regularizer-v1"
+    else:
+        schema = "ictpolarreal.profile-acquisition-adapter.v7"
+        algorithm_version = (
+            "ictpolarreal-frequency-consensus-adaptive-v1"
+            if tv_kind == "frequency-consensus-adaptive"
+            else "ictpolarreal-frequency-consensus-v1"
+        )
     lighting_path = Path(__file__).resolve().with_name("lighting_profiles.py")
     return {
-        "schema": "ictpolarreal.profile-acquisition-adapter.v7",
+        "schema": schema,
         "algorithm_version": algorithm_version,
         "lighting_profiles_sha256": hashlib.sha256(
             lighting_path.read_bytes()
@@ -3017,8 +3193,17 @@ def _normalize_tv_kind(kind: str) -> str:
     return normalized
 
 
-def _is_frequency_consensus_kind(kind: str) -> bool:
+def _is_frequency_consensus_cleanup_kind(kind: str) -> bool:
     return kind in {"frequency-consensus", "frequency-consensus-adaptive"}
+
+
+def _is_frequency_consensus_kind(kind: str) -> bool:
+    """Backward-compatible name for the two post-fit cleanup policies."""
+    return _is_frequency_consensus_cleanup_kind(kind)
+
+
+def _is_frequency_consensus_regularizer_kind(kind: str) -> bool:
+    return kind == "frequency-consensus-regularizer"
 
 
 def _frequency_consensus_bundle_schema(kind: str) -> str:
@@ -3054,6 +3239,49 @@ def _regularization_settings(kind: str) -> dict[str, Any]:
                 "floor + (1-floor) * exp(-albedo_difference/albedo_sigma "
                 "- normal_difference/normal_sigma)"
             ),
+        }
+    if kind == "frequency-consensus-regularizer":
+        return {
+            "map_domain": "constrained_0_1_full_precision",
+            "stage": "data_warmup_then_frozen_target_joint_optimization",
+            "data_optimizer": "one_uninterrupted_Adam_cosine_schedule",
+            "warmup_fraction": FREQUENCY_REGULARIZER_WARMUP_FRACTION,
+            "target_boundary": "after_warmup_data_optimizer_step",
+            "target_policy": "exact_full_strength_frequency_consensus_v1_target",
+            "target_strength": FREQUENCY_REGULARIZER_TARGET_STRENGTH,
+            "target_refreshes": 0,
+            "post_fit_updates": 0,
+            "guide": "full_precision_normalized_albedo_and_normal",
+            "foreground": "exact_fit_foreground",
+            "weighted_median_windows": [3, 7],
+            "weighted_median_formula": (
+                "fit_mask*exp(-distance_squared/(2*spatial_sigma_squared)"
+                "-mean_abs_albedo_difference/albedo_sigma"
+                "-(1-normal_cosine)/normal_sigma)"
+            ),
+            "spatial_sigma3": FREQUENCY_CONSENSUS_SPATIAL_SIGMA3,
+            "spatial_sigma7": FREQUENCY_CONSENSUS_SPATIAL_SIGMA7,
+            "albedo_sigma": FREQUENCY_CONSENSUS_ALBEDO_SIGMA,
+            "normal_sigma": FREQUENCY_CONSENSUS_NORMAL_SIGMA,
+            "edge_percentile": FREQUENCY_CONSENSUS_EDGE_PERCENTILE,
+            "base_target": (
+                f"value+{FREQUENCY_CONSENSUS_BASE_BLEND:g}*(median3-value)"
+            ),
+            "cross_map_evidence": (
+                f"count(abs(value-median7)>"
+                f"{FREQUENCY_CONSENSUS_EVIDENCE_THRESHOLD:g})"
+            ),
+            "minimum_evidence_maps": FREQUENCY_CONSENSUS_MIN_EVIDENCE_MAPS,
+            "own_deviation_threshold": FREQUENCY_CONSENSUS_OWN_DEVIATION,
+            "consensus_target": (
+                f"{FREQUENCY_CONSENSUS_MEDIAN3_TARGET_WEIGHT:g}*median3+"
+                f"{FREQUENCY_CONSENSUS_MEDIAN7_TARGET_WEIGHT:g}*median7"
+            ),
+            "penalty": "sqrt((value-target)^2+epsilon^2)-epsilon",
+            "epsilon": FREQUENCY_REGULARIZER_EPSILON,
+            "reduction": "mean_selected_pixels_then_mean_nonempty_parameters",
+            "weight_semantics": "objective_coefficient_only",
+            "outside_update_mask": "no_regularizer_gradient",
         }
     if kind == "frequency-consensus-adaptive":
         return {
@@ -3273,6 +3501,50 @@ def _frequency_consensus_stage_plan(
     }
 
 
+def _frequency_consensus_regularizer_stage_plan(
+    steps: int,
+    *,
+    enabled: bool,
+) -> dict[str, Any]:
+    """Plan one frozen target boundary inside the original optimizer schedule."""
+    if steps <= 0:
+        raise ValueError("end2end steps must be a positive integer")
+    if enabled and steps < 2:
+        raise ValueError(
+            "frequency-consensus regularizer needs at least two optimizer steps"
+        )
+    if not enabled:
+        return {
+            "enabled": False,
+            "warmup_fraction": FREQUENCY_REGULARIZER_WARMUP_FRACTION,
+            "data_warmup_steps": int(steps),
+            "target_after_data_step": None,
+            "regularized_steps": 0,
+            "target_strength": 0.0,
+            "post_fit_updates": 0,
+            "cleanup_optimizer_steps": 0,
+            "optimizer_reset": False,
+        }
+    warmup_steps = max(
+        1,
+        min(
+            steps - 1,
+            int(round(steps * FREQUENCY_REGULARIZER_WARMUP_FRACTION)),
+        ),
+    )
+    return {
+        "enabled": True,
+        "warmup_fraction": FREQUENCY_REGULARIZER_WARMUP_FRACTION,
+        "data_warmup_steps": int(warmup_steps),
+        "target_after_data_step": int(warmup_steps),
+        "regularized_steps": int(steps - warmup_steps),
+        "target_strength": FREQUENCY_REGULARIZER_TARGET_STRENGTH,
+        "post_fit_updates": 0,
+        "cleanup_optimizer_steps": 0,
+        "optimizer_reset": False,
+    }
+
+
 def _final_regularization_value(scalar_regularization, *, weight: float) -> float:
     """Evaluate a fitted regularizer only when it contributes to the objective."""
     if weight == 0.0:
@@ -3466,6 +3738,131 @@ def _checkpoint_frequency_consensus_state(
     return bundle, cleanup_applied, cleanup_diagnostic
 
 
+def _frequency_consensus_regularizer_checkpoint_record(
+    stage_plan: dict[str, Any],
+    bundle,
+    boundary_evaluation_losses,
+    initial_regularization_loss,
+    *,
+    next_step: int,
+):
+    if bundle is None:
+        if boundary_evaluation_losses is not None or initial_regularization_loss is not None:
+            raise ValueError(
+                "frequency-consensus regularizer has partial frozen checkpoint state"
+            )
+        return None
+    boundary = stage_plan.get("target_after_data_step")
+    if not isinstance(boundary, int) or next_step < boundary:
+        raise ValueError(
+            "frequency-consensus regularizer target exists before its boundary"
+        )
+    _validate_frequency_evaluation_snapshot(
+        boundary_evaluation_losses,
+        label="regularizer-boundary checkpoint",
+    )
+    if (
+        not isinstance(initial_regularization_loss, float)
+        or not math.isfinite(initial_regularization_loss)
+        or initial_regularization_loss < 0.0
+    ):
+        raise ValueError(
+            "frequency-consensus regularizer initial loss is invalid"
+        )
+    return {
+        "schema": FREQUENCY_REGULARIZER_STATE_SCHEMA,
+        "frozen_bundle": bundle,
+        "boundary_evaluation_losses": boundary_evaluation_losses,
+        "initial_regularization_loss": initial_regularization_loss,
+        "regularized_steps_completed": int(next_step - boundary),
+    }
+
+
+def _checkpoint_frequency_consensus_regularizer_state(
+    torch,
+    checkpoint: dict[str, Any],
+    stage_plan: dict[str, Any],
+    *,
+    next_step: int,
+    expected_shape: tuple[int, int],
+    model=None,
+):
+    state = checkpoint.get("frequency_regularizer_state")
+    if not stage_plan["enabled"]:
+        if state is not None:
+            raise ValueError(
+                "checkpoint contains frequency-consensus regularizer state for a disabled stage"
+            )
+        return None, None, None
+    boundary = int(stage_plan["target_after_data_step"])
+    if next_step < boundary:
+        if state is not None:
+            raise ValueError(
+                "checkpoint contains frequency-consensus regularizer state before warmup completed"
+            )
+        return None, None, None
+    expected_keys = {
+        "schema",
+        "frozen_bundle",
+        "boundary_evaluation_losses",
+        "initial_regularization_loss",
+        "regularized_steps_completed",
+    }
+    if (
+        not isinstance(state, dict)
+        or set(state) != expected_keys
+        or state.get("schema") != FREQUENCY_REGULARIZER_STATE_SCHEMA
+    ):
+        raise ValueError(
+            "checkpoint is missing valid frequency-consensus regularizer state"
+        )
+    completed = state.get("regularized_steps_completed")
+    if (
+        not isinstance(completed, int)
+        or isinstance(completed, bool)
+        or completed != next_step - boundary
+    ):
+        raise ValueError(
+            "checkpoint frequency-consensus regularizer completed-step count is stale"
+        )
+    bundle = state.get("frozen_bundle")
+    if (
+        not isinstance(bundle, dict)
+        or bundle.get("schema") != "ictpolarreal.frequency-consensus-bundle.v1"
+    ):
+        raise ValueError(
+            "checkpoint frequency-consensus regularizer has invalid fixed target schema"
+        )
+    _validate_frequency_consensus_bundle(
+        torch,
+        bundle,
+        expected_shape=expected_shape,
+        expected_created_after_step=boundary,
+        expected_strength=FREQUENCY_REGULARIZER_TARGET_STRENGTH,
+    )
+    boundary_evaluation_losses = state.get("boundary_evaluation_losses")
+    _validate_frequency_evaluation_snapshot(
+        boundary_evaluation_losses,
+        label="regularizer-boundary checkpoint",
+    )
+    initial_regularization_loss = state.get("initial_regularization_loss")
+    if (
+        not isinstance(initial_regularization_loss, float)
+        or not math.isfinite(initial_regularization_loss)
+        or initial_regularization_loss < 0.0
+    ):
+        raise ValueError(
+            "checkpoint frequency-consensus regularizer initial loss is invalid"
+        )
+    if next_step == boundary:
+        if model is None:
+            raise ValueError(
+                "frequency-consensus regularizer boundary checkpoint requires model validation"
+            )
+        _validate_frequency_source_model(torch, model, bundle)
+    return bundle, boundary_evaluation_losses, initial_regularization_loss
+
+
 def _validate_frequency_cleanup_diagnostic(diagnostic, bundle) -> None:
     if not isinstance(diagnostic, dict) or diagnostic.get("schema") != (
         "ictpolarreal.frequency-consensus-diagnostic.v1"
@@ -3544,6 +3941,22 @@ def _validate_frequency_applied_model(torch, model, bundle) -> None:
         ):
             raise ValueError(
                 f"applied frequency-consensus model does not match target {name}"
+            )
+
+
+def _validate_frequency_source_model(torch, model, bundle) -> None:
+    constrained = model._param_maps()
+    for name in DISNEY_TV_SCALAR_NAMES:
+        scalar = constrained[name]
+        if scalar.ndim == 3 and scalar.shape[-1] == 1:
+            scalar = scalar[..., 0]
+        source = bundle["maps"][name]["source"].to(
+            device=scalar.device,
+            dtype=scalar.dtype,
+        )
+        if not torch.equal(scalar, source):
+            raise ValueError(
+                f"frequency-consensus regularizer boundary source {name} is stale"
             )
 
 
@@ -5162,6 +5575,82 @@ def _frequency_completion_records_valid(
     return _frequency_evaluation_guard_regressed_suites(guard) == []
 
 
+def _frequency_regularizer_completion_records_valid(
+    regularization,
+    frozen_bundle,
+) -> bool:
+    stage_plan = regularization.get("stage_plan")
+    if (
+        not isinstance(stage_plan, dict)
+        or stage_plan.get("enabled") is not True
+        or stage_plan.get("post_fit_updates") != 0
+        or stage_plan.get("cleanup_optimizer_steps") != 0
+        or stage_plan.get("optimizer_reset") is not False
+        or stage_plan.get("target_strength")
+        != FREQUENCY_REGULARIZER_TARGET_STRENGTH
+        or frozen_bundle.get("role") != "train_time_frozen_target"
+        or frozen_bundle.get("created_after_step")
+        != stage_plan.get("target_after_data_step")
+        or frozen_bundle.get("strength")
+        != FREQUENCY_REGULARIZER_TARGET_STRENGTH
+        or regularization.get("post_fit_updates") != 0
+        or regularization.get("cleanup_applied") is not False
+        or regularization.get("regularized_steps_completed")
+        != stage_plan.get("regularized_steps")
+        or regularization.get("data_objective_only") is not False
+        or regularization.get("weight_semantics") != "objective_coefficient"
+    ):
+        return False
+    weight = regularization.get("weight")
+    initial_loss = regularization.get("initial_regularization_loss")
+    final_loss = regularization.get("final_regularization_loss")
+    weighted_final = regularization.get("weighted_final_regularization_loss")
+    if (
+        not isinstance(weight, float)
+        or not math.isfinite(weight)
+        or weight <= 0.0
+        or not isinstance(initial_loss, float)
+        or not math.isfinite(initial_loss)
+        or initial_loss < 0.0
+        or not isinstance(final_loss, float)
+        or not math.isfinite(final_loss)
+        or final_loss < 0.0
+        or not isinstance(weighted_final, float)
+        or not math.isfinite(weighted_final)
+        or weighted_final != weight * final_loss
+    ):
+        return False
+    boundary_evaluation_losses = regularization.get(
+        "boundary_evaluation_losses"
+    )
+    try:
+        _validate_frequency_evaluation_snapshot(
+            boundary_evaluation_losses,
+            label="regularizer-boundary artifact",
+        )
+    except ValueError:
+        return False
+    maps = frozen_bundle.get("maps")
+    active_map_count = regularization.get("active_map_count")
+    if (
+        not isinstance(maps, dict)
+        or set(maps) != set(DISNEY_TV_SCALAR_NAMES)
+        or not isinstance(active_map_count, int)
+        or isinstance(active_map_count, bool)
+        or active_map_count
+        != sum(
+            int(
+                isinstance(maps.get(name), dict)
+                and isinstance(maps[name].get("updated_entries"), int)
+                and maps[name]["updated_entries"] > 0
+            )
+            for name in DISNEY_TV_SCALAR_NAMES
+        )
+    ):
+        return False
+    return True
+
+
 def _frequency_frozen_artifact_complete(
     material_dir: Path,
     acquisition: dict[str, Any],
@@ -5173,8 +5662,9 @@ def _frequency_frozen_artifact_complete(
     )
 
     def enabled_frequency(value) -> bool:
-        if not isinstance(value, dict) or not _is_frequency_consensus_kind(
-            value.get("kind")
+        if not isinstance(value, dict) or not (
+            _is_frequency_consensus_cleanup_kind(value.get("kind"))
+            or _is_frequency_consensus_regularizer_kind(value.get("kind"))
         ):
             return False
         stage_plan = value.get("stage_plan")
@@ -5199,13 +5689,22 @@ def _frequency_frozen_artifact_complete(
     evaluations = (
         evaluation.get("evaluations") if isinstance(evaluation, dict) else None
     )
-    if (
-        not isinstance(frozen_bundle, dict)
-        or frozen_bundle.get("schema") != expected_bundle_schema
-        or not _frequency_completion_records_valid(
-            regularization, frozen_bundle, evaluations
-        )
+    if not isinstance(frozen_bundle, dict) or (
+        frozen_bundle.get("schema") != expected_bundle_schema
     ):
+        return False
+    if _is_frequency_consensus_regularizer_kind(regularization.get("kind")):
+        records_valid = _frequency_regularizer_completion_records_valid(
+            regularization,
+            frozen_bundle,
+        )
+    else:
+        records_valid = _frequency_completion_records_valid(
+            regularization,
+            frozen_bundle,
+            evaluations,
+        )
+    if not records_valid:
         return False
     artifact = frozen_bundle.get("artifact") if isinstance(frozen_bundle, dict) else None
     if not isinstance(artifact, dict):
@@ -5745,6 +6244,95 @@ def _disney_scalar_regularization(
     raise ValueError(
         f"{kind} is a post-fit update, not a differentiable loss"
     )
+
+
+def _frequency_consensus_regularizer_active_map_count(bundle) -> int:
+    if not isinstance(bundle, dict) or not isinstance(bundle.get("maps"), dict):
+        raise ValueError("frequency-consensus regularizer is missing its frozen target")
+    count = 0
+    for name in DISNEY_TV_SCALAR_NAMES:
+        entry = bundle["maps"].get(name)
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"frequency-consensus regularizer target {name} is invalid"
+            )
+        updated = entry.get("updated_count")
+        if not isinstance(updated, int) or updated < 0:
+            raise ValueError(
+                f"frequency-consensus regularizer update count {name} is invalid"
+            )
+        count += int(updated > 0)
+    return count
+
+
+def _frequency_consensus_regularizer_loss(
+    torch,
+    model,
+    bundle,
+    *,
+    epsilon: float = FREQUENCY_REGULARIZER_EPSILON,
+):
+    """Charbonnier distance to one detached, full-strength consensus target.
+
+    Each non-empty Disney map receives equal weight regardless of image size or
+    the number of selected pixels. Empty maps are omitted instead of diluting
+    the configured objective coefficient.
+    """
+    if not math.isfinite(epsilon) or epsilon <= 0.0:
+        raise ValueError("frequency-consensus regularizer epsilon must be positive")
+    active_map_count = _frequency_consensus_regularizer_active_map_count(bundle)
+    constrained = model._param_maps()
+    terms = []
+    differentiable_zero = None
+    for name in DISNEY_TV_SCALAR_NAMES:
+        scalar = constrained[name]
+        if scalar.ndim == 3 and scalar.shape[-1] == 1:
+            scalar = scalar[..., 0]
+        if scalar.ndim != 2:
+            raise ValueError(
+                f"Disney scalar {name} must be two-dimensional, got {tuple(scalar.shape)}"
+            )
+        scalar_zero = scalar.sum() * 0.0
+        differentiable_zero = (
+            scalar_zero
+            if differentiable_zero is None
+            else differentiable_zero + scalar_zero
+        )
+        entry = bundle["maps"][name]
+        if entry["updated_count"] == 0:
+            continue
+        target = entry.get("target")
+        update_mask = entry.get("mask")
+        if (
+            not isinstance(target, torch.Tensor)
+            or tuple(target.shape) != tuple(scalar.shape)
+            or target.requires_grad
+        ):
+            raise ValueError(
+                f"frequency-consensus regularizer target {name} is invalid"
+            )
+        if (
+            not isinstance(update_mask, torch.Tensor)
+            or tuple(update_mask.shape) != tuple(scalar.shape)
+            or update_mask.dtype != torch.bool
+            or update_mask.requires_grad
+        ):
+            raise ValueError(
+                f"frequency-consensus regularizer mask {name} is invalid"
+            )
+        target = target.to(device=scalar.device, dtype=scalar.dtype)
+        update_mask = update_mask.to(device=scalar.device)
+        difference = scalar[update_mask] - target[update_mask]
+        terms.append(
+            (difference.square() + epsilon * epsilon).sqrt().mean() - epsilon
+        )
+    if len(terms) != active_map_count:
+        raise ValueError("frequency-consensus regularizer active map count is stale")
+    if not terms:
+        if differentiable_zero is None:
+            raise ValueError("frequency-consensus regularizer has no Disney maps")
+        return differentiable_zero
+    return torch.stack(terms).mean()
 
 
 def _masked_disney_scalar_total_variation(torch, model, mask_hwc):
