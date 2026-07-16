@@ -1732,8 +1732,8 @@ def _write_overview(
     draw = ImageDraw.Draw(canvas)
     draw.text((38, 24), summary["title"], font=pair._font(58, bold=True), fill="white")
     flow = (
-        "Same data, initialization, schedule, and held-out cases · post-fit branches "
-        "after the data fit · train-time regularization changes the optimization trajectory"
+        "Controlled inputs and held-out cases · post-fit cleanup changes maps · "
+        "train-time regularization changes optimization"
     )
     draw.text(
         (42, 96),
