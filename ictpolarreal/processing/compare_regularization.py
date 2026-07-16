@@ -2392,8 +2392,13 @@ def _load_frequency_adaptive_frozen_artifact(
             fixed_consensus_target,
             fixed_base,
         )
+        # Replay the v1 producer literally.  Even at strength 1.0, the
+        # float32 subtract/multiply/add sequence is not bit-identical to the
+        # algebraically simplified ``fixed_desired`` value.
         expected_fixed = np.where(
-            roots["update_safe"], fixed_desired, source
+            roots["update_safe"],
+            source + 1.0 * (fixed_desired - source),
+            source,
         )
         if not np.array_equal(arrays["fixed_target"], expected_fixed):
             raise ValueError(f"adaptive frequency fixed v1 target is stale: {map_name}")

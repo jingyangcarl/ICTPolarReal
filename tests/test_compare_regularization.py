@@ -2518,6 +2518,15 @@ def test_compose_active_frequency_to_adaptive_report_validates_schema_and_keeps_
             noisy=False,
             shape=shape,
         )
+    # Force a high-dynamic-range v1 update where float32
+    # source + 1.0 * (desired - source) is not bit-equal to desired.
+    for map_name in compare_regularization.SCALAR_MAPS:
+        map_path = baseline / "material" / "olat" / "maps" / f"{map_name}.png"
+        with Image.open(map_path) as image:
+            values = np.asarray(image.convert("L"), dtype=np.uint8).copy()
+        values[116:125, 36:45] = 0
+        values[120, 40] = 255
+        _write_png(map_path, values)
     fit_mask = np.ones(shape, dtype=bool)
     fit_mask[0, 0] = False
     fit_mask[160, 96] = False
@@ -2529,13 +2538,67 @@ def test_compose_active_frequency_to_adaptive_report_validates_schema_and_keeps_
     update_safe = adaptive_bundle["update_safe"].detach().cpu().numpy()
     guide_core = adaptive_bundle["guide_texture_core"].detach().cpu().numpy()
     guide_halo = adaptive_bundle["guide_texture_halo"].detach().cpu().numpy()
+    adaptive_arrays = {
+        map_name: {
+            name: values.detach().cpu().numpy()
+            for name, values in entry.items()
+            if hasattr(values, "detach")
+        }
+        for map_name, entry in adaptive_bundle["maps"].items()
+    }
+    v1_evidence = np.sum(
+        np.stack(
+            [
+                np.abs(arrays["source"] - arrays["median7"])
+                > compare_regularization.FREQUENCY_EVIDENCE_THRESHOLD
+                for arrays in adaptive_arrays.values()
+            ],
+            axis=0,
+        ),
+        axis=0,
+        dtype=np.int64,
+    )
     unchanged_strong_eligible = 0
     expected_incremental_strong_changed = 0
-    for map_name, entry in adaptive_bundle["maps"].items():
-        source = entry["source"].detach().cpu().numpy()
-        fixed_target = entry["fixed_target"].detach().cpu().numpy()
-        target = entry["target"].detach().cpu().numpy()
-        consensus_mask = entry["consensus_mask"].detach().cpu().numpy()
+    simplified_fixed_targets = {}
+    rounding_sensitive_maps = []
+    for map_name, arrays in adaptive_arrays.items():
+        source = arrays["source"]
+        median3 = arrays["median3"]
+        median7 = arrays["median7"]
+        fixed_target = arrays["fixed_target"]
+        target = arrays["target"]
+        consensus_mask = arrays["consensus_mask"]
+        fixed_consensus = (
+            (v1_evidence >= compare_regularization.FREQUENCY_MIN_EVIDENCE_MAPS)
+            & (
+                np.abs(source - median7)
+                > compare_regularization.FREQUENCY_OWN_DEVIATION
+            )
+            & update_safe
+        )
+        fixed_base = source + compare_regularization.FREQUENCY_BASE_BLEND * (
+            median3 - source
+        )
+        fixed_consensus_target = (
+            compare_regularization.FREQUENCY_MEDIAN3_TARGET_WEIGHT * median3
+            + compare_regularization.FREQUENCY_MEDIAN7_TARGET_WEIGHT * median7
+        )
+        fixed_desired = np.where(
+            fixed_consensus,
+            fixed_consensus_target,
+            fixed_base,
+        )
+        exact_fixed = np.where(
+            update_safe,
+            source + 1.0 * (fixed_desired - source),
+            source,
+        )
+        simplified_fixed = np.where(update_safe, fixed_desired, source)
+        assert np.array_equal(fixed_target, exact_fixed)
+        simplified_fixed_targets[map_name] = simplified_fixed
+        if not np.array_equal(exact_fixed, simplified_fixed):
+            rounding_sensitive_maps.append(map_name)
         protected = (
             guide_core
             if map_name in compare_regularization.FREQUENCY_ADAPTIVE_FOCUSED_MAPS
@@ -2551,6 +2614,8 @@ def test_compose_active_frequency_to_adaptive_report_validates_schema_and_keeps_
             np.count_nonzero(consensus_mask & (target != fixed_target))
         )
     assert unchanged_strong_eligible > 0
+    assert rounding_sensitive_maps
+    rounding_tamper_map = rounding_sensitive_maps[0]
     mask_path = tmp_path / "mask.png"
     _write_png(mask_path, fit_mask.astype(np.uint8) * 255)
 
@@ -2684,6 +2749,52 @@ def test_compose_active_frequency_to_adaptive_report_validates_schema_and_keeps_
             baseline,
             candidate,
             tmp_path / "bad-metadata-semantics-comparison",
+            mask_path=mask_path,
+        )
+    artifact_path.write_bytes(original_artifact)
+    acquisition_path.write_text(json.dumps(acquisition), encoding="utf-8")
+
+    with np.load(artifact_path, allow_pickle=False) as payload:
+        simplified_payload = {
+            name: np.array(payload[name], copy=True) for name in payload.files
+        }
+    fixed_target_key = f"{rounding_tamper_map}__fixed_target"
+    exact_fixed_target = simplified_payload[fixed_target_key]
+    simplified_fixed_target = simplified_fixed_targets[rounding_tamper_map]
+    assert not np.array_equal(exact_fixed_target, simplified_fixed_target)
+    simplified_payload[fixed_target_key] = simplified_fixed_target
+    simplified_hash = _array_sha256(simplified_fixed_target)
+    simplified_metadata = json.loads(
+        str(simplified_payload["metadata"].item())
+    )
+    simplified_metadata["tensor_hashes"]["maps"][rounding_tamper_map][
+        "fixed_target"
+    ] = simplified_hash
+    simplified_payload["metadata"] = np.asarray(
+        json.dumps(simplified_metadata, sort_keys=True)
+    )
+    with artifact_path.open("wb") as stream:
+        np.savez_compressed(stream, **simplified_payload)
+    simplified_acquisition = copy.deepcopy(acquisition)
+    simplified_bundle = simplified_acquisition["regularization"][
+        "frozen_bundle"
+    ]
+    simplified_bundle["tensor_hashes"]["maps"][rounding_tamper_map][
+        "fixed_target"
+    ] = simplified_hash
+    simplified_bundle["maps"][rounding_tamper_map][
+        "fixed_target_sha256"
+    ] = simplified_hash
+    simplified_bundle["artifact"]["sha256"] = _file_sha256(artifact_path)
+    simplified_bundle["artifact"]["bytes"] = artifact_path.stat().st_size
+    acquisition_path.write_text(
+        json.dumps(simplified_acquisition), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="fixed v1 target is stale"):
+        compare_regularization.compose_regularization_comparison(
+            baseline,
+            candidate,
+            tmp_path / "simplified-fixed-target-comparison",
             mask_path=mask_path,
         )
     artifact_path.write_bytes(original_artifact)

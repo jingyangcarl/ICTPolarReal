@@ -1456,6 +1456,82 @@ def test_frequency_consensus_adaptive_refines_v1_only_outside_texture_halo():
         )
 
 
+def test_frequency_consensus_adaptive_replays_fixed_v1_float32_order():
+    torch = pytest.importorskip("torch")
+    shape = (11, 11)
+    center = (5, 5)
+    source_value = 0.16056667268276215
+    neighborhood_value = 0.4884500503540039
+    values = {
+        name: torch.full(shape, neighborhood_value, dtype=torch.float32)
+        for name in end2end_acquisition.DISNEY_TV_SCALAR_NAMES
+    }
+    for value in values.values():
+        value[center] = source_value
+
+    _fixed_model, fixed = _frequency_consensus_inputs(torch, values)
+    fixed_entry = fixed["maps"]["subsurface"]
+    source = fixed_entry["source"]
+    median3 = fixed_entry["median3"]
+    median7 = fixed_entry["median7"]
+    base_target = source + end2end_acquisition.FREQUENCY_CONSENSUS_BASE_BLEND * (
+        median3 - source
+    )
+    consensus_target = (
+        end2end_acquisition.FREQUENCY_CONSENSUS_MEDIAN3_TARGET_WEIGHT * median3
+        + end2end_acquisition.FREQUENCY_CONSENSUS_MEDIAN7_TARGET_WEIGHT * median7
+    )
+    fixed_desired = torch.where(
+        fixed_entry["consensus_mask"],
+        consensus_target,
+        base_target,
+    )
+    simplified = torch.where(fixed["update_safe"], fixed_desired, source)
+    producer_order = torch.where(
+        fixed["update_safe"],
+        source + 1.0 * (fixed_desired - source),
+        source,
+    )
+
+    assert fixed_entry["consensus_mask"][center]
+    assert simplified[center].view(torch.int32).item() + 1 == (
+        producer_order[center].view(torch.int32).item()
+    )
+    assert torch.equal(fixed_entry["target"], producer_order)
+
+    _adaptive_model, adaptive = _frequency_consensus_adaptive_inputs(
+        torch, values
+    )
+    assert torch.equal(
+        adaptive["maps"]["subsurface"]["fixed_target"],
+        producer_order,
+    )
+    end2end_acquisition._validate_frequency_consensus_bundle(
+        torch, adaptive, expected_shape=shape
+    )
+
+    bad_fixed = {
+        **adaptive,
+        "maps": {
+            **adaptive["maps"],
+            "subsurface": {
+                **adaptive["maps"]["subsurface"],
+                "fixed_target": adaptive["maps"]["subsurface"][
+                    "fixed_target"
+                ].clone(),
+            },
+        },
+    }
+    bad_fixed["maps"]["subsurface"]["fixed_target"][center] = simplified[center]
+    bad_fixed["tensor_hashes"] = (
+        end2end_acquisition._frequency_consensus_tensor_hashes(bad_fixed)
+    )
+    with pytest.raises(ValueError, match="fixed v1 target subsurface is stale"):
+        end2end_acquisition._validate_frequency_consensus_bundle(
+            torch, bad_fixed, expected_shape=shape
+        )
+
+
 def test_frequency_consensus_adaptive_artifact_and_semantics_fail_closed(tmp_path):
     torch = pytest.importorskip("torch")
     shape = (21, 21)

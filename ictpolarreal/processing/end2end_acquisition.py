@@ -4724,9 +4724,12 @@ def _validate_frequency_consensus_adaptive_bundle(
             fixed_consensus_target,
             fixed_base_target,
         )
+        # Replay the fixed-v1 producer literally.  The float32
+        # subtract/multiply/add sequence can differ by one bit from the
+        # algebraically simplified fixed_desired value even at strength 1.0.
         expected_fixed_target = torch.where(
             expected_update_safe,
-            fixed_desired,
+            source + 1.0 * (fixed_desired - source),
             source,
         )
         if not torch.equal(entry["fixed_target"], expected_fixed_target):
