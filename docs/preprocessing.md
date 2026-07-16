@@ -107,6 +107,82 @@ brings selected peaks to the `0.005` dead zone, while smaller weights allow a
 partial correction. For the TV modes the weight remains an objective
 coefficient.
 
+`frequency-consensus` is an optional post-fit alternative; it is not the
+default. Select it explicitly with `--end2end-tv-kind frequency-consensus`.
+The optimizer first completes the same 33,000-step data-only fit. After the
+last data step, the cleanup computes deterministic guide-weighted 3x3 and 7x7
+local medians for the scalar maps, protects foreground boundaries and edges
+identified from the fixed albedo and normal guides, freezes its sources,
+targets, and update masks, and applies one exact update without additional
+optimizer steps. The effective strength is
+`min(--end2end-tv-weight / 0.00125, 1)`, so `0.00125` is the full reference
+strength and `0` leaves the data-only result unchanged. The frozen tensors,
+guide state, and hashes are retained in
+`frequency_consensus_frozen.npz` beside `acquisition.json`.
+
+Before a frequency-consensus result can complete, the pipeline evaluates the
+same checkpoint immediately before and after the frozen update. It rejects a
+cleanup whose mean MSE regresses by more than the `1e-8` numerical tolerance on
+either the OLAT or HDRI suite. Completion also verifies that each post-cleanup
+case count and mean MSE match the corresponding final evaluation record (within
+`1e-12` absolute MSE tolerance), so a stale or unrelated evaluation cannot be
+reused. Passing that guard only establishes no regression for those two
+same-checkpoint measurements. Texture retention and material improvement must
+still be judged from the controlled material and relighting report.
+
+For a Cam07-only dataset arranged as `data/cam07_only/<object>/cam07`, run a
+zero-weight baseline and a reference-strength candidate into different roots.
+Both are full-profile GPU jobs and must go through Slurm:
+
+```bash
+# Controlled data-only baseline.
+bash run.sh process \
+  --data-root data/cam07_only \
+  --material-root outputs/material_regularizer_cam07/baseline \
+  --material-acquisition end2end \
+  --end2end-tv-kind frequency-consensus \
+  --end2end-tv-weight 0 \
+  --end2end-steps 33000 \
+  --end2end-learning-rate 0.001 \
+  --end2end-profiles all \
+  --end2end-primary-profile olat \
+  --end2end-eval-lights 16 \
+  --end2end-hdri-root /shared/path/to/hdr_maps_1k \
+  --end2end-hdri-count 100 \
+  --end2end-eval-hdris 4 \
+  --end2end-hdri-rotations 4 \
+  --min-lights 346 --max-lights 346 \
+  --slurm --backend torch --device cuda \
+  --slurm-account ACCOUNT --slurm-partition PARTITION \
+  --slurm-cpus 16 --slurm-mem 128G --slurm-gpus 1
+
+# One-update frequency-consensus candidate.
+bash run.sh process \
+  --data-root data/cam07_only \
+  --material-root outputs/material_regularizer_cam07/regularized \
+  --material-acquisition end2end \
+  --end2end-tv-kind frequency-consensus \
+  --end2end-tv-weight 0.00125 \
+  --end2end-steps 33000 \
+  --end2end-learning-rate 0.001 \
+  --end2end-profiles all \
+  --end2end-primary-profile olat \
+  --end2end-eval-lights 16 \
+  --end2end-hdri-root /shared/path/to/hdr_maps_1k \
+  --end2end-hdri-count 100 \
+  --end2end-eval-hdris 4 \
+  --end2end-hdri-rotations 4 \
+  --min-lights 346 --max-lights 346 \
+  --slurm --backend torch --device cuda \
+  --slurm-account ACCOUNT --slurm-partition PARTITION \
+  --slurm-cpus 16 --slurm-mem 128G --slurm-gpus 1
+```
+
+Use the same data, profile, optimization, lighting, and evaluation settings for
+both roots. Re-submit an identical interrupted command to resume its active
+profile. After both runs complete, build the controlled report as described in
+[evaluation.md](evaluation.md#controlled-regularization-report).
+
 ## HDRI conditions and synthesized targets
 
 `--end2end-hdri-root` points to a folder of HDR, EXR, TIFF, or PNG latlong
@@ -217,6 +293,7 @@ outputs/material_acquisition_end2end/
       olat/
         acquisition.json
         disney_brdf.pt
+        frequency_consensus_frozen.npz  # only for enabled frequency consensus
         maps/
           albedo.png
           baseColor.png
@@ -302,9 +379,10 @@ also require a GPU with at least 40 GiB memory; the worker checks the actual
 device and estimated Disney autograd graph before allocating the fit. The
 defaults request 16 CPU cores, 128 GB host memory, one GPU, and 3:59 hours. Use
 `--slurm-time`, `--slurm-cpus`, `--slurm-mem`, and the other `--slurm-*`
-options to match the cluster. `--slurm-dry-run` validates the inputs and prints
-the escaped `sbatch` command without submitting it; logs default to
-`outputs/slurm/`.
+options to match the cluster. The shell rejects end-to-end processing outside a
+Slurm allocation or exported worker context; the default Ward acquisition can
+still run locally. `--slurm-dry-run` validates the inputs and prints the escaped
+`sbatch` command without submitting it; logs default to `outputs/slurm/`.
 
 The default three profiles perform 33,000 updates each. On clusters with a
 four-hour queue limit, a full run may need more than one submission. Re-run the

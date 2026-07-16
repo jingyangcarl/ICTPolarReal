@@ -158,3 +158,32 @@ not a windowed Gaussian SSIM implementation. Setting
 `--end2end-eval-lights 0` or `--end2end-eval-hdris 0` changes the corresponding
 suite to fitted-condition reconstruction, and the summary labels it
 `fitted_olat` or `fitted_hdri` rather than held out.
+
+## Controlled regularization report
+
+Compare a completed zero-weight camera result against its regularized result
+with the acquisition-aware report composer. The two runs must use controlled
+data, profile, optimization, lighting, and evaluation settings:
+
+```bash
+OBJECT=dragondruit
+python -m ictpolarreal.processing.compare_regularization \
+  --baseline outputs/material_regularizer_cam07/baseline/${OBJECT}/cam07 \
+  --regularized outputs/material_regularizer_cam07/regularized/${OBJECT}/cam07 \
+  --output outputs/material_regularizer_cam07/comparison \
+  --data-root data/cam07_only
+```
+
+The report root contains `overview.png`, `summary.json`, `metrics.csv`, one
+material sheet per fit profile under `material/`, and OLAT/HDRI relighting
+sheets under `evaluation/`. A frequency-consensus comparison also includes
+`material/frequency_hotspot_1to1.png` and
+`material/frequency_fullmaps_1to1.png` for native-scale inspection.
+
+Qualification requires exactly the `olat`, `hdri`, and `mix` fit profiles and
+all numeric gates. A subset requested with `--profiles` is useful for an early
+diagnostic, but its status is `INCOMPLETE` even when every available numeric
+gate passes; only full three-profile coverage can report `PASS`. A passing
+report still does not prove general texture preservation or overall material
+quality. Inspect the native-resolution material sheets together with the
+relighting comparisons and machine-readable metrics.

@@ -69,11 +69,17 @@ def main() -> None:
     )
     parser.add_argument(
         "--end2end-tv-kind",
-        choices=("l1", "edge-charbonnier", "impulse-median"),
+        choices=(
+            "l1",
+            "edge-charbonnier",
+            "impulse-median",
+            "frequency-consensus",
+        ),
         default="impulse-median",
         help=(
             "Scalar-map regularizer: legacy uniform L1 TV, edge-aware "
-            "Charbonnier TV, or post-fit impulse-only median cleanup."
+            "Charbonnier TV, post-fit impulse-only cleanup, or post-fit "
+            "frequency-consensus cleanup."
         ),
     )
     parser.add_argument(

@@ -114,10 +114,13 @@ Useful options:
   `end2end`. The default is the sibling folder `../imaginaire`.
 - `--end2end-steps N` and `--end2end-learning-rate FLOAT`: control the Disney
   optimization. Defaults are 33,000 steps and a learning rate of `1e-3`.
-- `--end2end-tv-kind l1|edge-charbonnier|impulse-median`: choose the scalar-map
-  regularizer. The default `impulse-median` mode completes the ordinary data fit,
-  freezes a conservative 5x5 median/MAD detector away from albedo and normal
-  edges, then applies a post-fit proximal update only at isolated score peaks.
+- `--end2end-tv-kind l1|edge-charbonnier|impulse-median|frequency-consensus`:
+  choose the scalar-map regularizer. The default remains `impulse-median`, which
+  completes the ordinary data fit, freezes a conservative 5x5 median/MAD
+  detector away from albedo and normal edges, then applies a post-fit proximal
+  update only at isolated score peaks. The optional `frequency-consensus` mode
+  also leaves the full data-only fit unchanged, then performs one deterministic
+  frozen update guided by albedo, normal, and 3x3/7x7 scalar-map neighborhoods.
   `edge-charbonnier` and `l1` retain the broader spatial-TV ablations.
 - `--end2end-tv-weight FLOAT`: set the regularizer strength. For
   `impulse-median`, cumulative constrained-map shrink is the weight multiplied
@@ -127,7 +130,10 @@ Useful options:
   objective coefficient. Unflagged scalar entries, frozen albedo/normal maps,
   and object boundaries are not changed. Each enabled impulse fit records the
   exact frozen targets and masks in a hashed `impulse_median_frozen.npz`
-  artifact.
+  artifact. For `frequency-consensus`, the effective update strength is
+  `min(weight / 0.00125, 1)`: `0.00125` is full reference strength and `0`
+  preserves the data-only result. Its hashed sources, targets, masks, and guide
+  state are written to `frequency_consensus_frozen.npz`.
 - `--end2end-profiles LIST`: choose independent `olat`, `hdri`, and `mix` fits.
   The default is `olat,hdri,mix`; `all` is an alias, and a subset such as
   `--end2end-profiles olat` avoids fitting the other profiles.
@@ -155,6 +161,9 @@ Useful options:
 - `--slurm`: submit material acquisition to Slurm instead of running it in the
   current shell. Resource options include `--slurm-account`, `--slurm-partition`,
   `--slurm-time`, `--slurm-cpus`, `--slurm-mem`, and `--slurm-gpus`.
+- End-to-end acquisition is guarded against accidental execution on a local or
+  login shell: use `--slurm`, or run the printed command only inside an
+  allocation. The default Ward acquisition remains available locally.
 - HDRI/mix fitting preflights the allocated device and requires at least a
   40 GiB GPU. The default three-profile run performs 99,000 total updates; if a
   queue time limit interrupts it, submit the identical command again to skip
@@ -193,6 +202,14 @@ all unflagged scalar entries remain bit-identical to the data fit. The broader
 edge-aware Charbonnier and uniform L1 TV modes remain explicit ablations.
 Invalid/background pixels are masked before whole-image 99.5th-percentile
 linear scaling.
+
+With `--end2end-tv-kind frequency-consensus`, the same full data-only fit is
+followed by one deterministic guide-aware frozen update. Completion also
+requires same-checkpoint pre/post-cleanup mean MSE not to regress on either the
+OLAT or HDRI evaluation suite. This guard is a minimum safety check, not proof
+that texture or material quality improved; inspect both the material maps and
+relighting evaluation. See [docs/evaluation.md](docs/evaluation.md) for the
+controlled comparison report.
 
 End-to-end HDRI targets are not separately photographed environment-light
 captures. They are synthesized from the measured ICTPolarReal parallel OLAT

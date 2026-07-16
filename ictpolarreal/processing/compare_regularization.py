@@ -18,6 +18,10 @@ from ictpolarreal.processing.material_decomposition import (
     load_end2end_view_directions,
 )
 from ictpolarreal.utils.io import read_image
+from ictpolarreal.utils.metrics import (
+    psnr as image_psnr,
+    ssim_global as image_ssim_global,
+)
 
 
 SCALAR_MAPS = (
@@ -31,6 +35,7 @@ SCALAR_MAPS = (
     "clearcoatGloss",
 )
 EVALUATION_LIGHTING = ("olat", "hdri")
+QUALIFICATION_PROFILES = ("olat", "hdri", "mix")
 MATERIAL_LABEL_GUTTER = 600
 OVERVIEW_MATERIAL_LEFT = 360
 DEFAULT_GUIDE_ALBEDO_SIGMA = 0.05
@@ -38,13 +43,63 @@ DEFAULT_GUIDE_NORMAL_SIGMA = 0.02
 QUIET_GUIDE_PERCENTILE = 50.0
 EDGE_GUIDE_PERCENTILE = 80.0
 MEANINGFUL_EDGE_GRADIENT_MIN = 1.0 / 255.0
+EDGE_NUMERICAL_ZERO = 1e-12
 IMPULSE_FROZEN_ARTIFACT_SCHEMA = "ictpolarreal.impulse-frozen-artifact.v1"
+FREQUENCY_FROZEN_ARTIFACT_SCHEMA = (
+    "ictpolarreal.frequency-frozen-artifact.v1"
+)
+FREQUENCY_FROZEN_ARTIFACT_NAME = "frequency_consensus_frozen.npz"
+FREQUENCY_DETAIL_CROP_BOX = (96, 160, 192, 256)
+FREQUENCY_DETAIL_MAPS = (
+    "subsurface",
+    "specular",
+    "anisotropic",
+    "roughness",
+)
+FREQUENCY_DETAIL_TILE_LEFT = 220
+FREQUENCY_DETAIL_TILE_TOP = 130
+FREQUENCY_DETAIL_ROW_GAP = 42
+FREQUENCY_ANNOTATION_LEFT = 18
+FREQUENCY_ANNOTATION_GAP = 24
+OVERVIEW_DETAIL_VARIANT_GAP = 24
+OVERVIEW_DETAIL_GROUP_GAP = 64
+FREQUENCY_BASE_BLEND = 0.40
+FREQUENCY_EVIDENCE_THRESHOLD = 0.05
+FREQUENCY_MIN_EVIDENCE_MAPS = 2
+FREQUENCY_OWN_DEVIATION = 0.025
+FREQUENCY_MEDIAN3_TARGET_WEIGHT = 0.90
+FREQUENCY_MEDIAN7_TARGET_WEIGHT = 0.10
+FREQUENCY_SPATIAL_SIGMA3 = 1.0
+FREQUENCY_SPATIAL_SIGMA7 = 2.5
+FREQUENCY_ALBEDO_SIGMA = 0.05
+FREQUENCY_NORMAL_SIGMA = 0.02
+FREQUENCY_EDGE_PERCENTILE = 80.0
+FREQUENCY_GUIDE_BAND_THRESHOLD = 0.35
+FREQUENCY_EVALUATION_GUARD_SCHEMA = (
+    "ictpolarreal.frequency-consensus-evaluation-guard.v1"
+)
+FREQUENCY_EVALUATION_MEAN_MSE_TOLERANCE = 1e-8
+ACQUISITION_ERROR_HEATMAP_MAX = 0.25
+ACQUISITION_ERROR_HEATMAP_POSITIONS = np.asarray(
+    [0.0, 0.25, 0.5, 0.75, 1.0], dtype=np.float32
+)
+ACQUISITION_ERROR_HEATMAP_COLORS = np.asarray(
+    [
+        [0, 0, 0],
+        [15, 32, 110],
+        [0, 180, 220],
+        [255, 220, 35],
+        [220, 25, 25],
+    ],
+    dtype=np.float32,
+) / 255.0
 EXPORT_QUANTIZATION_TOLERANCE = 0.5 / 255.0
 _LEGACY_CHECKPOINT_SCHEMA = "ictpolarreal.end2end-checkpoint.v8"
 _EDGE_CHECKPOINT_SCHEMA = "ictpolarreal.end2end-checkpoint.v9"
 _STAGED_IMPULSE_CHECKPOINT_SCHEMA = "ictpolarreal.end2end-checkpoint.v10"
 _PROXIMAL_V11_CHECKPOINT_SCHEMA = "ictpolarreal.end2end-checkpoint.v11"
 _PROXIMAL_V12_CHECKPOINT_SCHEMA = "ictpolarreal.end2end-checkpoint.v12"
+_FREQUENCY_CHECKPOINT_SCHEMA = "ictpolarreal.end2end-checkpoint.v13"
 _LEGACY_ADAPTER = (
     "ictpolarreal.profile-acquisition-adapter.v2",
     "ictpolarreal-masked-tv-v1",
@@ -65,6 +120,10 @@ _PROXIMAL_V12_ADAPTER = (
     "ictpolarreal.profile-acquisition-adapter.v6",
     "ictpolarreal-impulse-proximal-v5",
 )
+_FREQUENCY_ADAPTER = (
+    "ictpolarreal.profile-acquisition-adapter.v7",
+    "ictpolarreal-frequency-consensus-v1",
+)
 _LEGACY_IDENTITY = (_LEGACY_CHECKPOINT_SCHEMA, _LEGACY_ADAPTER)
 _EDGE_IDENTITY = (_EDGE_CHECKPOINT_SCHEMA, _EDGE_ADAPTER)
 _STAGED_IMPULSE_IDENTITY = (
@@ -79,6 +138,10 @@ _PROXIMAL_V12_IDENTITY = (
     _PROXIMAL_V12_CHECKPOINT_SCHEMA,
     _PROXIMAL_V12_ADAPTER,
 )
+_FREQUENCY_IDENTITY = (
+    _FREQUENCY_CHECKPOINT_SCHEMA,
+    _FREQUENCY_ADAPTER,
+)
 _SUPPORTED_REGULARIZERS_BY_IDENTITY = {
     _LEGACY_IDENTITY: frozenset({"l1"}),
     _EDGE_IDENTITY: frozenset({"l1", "edge-charbonnier"}),
@@ -90,6 +153,9 @@ _SUPPORTED_REGULARIZERS_BY_IDENTITY = {
     ),
     _PROXIMAL_V12_IDENTITY: frozenset(
         {"l1", "edge-charbonnier", "impulse-median"}
+    ),
+    _FREQUENCY_IDENTITY: frozenset(
+        {"l1", "edge-charbonnier", "impulse-median", "frequency-consensus"}
     ),
 }
 _ZERO_WEIGHT_TRANSITIONS = {
@@ -109,6 +175,14 @@ _ZERO_WEIGHT_TRANSITIONS = {
         _PROXIMAL_V12_IDENTITY,
     ): "zero-weight-v10-to-v12",
     (_PROXIMAL_V11_IDENTITY, _PROXIMAL_V12_IDENTITY): "zero-weight-v11-to-v12",
+    (_LEGACY_IDENTITY, _FREQUENCY_IDENTITY): "zero-weight-v8-to-v13",
+    (_EDGE_IDENTITY, _FREQUENCY_IDENTITY): "zero-weight-v9-to-v13",
+    (
+        _STAGED_IMPULSE_IDENTITY,
+        _FREQUENCY_IDENTITY,
+    ): "zero-weight-v10-to-v13",
+    (_PROXIMAL_V11_IDENTITY, _FREQUENCY_IDENTITY): "zero-weight-v11-to-v13",
+    (_PROXIMAL_V12_IDENTITY, _FREQUENCY_IDENTITY): "zero-weight-v12-to-v13",
 }
 
 
@@ -255,7 +329,22 @@ def compose_regularization_comparison(
         acquisitions,
         contract,
     )
+    frequency_cleanup = _measure_frequency_cleanup(
+        baseline_camera,
+        regularized_camera,
+        profiles,
+        mask,
+        acquisitions,
+        contract,
+    )
     evaluation_metrics = _collect_evaluation_metrics(acquisitions, profiles)
+    case_png_metrics = _collect_case_png_metrics(
+        baseline_camera,
+        regularized_camera,
+        acquisitions,
+        profiles,
+        mask,
+    )
     summary = _build_summary(
         baseline_camera,
         regularized_camera,
@@ -268,6 +357,8 @@ def compose_regularization_comparison(
         guide_regions,
         guide_diagnostic,
         impulse_cleanup,
+        frequency_cleanup,
+        case_png_metrics,
     )
 
     stage = output_dir.with_name(f".{output_dir.name}.tmp")
@@ -293,19 +384,13 @@ def compose_regularization_comparison(
         evaluation_paths = []
         for lighting in EVALUATION_LIGHTING:
             path = stage / "evaluation" / f"{lighting}.png"
-            case_id = _shared_representative_case(
-                baseline_camera,
-                regularized_camera,
-                lighting,
-            )
-            summary["representative_cases"][lighting] = case_id
             _write_evaluation_comparison(
                 baseline_camera,
                 regularized_camera,
                 profiles,
                 lighting,
-                case_id,
                 evaluation_metrics,
+                case_png_metrics,
                 path,
             )
             evaluation_paths.append(path)
@@ -315,7 +400,24 @@ def compose_regularization_comparison(
             map_metrics,
             evaluation_metrics,
             impulse_cleanup,
+            frequency_cleanup,
+            case_png_metrics,
         )
+        if frequency_cleanup is not None and frequency_cleanup.get("available") is True:
+            _write_frequency_detail(
+                baseline_camera,
+                regularized_camera,
+                acquisitions,
+                frequency_cleanup,
+                stage / "material" / "frequency_hotspot_1to1.png",
+            )
+            _write_frequency_full_maps(
+                baseline_camera,
+                regularized_camera,
+                acquisitions,
+                frequency_cleanup,
+                stage / "material" / "frequency_fullmaps_1to1.png",
+            )
         _write_json(stage / "summary.json", summary)
         _write_overview(
             baseline_camera,
@@ -326,7 +428,14 @@ def compose_regularization_comparison(
             summary,
             stage / "overview.png",
         )
-        _validate_report(stage, profiles)
+        _validate_report(
+            stage,
+            profiles,
+            require_frequency_detail=(
+                frequency_cleanup is not None
+                and frequency_cleanup.get("available") is True
+            ),
+        )
 
         if output_dir.exists():
             output_dir.replace(backup)
@@ -395,14 +504,47 @@ def _comparison_profiles(
 def _load_acquisitions(
     camera_dir: Path, profiles: Sequence[str]
 ) -> dict[str, dict[str, Any]]:
-    return {
-        profile: json.loads(
-            (camera_dir / "material" / profile / "acquisition.json").read_text(
-                encoding="utf-8"
-            )
+    acquisitions = {}
+    for profile in profiles:
+        path = camera_dir / "material" / profile / "acquisition.json"
+        acquisition = json.loads(path.read_text(encoding="utf-8"))
+        _validate_acquisition_profile_binding(
+            acquisition,
+            requested_profile=profile,
+            source=path,
         )
-        for profile in profiles
+        acquisitions[profile] = acquisition
+    return acquisitions
+
+
+def _validate_acquisition_profile_binding(
+    acquisition: dict[str, Any],
+    *,
+    requested_profile: str,
+    source: Path | str,
+) -> None:
+    signature = acquisition.get("checkpoint_signature")
+    evaluation = acquisition.get("evaluation")
+    bindings = {
+        "lighting_profile": acquisition.get("lighting_profile"),
+        "checkpoint_signature.profile": (
+            signature.get("profile") if isinstance(signature, dict) else None
+        ),
+        "evaluation.profile": (
+            evaluation.get("profile") if isinstance(evaluation, dict) else None
+        ),
     }
+    mismatched = {
+        name: value
+        for name, value in bindings.items()
+        if value != requested_profile
+    }
+    if mismatched:
+        raise ValueError(
+            "acquisition profile binding differs from its requested material "
+            f"directory: source={source}, requested={requested_profile!r}, "
+            f"bindings={mismatched}"
+        )
 
 
 def _validate_comparison_contract(
@@ -592,6 +734,7 @@ def _canonical_regularization_kind(kind: str) -> str:
         "l1": "l1",
         "edge-charbonnier": "edge-charbonnier",
         "impulse-median": "impulse-median",
+        "frequency-consensus": "frequency-consensus",
     }.get(kind, kind)
 
 
@@ -684,6 +827,8 @@ def _validate_variable_regularizer_transition(
             _PROXIMAL_V12_IDENTITY,
         }:
             target_kind_supported = regularized_kind == "impulse-median"
+        elif regularized_identity == _FREQUENCY_IDENTITY:
+            target_kind_supported = regularized_kind == "frequency-consensus"
         if (
             transition == expected_transition
             and baseline_kind in baseline_supported
@@ -1034,6 +1179,54 @@ def _signed_gradient_cosine(
     )
 
 
+def _gaussian_filter_nearest(values: np.ndarray, sigma: float) -> np.ndarray:
+    if not math.isfinite(sigma) or sigma <= 0.0:
+        raise ValueError("Gaussian diagnostic sigma must be finite and positive")
+    radius = int(4.0 * sigma + 0.5)
+    coordinate = np.arange(-radius, radius + 1, dtype=np.float64)
+    kernel = np.exp(-0.5 * (coordinate / sigma) ** 2)
+    kernel /= kernel.sum()
+    filtered = np.asarray(values, dtype=np.float64)
+    for axis in (0, 1):
+        padding = [(0, 0)] * filtered.ndim
+        padding[axis] = (radius, radius)
+        padded = np.pad(filtered, padding, mode="edge")
+        windows = np.lib.stride_tricks.sliding_window_view(
+            padded,
+            kernel.size,
+            axis=axis,
+        )
+        filtered = np.tensordot(windows, kernel, axes=([-1], [0]))
+    return filtered
+
+
+def _band3_8(values: np.ndarray) -> np.ndarray:
+    return _gaussian_filter_nearest(values, 0.8) - _gaussian_filter_nearest(
+        values, 2.4
+    )
+
+
+def _guide_textured_band_mask(
+    albedo: np.ndarray,
+    normal: np.ndarray,
+    interior: np.ndarray,
+) -> np.ndarray:
+    albedo_band = _band3_8(albedo)
+    normal_band = _band3_8(normal)
+    albedo_strength = np.sqrt(np.sum(albedo_band**2, axis=-1))
+    normal_strength = np.sqrt(np.sum(normal_band**2, axis=-1))
+    albedo_scale = max(float(np.percentile(albedo_strength[interior], 90.0)), 1e-6)
+    normal_scale = max(float(np.percentile(normal_strength[interior], 90.0)), 1e-6)
+    score = np.maximum(
+        albedo_strength / albedo_scale,
+        normal_strength / normal_scale,
+    )
+    selected = interior & (score >= FREQUENCY_GUIDE_BAND_THRESHOLD)
+    if not np.any(selected):
+        raise ValueError("frequency band diagnostic has no guide-textured pixels")
+    return selected
+
+
 def _map_spatial_metrics(
     values: np.ndarray,
     mask: np.ndarray,
@@ -1060,7 +1253,7 @@ def _map_spatial_metrics(
     median = np.median(windows, axis=(-2, -1))
     residual = np.abs(values - median)[mask]
     quiet_residual = np.abs(values - median)[guide_masks["quiet_pixels"]]
-    return {
+    result = {
         "neighbor_variation": neighbor_variation,
         "median5_residual_mae": float(residual.mean()),
         "median5_residual_outlier_fraction_gt_0p05": float(
@@ -1071,8 +1264,31 @@ def _map_spatial_metrics(
         "quiet_region_median5_residual_outlier_fraction_gt_0p05": float(
             np.mean(quiet_residual > 0.05)
         ),
+        "quiet_region_pixels": int(quiet_residual.size),
+        "quiet_region_median5_residual_outlier_count_gt_0p05": int(
+            np.count_nonzero(quiet_residual > 0.05)
+        ),
         "guide_edge_gradient_magnitude": edge_gradient_magnitude,
     }
+    left, top, right, bottom = FREQUENCY_DETAIL_CROP_BOX
+    if values.shape[1] >= right and values.shape[0] >= bottom:
+        hotspot_quiet = guide_masks["quiet_pixels"][top:bottom, left:right]
+        hotspot_residual = np.abs(values - median)[top:bottom, left:right]
+        hotspot_quiet_count = int(np.count_nonzero(hotspot_quiet))
+        result["fixed_hotspot_quiet_pixels"] = hotspot_quiet_count
+        result[
+            "fixed_hotspot_median5_residual_outlier_fraction_gt_0p05"
+        ] = (
+            float(np.mean(hotspot_residual[hotspot_quiet] > 0.05))
+            if hotspot_quiet_count
+            else None
+        )
+    else:
+        result["fixed_hotspot_quiet_pixels"] = 0
+        result[
+            "fixed_hotspot_median5_residual_outlier_fraction_gt_0p05"
+        ] = None
+    return result
 
 
 def _measure_material_maps(
@@ -1086,9 +1302,11 @@ def _measure_material_maps(
     guide_metadata = {}
     for profile in profiles:
         maps_dir = baseline_camera / "material" / profile / "maps"
+        guide_albedo = _read_rgb_map(maps_dir / "baseColor.png")
+        guide_normal = _read_rgb_map(maps_dir / "normal.png") * 2.0 - 1.0
         guide_masks, guide_metadata[profile] = _guide_region_masks(
-            _read_rgb_map(maps_dir / "baseColor.png"),
-            _read_rgb_map(maps_dir / "normal.png"),
+            guide_albedo,
+            (guide_normal + 1.0) * 0.5,
             mask,
             albedo_sigma=float(guide_diagnostic["albedo_sigma"]),
             normal_sigma=float(guide_diagnostic["normal_sigma"]),
@@ -1100,6 +1318,14 @@ def _measure_material_maps(
         guide_metadata[profile][
             "matches_active_regularizer_configuration"
         ] = guide_diagnostic["matches_active_regularizer_configuration"]
+        band_mask = _guide_textured_band_mask(
+            guide_albedo,
+            guide_normal,
+            mask,
+        )
+        guide_metadata[profile]["guide_textured_band3_8_pixels"] = int(
+            np.count_nonzero(band_mask)
+        )
         output[profile] = {}
         for map_name in SCALAR_MAPS:
             variants = {}
@@ -1129,6 +1355,32 @@ def _measure_material_maps(
                     guide_masks["edge_vertical"],
                 ),
             )
+            baseline_band = _band3_8(variant_values["baseline"])
+            regularized_band = _band3_8(variant_values["regularized"])
+            baseline_band_energy = float(
+                np.sum(baseline_band[band_mask] ** 2, dtype=np.float64)
+            )
+            regularized_band_energy = float(
+                np.sum(regularized_band[band_mask] ** 2, dtype=np.float64)
+            )
+            variants["baseline"]["guide_textured_band3_8_energy"] = (
+                baseline_band_energy
+            )
+            variants["regularized"]["guide_textured_band3_8_energy"] = (
+                regularized_band_energy
+            )
+            low_frequency_mae = float(
+                np.mean(
+                    np.abs(
+                        _gaussian_filter_nearest(
+                            variant_values["regularized"], 3.0
+                        )
+                        - _gaussian_filter_nearest(
+                            variant_values["baseline"], 3.0
+                        )
+                    )[mask]
+                )
+            )
             variants["comparison"] = {
                 "quiet_region_variation_relative_change_fraction": _relative_change_fraction(
                     variants["baseline"]["quiet_region_neighbor_variation"],
@@ -1147,6 +1399,12 @@ def _measure_material_maps(
                     regularized_edge,
                 ),
                 "guide_edge_signed_gradient_cosine": signed_cosine,
+                "guide_textured_band3_8_amplitude_ratio": (
+                    math.sqrt(regularized_band_energy / baseline_band_energy)
+                    if baseline_band_energy > 1e-18
+                    else None
+                ),
+                "gaussian3_low_frequency_mae": low_frequency_mae,
                 "meaningful_guide_edge_gradient": bool(
                     baseline_edge >= MEANINGFUL_EDGE_GRADIENT_MIN
                 ),
@@ -1311,6 +1569,364 @@ def _load_impulse_frozen_artifact(
         "created_after_step": int(created_after_step),
         "maps": maps,
         "total_flagged_centers": total_flagged,
+    }
+
+
+def _load_frequency_frozen_artifact(
+    material_dir: Path,
+    acquisition: dict[str, Any],
+    expected_shape: tuple[int, int],
+) -> dict[str, Any]:
+    regularization = acquisition.get("regularization")
+    if not isinstance(regularization, dict):
+        raise ValueError("frequency candidate is missing regularization provenance")
+    stage_plan = regularization.get("stage_plan")
+    if not isinstance(stage_plan, dict) or stage_plan.get("enabled") is not True:
+        raise ValueError("frequency candidate does not record an enabled stage plan")
+    frozen_bundle = regularization.get("frozen_bundle")
+    if not isinstance(frozen_bundle, dict) or frozen_bundle.get("schema") != (
+        "ictpolarreal.frequency-consensus-bundle.v1"
+    ):
+        raise ValueError("frequency candidate is missing frozen-bundle provenance")
+    artifact = frozen_bundle.get("artifact")
+    if not isinstance(artifact, dict):
+        raise ValueError("frequency candidate is missing frozen-artifact provenance")
+    if artifact.get("schema") != FREQUENCY_FROZEN_ARTIFACT_SCHEMA:
+        raise ValueError("frequency frozen artifact has an unsupported schema")
+    if artifact.get("format") != "numpy_npz_compressed":
+        raise ValueError("frequency frozen artifact has an unsupported format")
+    relative_path = artifact.get("path")
+    if relative_path != FREQUENCY_FROZEN_ARTIFACT_NAME:
+        raise ValueError(
+            "frequency frozen artifact path must be frequency_consensus_frozen.npz"
+        )
+    relative = Path(relative_path)
+    if relative.is_absolute() or len(relative.parts) != 1:
+        raise ValueError("frequency frozen artifact path must be a material filename")
+    artifact_path = (material_dir / relative).resolve()
+    if artifact_path.parent != material_dir.resolve():
+        raise ValueError("frequency frozen artifact path escapes its material folder")
+    if not artifact_path.is_file():
+        raise FileNotFoundError(f"frequency frozen artifact is missing: {artifact_path}")
+    expected_bytes = artifact.get("bytes")
+    if (
+        not isinstance(expected_bytes, int)
+        or isinstance(expected_bytes, bool)
+        or expected_bytes <= 0
+        or artifact_path.stat().st_size != expected_bytes
+    ):
+        raise ValueError("frequency frozen artifact byte size does not match provenance")
+    expected_file_hash = artifact.get("sha256")
+    actual_file_hash = _file_sha256(artifact_path)
+    if (
+        not isinstance(expected_file_hash, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", expected_file_hash)
+        or actual_file_hash != expected_file_hash
+    ):
+        raise ValueError("frequency frozen artifact SHA-256 does not match provenance")
+
+    root_names = (
+        "fit_foreground",
+        "full_foreground5",
+        "edge_protected_full_precision",
+        "edge_protected_png_quantized",
+        "edge_protected",
+        "update_safe",
+        "evidence_count",
+    )
+    float_names = ("source", "median3", "median7", "target")
+    mask_names = ("mask", "consensus_mask")
+    expected_keys = {"metadata", *root_names}
+    for map_name in SCALAR_MAPS:
+        expected_keys.update(
+            f"{map_name}__{name}" for name in (*float_names, *mask_names)
+        )
+    try:
+        with np.load(artifact_path, allow_pickle=False) as payload:
+            if set(payload.files) != expected_keys:
+                raise ValueError(
+                    "frequency frozen artifact contains an unexpected array set"
+                )
+            metadata_array = payload["metadata"]
+            if metadata_array.shape != ():
+                raise ValueError("frequency frozen artifact metadata must be scalar")
+            try:
+                metadata = json.loads(str(metadata_array.item()))
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "frequency frozen artifact metadata is invalid"
+                ) from exc
+            roots = {
+                name: np.array(payload[name], copy=True) for name in root_names
+            }
+            maps = {
+                map_name: {
+                    name: np.array(payload[f"{map_name}__{name}"], copy=True)
+                    for name in (*float_names, *mask_names)
+                }
+                for map_name in SCALAR_MAPS
+            }
+    except (OSError, ValueError) as exc:
+        if isinstance(exc, ValueError) and str(exc).startswith("frequency frozen"):
+            raise
+        raise ValueError(f"could not read frequency frozen artifact: {exc}") from exc
+
+    created_after_step = frozen_bundle.get("created_after_step")
+    strength = frozen_bundle.get("strength")
+    median_chunk_rows = frozen_bundle.get("median_chunk_rows")
+    edge_threshold_full = frozen_bundle.get("edge_threshold_full_precision")
+    edge_threshold_png = frozen_bundle.get("edge_threshold_png_quantized")
+    metadata_maps = metadata.get("maps") if isinstance(metadata, dict) else None
+    if (
+        not isinstance(metadata, dict)
+        or metadata.get("schema") != FREQUENCY_FROZEN_ARTIFACT_SCHEMA
+        or metadata.get("created_after_step") != created_after_step
+        or metadata.get("strength") != strength
+        or metadata.get("median_chunk_rows") != median_chunk_rows
+        or metadata.get("edge_threshold_full_precision") != edge_threshold_full
+        or metadata.get("edge_threshold_png_quantized") != edge_threshold_png
+        or not isinstance(metadata_maps, list)
+        or not all(isinstance(name, str) for name in metadata_maps)
+        or len(metadata_maps) != len(set(metadata_maps))
+        or set(metadata_maps) != set(SCALAR_MAPS)
+    ):
+        raise ValueError(
+            "frequency frozen artifact metadata does not match acquisition provenance"
+        )
+    if (
+        not isinstance(created_after_step, int)
+        or isinstance(created_after_step, bool)
+        or stage_plan.get("detector_after_data_step") != created_after_step
+    ):
+        raise ValueError(
+            "frequency frozen artifact boundary does not match the stage plan"
+        )
+    if (
+        not isinstance(strength, (int, float))
+        or isinstance(strength, bool)
+        or not math.isfinite(float(strength))
+        or not 0.0 < float(strength) <= 1.0
+        or stage_plan.get("strength") != strength
+    ):
+        raise ValueError("frequency frozen artifact has invalid strength provenance")
+    if (
+        not isinstance(median_chunk_rows, dict)
+        or set(median_chunk_rows) != {"3x3", "7x7"}
+        or any(
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value <= 0
+            or value > expected_shape[0]
+            for value in median_chunk_rows.values()
+        )
+    ):
+        raise ValueError("frequency frozen artifact has an invalid median chunk plan")
+    for name, value in (
+        ("full-precision", edge_threshold_full),
+        ("PNG-quantized", edge_threshold_png),
+    ):
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+            or float(value) < 0.0
+        ):
+            raise ValueError(
+                f"frequency frozen artifact has an invalid {name} edge threshold"
+            )
+
+    for name in root_names[:-1]:
+        if roots[name].shape != expected_shape or roots[name].dtype != np.bool_:
+            raise ValueError(
+                f"frequency frozen {name} must be bool {expected_shape}"
+            )
+    evidence_count = roots["evidence_count"]
+    if evidence_count.shape != expected_shape or evidence_count.dtype != np.int64:
+        raise ValueError(
+            f"frequency frozen evidence_count must be int64 {expected_shape}"
+        )
+    if np.any((evidence_count < 0) | (evidence_count > len(SCALAR_MAPS))):
+        raise ValueError("frequency frozen evidence_count is outside its map range")
+    if not np.array_equal(
+        roots["full_foreground5"], _erode_mask(roots["fit_foreground"], radius=2)
+    ):
+        raise ValueError("frequency frozen full foreground has invalid semantics")
+    if not np.array_equal(
+        roots["edge_protected"],
+        roots["edge_protected_full_precision"]
+        | roots["edge_protected_png_quantized"],
+    ):
+        raise ValueError("frequency frozen edge-protection union is invalid")
+    if not np.array_equal(
+        roots["update_safe"],
+        roots["full_foreground5"] & ~roots["edge_protected"],
+    ):
+        raise ValueError("frequency frozen update-safe mask has invalid semantics")
+
+    tensor_hashes = {
+        "root": {name: _array_sha256(roots[name]) for name in root_names},
+        "maps": {
+            map_name: {
+                name: _array_sha256(maps[map_name][name])
+                for name in (*float_names, *mask_names)
+            }
+            for map_name in SCALAR_MAPS
+        },
+    }
+    if (
+        metadata.get("tensor_hashes") != tensor_hashes
+        or frozen_bundle.get("tensor_hashes") != tensor_hashes
+    ):
+        raise ValueError("frequency frozen tensor hashes do not match artifact arrays")
+    root_provenance = {
+        "fit_foreground": "fit_foreground_sha256",
+        "edge_protected_full_precision": (
+            "edge_protected_full_precision_sha256"
+        ),
+        "edge_protected_png_quantized": (
+            "edge_protected_png_quantized_sha256"
+        ),
+        "edge_protected": "edge_protected_sha256",
+        "update_safe": "update_safe_sha256",
+        "evidence_count": "evidence_count_sha256",
+    }
+    for name, provenance_name in root_provenance.items():
+        if frozen_bundle.get(provenance_name) != tensor_hashes["root"][name]:
+            raise ValueError(
+                f"frequency frozen {name} hash does not match provenance"
+            )
+
+    map_provenance = frozen_bundle.get("maps")
+    if not isinstance(map_provenance, dict) or set(map_provenance) != set(
+        SCALAR_MAPS
+    ):
+        raise ValueError("frequency frozen bundle has invalid per-map provenance")
+    total_updated = 0
+    total_consensus = 0
+    for map_name, arrays in maps.items():
+        for name in float_names:
+            values = arrays[name]
+            if values.shape != expected_shape or values.dtype != np.float32:
+                raise ValueError(
+                    f"frequency frozen {name} {map_name} must be float32 "
+                    f"{expected_shape}"
+                )
+            if not np.all(np.isfinite(values)) or np.any(
+                (values < 0.0) | (values > 1.0)
+            ):
+                raise ValueError(
+                    f"frequency frozen {name} {map_name} is outside [0,1]"
+                )
+        for name in mask_names:
+            values = arrays[name]
+            if values.shape != expected_shape or values.dtype != np.bool_:
+                raise ValueError(
+                    f"frequency frozen {name} {map_name} must be bool "
+                    f"{expected_shape}"
+                )
+        update_mask = arrays["mask"]
+        consensus_mask = arrays["consensus_mask"]
+        if not np.array_equal(
+            update_mask,
+            roots["update_safe"] & (arrays["target"] != arrays["source"]),
+        ):
+            raise ValueError(
+                f"frequency frozen update mask has invalid semantics: {map_name}"
+            )
+        if np.any(consensus_mask & ~roots["update_safe"]):
+            raise ValueError(
+                f"frequency frozen consensus mask is not update-safe: {map_name}"
+            )
+        provenance = map_provenance[map_name]
+        if not isinstance(provenance, dict):
+            raise ValueError(f"frequency frozen map provenance is invalid: {map_name}")
+        updated_count = int(np.count_nonzero(update_mask))
+        consensus_count = int(np.count_nonzero(consensus_mask))
+        if (
+            provenance.get("updated_entries") != updated_count
+            or provenance.get("consensus_entries") != consensus_count
+        ):
+            raise ValueError(
+                f"frequency frozen map {map_name} has stale entry counts"
+            )
+        for name in float_names:
+            if provenance.get(f"{name}_sha256") != tensor_hashes["maps"][
+                map_name
+            ][name]:
+                raise ValueError(
+                    f"frequency frozen {name} {map_name} hash does not match"
+                )
+        for name in mask_names:
+            if provenance.get(f"{name}_sha256") != tensor_hashes["maps"][
+                map_name
+            ][name]:
+                raise ValueError(
+                    f"frequency frozen {name} {map_name} hash does not match"
+                )
+        total_updated += updated_count
+        total_consensus += consensus_count
+    expected_evidence = np.sum(
+        np.stack(
+            [
+                np.abs(maps[name]["source"] - maps[name]["median7"])
+                > FREQUENCY_EVIDENCE_THRESHOLD
+                for name in SCALAR_MAPS
+            ],
+            axis=0,
+        ),
+        axis=0,
+        dtype=np.int64,
+    )
+    if not np.array_equal(evidence_count, expected_evidence):
+        raise ValueError("frequency frozen evidence count has invalid semantics")
+    for map_name, arrays in maps.items():
+        expected_consensus = (
+            (evidence_count >= FREQUENCY_MIN_EVIDENCE_MAPS)
+            & (
+                np.abs(arrays["source"] - arrays["median7"])
+                > FREQUENCY_OWN_DEVIATION
+            )
+            & roots["update_safe"]
+        )
+        if not np.array_equal(arrays["consensus_mask"], expected_consensus):
+            raise ValueError(
+                f"frequency frozen consensus mask has invalid semantics: {map_name}"
+            )
+        base_target = arrays["source"] + FREQUENCY_BASE_BLEND * (
+            arrays["median3"] - arrays["source"]
+        )
+        consensus_target = (
+            FREQUENCY_MEDIAN3_TARGET_WEIGHT * arrays["median3"]
+            + FREQUENCY_MEDIAN7_TARGET_WEIGHT * arrays["median7"]
+        )
+        desired = np.where(expected_consensus, consensus_target, base_target)
+        expected_target = np.where(
+            roots["update_safe"],
+            arrays["source"] + float(strength) * (desired - arrays["source"]),
+            arrays["source"],
+        )
+        if not np.array_equal(arrays["target"], expected_target):
+            raise ValueError(
+                f"frequency frozen target has invalid semantics: {map_name}"
+            )
+    if (
+        frozen_bundle.get("total_updated_entries") != total_updated
+        or frozen_bundle.get("total_consensus_entries") != total_consensus
+    ):
+        raise ValueError("frequency frozen total entry counts do not match artifact")
+    return {
+        "path": artifact_path,
+        "sha256": actual_file_hash,
+        "bytes": expected_bytes,
+        "created_after_step": int(created_after_step),
+        "strength": float(strength),
+        "median_chunk_rows": dict(median_chunk_rows),
+        "edge_threshold_full_precision": float(edge_threshold_full),
+        "edge_threshold_png_quantized": float(edge_threshold_png),
+        **roots,
+        "maps": maps,
+        "total_updated_entries": total_updated,
+        "total_consensus_entries": total_consensus,
     }
 
 
@@ -1686,10 +2302,1393 @@ def _measure_impulse_cleanup(
     }
 
 
+def _validate_frequency_baseline_state(regularization: Any) -> None:
+    if not isinstance(regularization, dict):
+        raise ValueError("frequency comparison requires baseline provenance")
+    try:
+        weight = float(regularization.get("weight", -1.0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("frequency comparison requires a zero-weight baseline") from exc
+    if not math.isfinite(weight) or weight != 0.0:
+        raise ValueError("frequency comparison requires a zero-weight baseline")
+    stage_plan = regularization.get("stage_plan")
+    if stage_plan is not None and (
+        not isinstance(stage_plan, dict) or stage_plan.get("enabled") is not False
+    ):
+        raise ValueError("frequency baseline stage must be disabled")
+    if regularization.get("cleanup_applied") not in (None, False):
+        raise ValueError("frequency baseline must not apply post-fit cleanup")
+
+
+def _validate_frequency_settings(settings: Any) -> None:
+    expected = {
+        "map_domain": "constrained_0_1_full_precision",
+        "stage": "full_data_fit_then_one_frozen_frequency_consensus_update",
+        "weighted_median_windows": [3, 7],
+        "spatial_sigma3": FREQUENCY_SPATIAL_SIGMA3,
+        "spatial_sigma7": FREQUENCY_SPATIAL_SIGMA7,
+        "albedo_sigma": FREQUENCY_ALBEDO_SIGMA,
+        "normal_sigma": FREQUENCY_NORMAL_SIGMA,
+        "edge_percentile": FREQUENCY_EDGE_PERCENTILE,
+        "base_target": f"value+{FREQUENCY_BASE_BLEND:g}*(median3-value)",
+        "cross_map_evidence": (
+            f"count(abs(value-median7)>{FREQUENCY_EVIDENCE_THRESHOLD:g})"
+        ),
+        "minimum_evidence_maps": FREQUENCY_MIN_EVIDENCE_MAPS,
+        "own_deviation_threshold": FREQUENCY_OWN_DEVIATION,
+        "consensus_target": (
+            f"{FREQUENCY_MEDIAN3_TARGET_WEIGHT:g}*median3+"
+            f"{FREQUENCY_MEDIAN7_TARGET_WEIGHT:g}*median7"
+        ),
+        "cleanup_optimizer_steps": 0,
+    }
+    if not isinstance(settings, dict):
+        raise ValueError("frequency candidate has invalid algorithm settings")
+    mismatched = [
+        name for name, value in expected.items() if settings.get(name) != value
+    ]
+    if mismatched:
+        raise ValueError(
+            "frequency candidate algorithm settings differ from the report "
+            f"contract: {mismatched}"
+        )
+
+
+def _validate_frequency_evaluation_guard(
+    acquisition: dict[str, Any],
+    *,
+    profile: str,
+) -> dict[str, Any]:
+    """Validate the candidate's frozen same-checkpoint relighting guard."""
+    regularization = acquisition.get("regularization")
+    guard = (
+        regularization.get("evaluation_guard")
+        if isinstance(regularization, dict)
+        else None
+    )
+    if (
+        not isinstance(guard, dict)
+        or set(guard) != {"schema", "same_checkpoint", "suites"}
+        or guard.get("schema") != FREQUENCY_EVALUATION_GUARD_SCHEMA
+        or guard.get("same_checkpoint") is not True
+    ):
+        raise ValueError(
+            f"frequency candidate {profile} has a missing or invalid "
+            "same-checkpoint evaluation guard"
+        )
+    suites = guard.get("suites")
+    if not isinstance(suites, dict) or set(suites) != set(EVALUATION_LIGHTING):
+        raise ValueError(
+            f"frequency candidate {profile} evaluation guard has invalid suites"
+        )
+    evaluation = acquisition.get("evaluation")
+    evaluations = (
+        evaluation.get("evaluations") if isinstance(evaluation, dict) else None
+    )
+    if not isinstance(evaluations, dict):
+        raise ValueError(
+            f"frequency candidate {profile} has no final evaluation provenance"
+        )
+
+    expected_record_keys = {
+        "pre_cleanup_mse",
+        "post_cleanup_mse",
+        "post_minus_pre_mse",
+        "pre_cleanup_mean_mse",
+        "post_cleanup_mean_mse",
+        "post_minus_pre_mean_mse",
+        "worsened",
+    }
+    public_suites = {}
+    for lighting in EVALUATION_LIGHTING:
+        record = suites[lighting]
+        if not isinstance(record, dict) or set(record) != expected_record_keys:
+            raise ValueError(
+                f"frequency candidate {profile} {lighting} evaluation guard "
+                "has an invalid serialized shape"
+            )
+        before = record.get("pre_cleanup_mse")
+        after = record.get("post_cleanup_mse")
+        deltas = record.get("post_minus_pre_mse")
+        if (
+            not isinstance(before, list)
+            or not isinstance(after, list)
+            or not isinstance(deltas, list)
+            or not before
+            or len(before) != len(after)
+            or len(before) != len(deltas)
+            or any(
+                not isinstance(value, float) or not math.isfinite(value)
+                for values in (before, after, deltas)
+                for value in values
+            )
+            or any(value < 0.0 for values in (before, after) for value in values)
+        ):
+            raise ValueError(
+                f"frequency candidate {profile} {lighting} evaluation guard "
+                "has invalid per-case losses"
+            )
+        expected_deltas = [post - pre for pre, post in zip(before, after)]
+        if any(
+            recorded != expected
+            for recorded, expected in zip(deltas, expected_deltas)
+        ):
+            raise ValueError(
+                f"frequency candidate {profile} {lighting} evaluation guard "
+                "has inconsistent per-case arithmetic"
+            )
+        before_mean = float(np.mean(before))
+        after_mean = float(np.mean(after))
+        mean_delta = after_mean - before_mean
+        if (
+            record.get("pre_cleanup_mean_mse") != before_mean
+            or record.get("post_cleanup_mean_mse") != after_mean
+            or record.get("post_minus_pre_mean_mse") != mean_delta
+            or record.get("worsened") is not (after_mean > before_mean)
+        ):
+            raise ValueError(
+                f"frequency candidate {profile} {lighting} evaluation guard "
+                "has inconsistent mean or decision provenance"
+            )
+
+        final_suite = evaluations.get(lighting)
+        final_metrics = (
+            final_suite.get("metrics") if isinstance(final_suite, dict) else None
+        )
+        recorded_count = (
+            final_suite.get("count") if isinstance(final_suite, dict) else None
+        )
+        final_mse = (
+            final_metrics.get("mse") if isinstance(final_metrics, dict) else None
+        )
+        if (
+            not isinstance(recorded_count, int)
+            or isinstance(recorded_count, bool)
+            or recorded_count != len(before)
+            or not isinstance(final_mse, (int, float))
+            or isinstance(final_mse, bool)
+            or not math.isfinite(float(final_mse))
+            or float(final_mse) < 0.0
+            or not math.isclose(
+                float(final_mse),
+                after_mean,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        ):
+            raise ValueError(
+                f"frequency candidate {profile} {lighting} evaluation guard "
+                "does not match the final evaluation count/MSE"
+            )
+        if mean_delta > FREQUENCY_EVALUATION_MEAN_MSE_TOLERANCE:
+            raise ValueError(
+                f"frequency candidate {profile} {lighting} same-checkpoint "
+                "evaluation regressed beyond tolerance: "
+                f"{mean_delta:+.9g} > "
+                f"{FREQUENCY_EVALUATION_MEAN_MSE_TOLERANCE:.1e}"
+            )
+        public_suites[lighting] = {
+            "case_count": len(before),
+            "pre_cleanup_mean_mse": before_mean,
+            "post_cleanup_mean_mse": after_mean,
+            "post_minus_pre_mean_mse": mean_delta,
+            "within_no_regression_tolerance": True,
+        }
+    return {
+        "validated": True,
+        "schema": FREQUENCY_EVALUATION_GUARD_SCHEMA,
+        "same_checkpoint": True,
+        "mean_mse_tolerance": FREQUENCY_EVALUATION_MEAN_MSE_TOLERANCE,
+        "suites": public_suites,
+    }
+
+
+def _measure_frequency_cleanup(
+    baseline_camera: Path,
+    regularized_camera: Path,
+    profiles: Sequence[str],
+    fit_mask: np.ndarray,
+    acquisitions: dict[str, dict[str, dict[str, Any]]],
+    contract: dict[str, Any],
+) -> dict[str, Any] | None:
+    if contract["regularization_kind"] != "frequency-consensus":
+        return None
+    candidate_identities = {
+        (
+            acquisitions["regularized"][profile]["checkpoint_signature"].get(
+                "schema"
+            ),
+            _adapter_identity(
+                acquisitions["regularized"][profile]["checkpoint_signature"]
+            ),
+        )
+        for profile in profiles
+    }
+    if candidate_identities != {_FREQUENCY_IDENTITY}:
+        raise ValueError(
+            "frequency cleanup report requires the v13 frequency-consensus "
+            f"identity; found {candidate_identities}"
+        )
+    if fit_mask.ndim != 2 or not np.any(fit_mask):
+        raise ValueError("frequency cleanup report requires a nonempty 2D fit mask")
+
+    aggregate = {
+        "fit_map_entries": 0,
+        "updated_entries": 0,
+        "consensus_entries": 0,
+        "updated_union_pixels": 0,
+        "distance_baseline_sum": 0.0,
+        "distance_candidate_sum": 0.0,
+        "within_tolerance": 0,
+        "source_alignment_count": 0,
+        "source_alignment_sum": 0.0,
+        "source_alignment_max": 0.0,
+        "target_alignment_count": 0,
+        "target_alignment_sum": 0.0,
+        "target_alignment_max": 0.0,
+        "outside_union_count": 0,
+        "outside_union_sum": 0.0,
+        "outside_union_max": 0.0,
+        "outside_per_map_count": 0,
+        "outside_per_map_sum": 0.0,
+        "outside_per_map_max": 0.0,
+    }
+    per_profile = {}
+    common_strength = None
+    for profile in profiles:
+        baseline_regularization = acquisitions["baseline"][profile].get(
+            "regularization"
+        )
+        _validate_frequency_baseline_state(baseline_regularization)
+        acquisition = acquisitions["regularized"][profile]
+        if acquisition.get("schema") != "ictpolarreal.end2end-disney.v13":
+            raise ValueError(
+                "frequency candidate acquisition schema does not match its "
+                "checkpoint/adapter identity"
+            )
+        regularization = acquisition.get("regularization", {})
+        if regularization.get("cleanup_applied") is not True:
+            raise ValueError("frequency candidate did not complete its post-fit update")
+        if regularization.get("data_objective_only") is not True:
+            raise ValueError("frequency candidate must keep data fitting unchanged")
+        evaluation_guard = _validate_frequency_evaluation_guard(
+            acquisition,
+            profile=profile,
+        )
+        settings = regularization.get("settings")
+        stage_plan = regularization.get("stage_plan")
+        _validate_frequency_settings(settings)
+        if (
+            not isinstance(stage_plan, dict)
+            or stage_plan.get("enabled") is not True
+            or stage_plan.get("cleanup_optimizer_steps") != 0
+            or stage_plan.get("post_fit_updates") != 1
+            or stage_plan.get("data_fit_steps") != acquisition.get("steps")
+            or stage_plan.get("detector_after_data_step")
+            != stage_plan.get("data_fit_steps")
+        ):
+            raise ValueError("frequency candidate has an invalid post-fit plan")
+        try:
+            weight = float(regularization["weight"])
+            reference = float(stage_plan["weight_reference"])
+            strength = float(stage_plan["strength"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("frequency candidate has invalid strength provenance") from exc
+        expected_strength = min(weight / reference, 1.0) if reference > 0.0 else -1.0
+        if (
+            not math.isfinite(reference)
+            or reference <= 0.0
+            or not math.isfinite(strength)
+            or not 0.0 < strength <= 1.0
+            or not math.isclose(
+                strength,
+                expected_strength,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        ):
+            raise ValueError("frequency candidate has invalid strength provenance")
+        if common_strength is None:
+            common_strength = strength
+        elif not math.isclose(common_strength, strength, rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError("frequency cleanup strength differs across profiles")
+
+        diagnostic = regularization.get("cleanup_diagnostic")
+        if not isinstance(diagnostic, dict) or diagnostic.get("schema") != (
+            "ictpolarreal.frequency-consensus-diagnostic.v1"
+        ):
+            raise ValueError("frequency candidate has invalid cleanup diagnostics")
+        artifact = _load_frequency_frozen_artifact(
+            regularized_camera / "material" / profile,
+            acquisition,
+            fit_mask.shape,
+        )
+        if not np.array_equal(artifact["fit_foreground"], fit_mask):
+            raise ValueError(
+                "frequency frozen fit foreground does not match the comparison mask"
+            )
+        if not math.isclose(
+            float(diagnostic.get("strength", -1.0)),
+            artifact["strength"],
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise ValueError("frequency diagnostic strength differs from artifact")
+        if (
+            diagnostic.get("updated_entries")
+            != artifact["total_updated_entries"]
+            or diagnostic.get("consensus_entries")
+            != artifact["total_consensus_entries"]
+        ):
+            raise ValueError("frequency diagnostic totals differ from artifact")
+        diagnostic_maps = diagnostic.get("maps")
+        if not isinstance(diagnostic_maps, dict) or set(diagnostic_maps) != set(
+            SCALAR_MAPS
+        ):
+            raise ValueError("frequency diagnostic is missing per-map counts")
+
+        fit_pixels = int(np.count_nonzero(fit_mask))
+        spatial_union = np.zeros(fit_mask.shape, dtype=bool)
+        map_differences = {}
+        profile_accumulator = {
+            "updated": 0,
+            "consensus": 0,
+            "baseline_distance": 0.0,
+            "candidate_distance": 0.0,
+            "within_tolerance": 0,
+            "source_sum": 0.0,
+            "source_max": 0.0,
+            "target_sum": 0.0,
+            "target_max": 0.0,
+            "outside_per_map_count": 0,
+            "outside_per_map_sum": 0.0,
+            "outside_per_map_max": 0.0,
+        }
+        per_map = {}
+        full_precision_before = []
+        diagnostic_moved_total = 0
+        for map_name in SCALAR_MAPS:
+            baseline_values = _read_scalar_map(
+                baseline_camera / "material" / profile / "maps" / f"{map_name}.png"
+            )
+            candidate_values = _read_scalar_map(
+                regularized_camera
+                / "material"
+                / profile
+                / "maps"
+                / f"{map_name}.png"
+            )
+            if baseline_values.shape != fit_mask.shape or candidate_values.shape != (
+                fit_mask.shape
+            ):
+                raise ValueError("frequency cleanup maps do not match the fit-mask shape")
+            arrays = artifact["maps"][map_name]
+            update_mask = arrays["mask"]
+            consensus_mask = arrays["consensus_mask"]
+            if np.any(update_mask & ~fit_mask):
+                raise ValueError(
+                    f"frequency frozen updates fall outside the fit mask: {map_name}"
+                )
+            updated_count = int(np.count_nonzero(update_mask))
+            consensus_count = int(np.count_nonzero(consensus_mask))
+            diagnostic_entry = diagnostic_maps.get(map_name)
+            if (
+                not isinstance(diagnostic_entry, dict)
+                or diagnostic_entry.get("updated_entries") != updated_count
+                or diagnostic_entry.get("consensus_entries") != consensus_count
+            ):
+                raise ValueError(
+                    f"frequency diagnostic counts differ for {map_name}"
+                )
+            moved_entries = diagnostic_entry.get("moved_entries")
+            if (
+                not isinstance(moved_entries, int)
+                or isinstance(moved_entries, bool)
+                or not 0 <= moved_entries <= updated_count
+            ):
+                raise ValueError(
+                    f"frequency diagnostic moved count is invalid for {map_name}"
+                )
+            diagnostic_moved_total += moved_entries
+
+            source_alignment = np.abs(
+                baseline_values[fit_mask] - arrays["source"][fit_mask]
+            )
+            target_alignment = np.abs(
+                candidate_values[fit_mask] - arrays["target"][fit_mask]
+            )
+            source_max = float(source_alignment.max(initial=0.0))
+            target_max = float(target_alignment.max(initial=0.0))
+            tolerance = EXPORT_QUANTIZATION_TOLERANCE + 1e-7
+            if source_max > tolerance:
+                raise ValueError(
+                    f"baseline export does not match frozen source for {map_name}"
+                )
+            if target_max > tolerance:
+                raise ValueError(
+                    f"candidate export does not match frozen target for {map_name}"
+                )
+
+            baseline_distance = np.abs(
+                baseline_values[update_mask] - arrays["target"][update_mask]
+            )
+            candidate_distance = np.abs(
+                candidate_values[update_mask] - arrays["target"][update_mask]
+            )
+            full_before = np.abs(
+                arrays["source"][update_mask] - arrays["target"][update_mask]
+            )
+            full_precision_before.append(full_before)
+            expected_before = float(full_before.mean()) if updated_count else 0.0
+            try:
+                recorded_before = float(diagnostic_entry["mean_distance_before"])
+                recorded_after = float(diagnostic_entry["mean_distance_after"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"frequency diagnostic distances are invalid for {map_name}"
+                ) from exc
+            if (
+                not math.isfinite(recorded_before)
+                or not math.isfinite(recorded_after)
+                or recorded_after < 0.0
+                or not math.isclose(
+                    recorded_before,
+                    expected_before,
+                    rel_tol=1e-6,
+                    abs_tol=1e-7,
+                )
+            ):
+                raise ValueError(
+                    f"frequency diagnostic distances differ for {map_name}"
+                )
+            within_tolerance = int(
+                np.count_nonzero(
+                    candidate_distance <= EXPORT_QUANTIZATION_TOLERANCE + 1e-12
+                )
+            )
+            exported_change = np.abs(candidate_values - baseline_values)
+            map_differences[map_name] = exported_change
+            outside = fit_mask & ~update_mask
+            outside_values = exported_change[outside]
+            outside_sum = float(outside_values.sum(dtype=np.float64))
+            outside_max = float(outside_values.max(initial=0.0))
+            baseline_sum = float(baseline_distance.sum(dtype=np.float64))
+            candidate_sum = float(candidate_distance.sum(dtype=np.float64))
+            source_sum = float(source_alignment.sum(dtype=np.float64))
+            target_sum = float(target_alignment.sum(dtype=np.float64))
+            outside_count = int(outside_values.size)
+            spatial_union |= update_mask
+            per_map[map_name] = {
+                "updated_entries": updated_count,
+                "updated_fraction_of_fit_foreground": (
+                    float(updated_count / fit_pixels) if fit_pixels else 0.0
+                ),
+                "consensus_entries": consensus_count,
+                "consensus_fraction_of_updated_entries": (
+                    float(consensus_count / updated_count)
+                    if updated_count
+                    else None
+                ),
+                "mean_absolute_distance_to_frozen_target": {
+                    "baseline": _optional_mean(baseline_sum, updated_count),
+                    "candidate": _optional_mean(candidate_sum, updated_count),
+                },
+                "within_export_tolerance_of_frozen_target": {
+                    "count": within_tolerance,
+                    "fraction": (
+                        float(within_tolerance / updated_count)
+                        if updated_count
+                        else None
+                    ),
+                },
+                "baseline_export_alignment_to_frozen_source": {
+                    "mean_absolute": _optional_mean(source_sum, fit_pixels),
+                    "maximum_absolute": source_max,
+                },
+                "candidate_export_alignment_to_frozen_target": {
+                    "mean_absolute": _optional_mean(target_sum, fit_pixels),
+                    "maximum_absolute": target_max,
+                },
+                "exported_change_outside_own_update_mask": {
+                    "entry_count": outside_count,
+                    "mean_absolute": _optional_mean(outside_sum, outside_count),
+                    "maximum_absolute": outside_max,
+                },
+            }
+            profile_accumulator["updated"] += updated_count
+            profile_accumulator["consensus"] += consensus_count
+            profile_accumulator["baseline_distance"] += baseline_sum
+            profile_accumulator["candidate_distance"] += candidate_sum
+            profile_accumulator["within_tolerance"] += within_tolerance
+            profile_accumulator["source_sum"] += source_sum
+            profile_accumulator["source_max"] = max(
+                profile_accumulator["source_max"], source_max
+            )
+            profile_accumulator["target_sum"] += target_sum
+            profile_accumulator["target_max"] = max(
+                profile_accumulator["target_max"], target_max
+            )
+            profile_accumulator["outside_per_map_count"] += outside_count
+            profile_accumulator["outside_per_map_sum"] += outside_sum
+            profile_accumulator["outside_per_map_max"] = max(
+                profile_accumulator["outside_per_map_max"], outside_max
+            )
+
+        full_before_values = (
+            np.concatenate([value for value in full_precision_before if value.size])
+            if any(value.size for value in full_precision_before)
+            else np.empty(0, dtype=np.float32)
+        )
+        expected_diagnostic_before = (
+            float(full_before_values.mean()) if full_before_values.size else 0.0
+        )
+        if (
+            diagnostic.get("moved_entries") != diagnostic_moved_total
+            or not math.isclose(
+                float(diagnostic.get("mean_distance_before", -1.0)),
+                expected_diagnostic_before,
+                rel_tol=1e-6,
+                abs_tol=1e-7,
+            )
+        ):
+            raise ValueError("frequency aggregate diagnostic differs from artifact")
+        try:
+            diagnostic_after = float(diagnostic["mean_distance_after"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("frequency aggregate diagnostic is invalid") from exc
+        if not math.isfinite(diagnostic_after) or diagnostic_after < 0.0:
+            raise ValueError("frequency aggregate diagnostic is invalid")
+
+        outside_union = fit_mask & ~spatial_union
+        outside_union_count = int(np.count_nonzero(outside_union) * len(SCALAR_MAPS))
+        outside_union_sum = float(
+            sum(
+                difference[outside_union].sum(dtype=np.float64)
+                for difference in map_differences.values()
+            )
+        )
+        outside_union_max = float(
+            max(
+                (
+                    difference[outside_union].max(initial=0.0)
+                    for difference in map_differences.values()
+                ),
+                default=0.0,
+            )
+        )
+        updated = profile_accumulator["updated"]
+        union_pixels = int(np.count_nonzero(spatial_union))
+        profile_fit_entries = fit_pixels * len(SCALAR_MAPS)
+        per_profile[profile] = {
+            "artifact": {
+                "validated": True,
+                "path": str(artifact["path"]),
+                "sha256": artifact["sha256"],
+                "bytes": artifact["bytes"],
+                "created_after_step": artifact["created_after_step"],
+            },
+            "fit_foreground_pixels": fit_pixels,
+            "evaluation_guard": evaluation_guard,
+            "strength": artifact["strength"],
+            "edge_threshold_full_precision": artifact[
+                "edge_threshold_full_precision"
+            ],
+            "edge_threshold_png_quantized": artifact[
+                "edge_threshold_png_quantized"
+            ],
+            "edge_protected_pixels": int(np.count_nonzero(artifact["edge_protected"])),
+            "update_safe_pixels": int(np.count_nonzero(artifact["update_safe"])),
+            "updated": {
+                "map_entries": updated,
+                "map_entry_fraction": float(updated / profile_fit_entries),
+                "spatial_union_pixels": union_pixels,
+                "spatial_union_fraction": float(union_pixels / fit_pixels),
+            },
+            "consensus": {
+                "map_entries": profile_accumulator["consensus"],
+                "fraction_of_updated_entries": (
+                    float(profile_accumulator["consensus"] / updated)
+                    if updated
+                    else None
+                ),
+            },
+            "mean_absolute_distance_to_frozen_target": {
+                "baseline": _optional_mean(
+                    profile_accumulator["baseline_distance"], updated
+                ),
+                "candidate": _optional_mean(
+                    profile_accumulator["candidate_distance"], updated
+                ),
+            },
+            "within_export_tolerance_of_frozen_target": {
+                "count": profile_accumulator["within_tolerance"],
+                "fraction": (
+                    float(profile_accumulator["within_tolerance"] / updated)
+                    if updated
+                    else None
+                ),
+            },
+            "baseline_export_alignment_to_frozen_source": {
+                "mean_absolute": _optional_mean(
+                    profile_accumulator["source_sum"], profile_fit_entries
+                ),
+                "maximum_absolute": profile_accumulator["source_max"],
+            },
+            "candidate_export_alignment_to_frozen_target": {
+                "mean_absolute": _optional_mean(
+                    profile_accumulator["target_sum"], profile_fit_entries
+                ),
+                "maximum_absolute": profile_accumulator["target_max"],
+            },
+            "exported_change_outside_spatial_update_union": {
+                "entry_count": outside_union_count,
+                "mean_absolute": _optional_mean(outside_union_sum, outside_union_count),
+                "maximum_absolute": outside_union_max,
+            },
+            "exported_change_outside_per_map_update_masks": {
+                "entry_count": profile_accumulator["outside_per_map_count"],
+                "mean_absolute": _optional_mean(
+                    profile_accumulator["outside_per_map_sum"],
+                    profile_accumulator["outside_per_map_count"],
+                ),
+                "maximum_absolute": profile_accumulator["outside_per_map_max"],
+            },
+            "maps": per_map,
+        }
+        aggregate["fit_map_entries"] += profile_fit_entries
+        aggregate["updated_entries"] += updated
+        aggregate["consensus_entries"] += profile_accumulator["consensus"]
+        aggregate["updated_union_pixels"] += union_pixels
+        aggregate["distance_baseline_sum"] += profile_accumulator[
+            "baseline_distance"
+        ]
+        aggregate["distance_candidate_sum"] += profile_accumulator[
+            "candidate_distance"
+        ]
+        aggregate["within_tolerance"] += profile_accumulator["within_tolerance"]
+        aggregate["source_alignment_count"] += profile_fit_entries
+        aggregate["source_alignment_sum"] += profile_accumulator["source_sum"]
+        aggregate["source_alignment_max"] = max(
+            aggregate["source_alignment_max"], profile_accumulator["source_max"]
+        )
+        aggregate["target_alignment_count"] += profile_fit_entries
+        aggregate["target_alignment_sum"] += profile_accumulator["target_sum"]
+        aggregate["target_alignment_max"] = max(
+            aggregate["target_alignment_max"], profile_accumulator["target_max"]
+        )
+        aggregate["outside_union_count"] += outside_union_count
+        aggregate["outside_union_sum"] += outside_union_sum
+        aggregate["outside_union_max"] = max(
+            aggregate["outside_union_max"], outside_union_max
+        )
+        aggregate["outside_per_map_count"] += profile_accumulator[
+            "outside_per_map_count"
+        ]
+        aggregate["outside_per_map_sum"] += profile_accumulator[
+            "outside_per_map_sum"
+        ]
+        aggregate["outside_per_map_max"] = max(
+            aggregate["outside_per_map_max"],
+            profile_accumulator["outside_per_map_max"],
+        )
+
+    updated = aggregate["updated_entries"]
+    public_aggregate = {
+        "strength": common_strength,
+        "export_quantization_tolerance": EXPORT_QUANTIZATION_TOLERANCE,
+        "updated": {
+            "map_entries": updated,
+            "map_entry_fraction": float(updated / aggregate["fit_map_entries"]),
+            "spatial_union_pixels_across_profiles": aggregate[
+                "updated_union_pixels"
+            ],
+        },
+        "consensus": {
+            "map_entries": aggregate["consensus_entries"],
+            "fraction_of_updated_entries": (
+                float(aggregate["consensus_entries"] / updated)
+                if updated
+                else None
+            ),
+        },
+        "mean_absolute_distance_to_frozen_target": {
+            "baseline": _optional_mean(aggregate["distance_baseline_sum"], updated),
+            "candidate": _optional_mean(
+                aggregate["distance_candidate_sum"], updated
+            ),
+        },
+        "within_export_tolerance_of_frozen_target": {
+            "count": aggregate["within_tolerance"],
+            "fraction": (
+                float(aggregate["within_tolerance"] / updated)
+                if updated
+                else None
+            ),
+        },
+        "baseline_export_alignment_to_frozen_source": {
+            "mean_absolute": _optional_mean(
+                aggregate["source_alignment_sum"],
+                aggregate["source_alignment_count"],
+            ),
+            "maximum_absolute": aggregate["source_alignment_max"],
+        },
+        "candidate_export_alignment_to_frozen_target": {
+            "mean_absolute": _optional_mean(
+                aggregate["target_alignment_sum"],
+                aggregate["target_alignment_count"],
+            ),
+            "maximum_absolute": aggregate["target_alignment_max"],
+        },
+        "exported_change_outside_spatial_update_union": {
+            "entry_count": aggregate["outside_union_count"],
+            "mean_absolute": _optional_mean(
+                aggregate["outside_union_sum"], aggregate["outside_union_count"]
+            ),
+            "maximum_absolute": aggregate["outside_union_max"],
+        },
+        "exported_change_outside_per_map_update_masks": {
+            "entry_count": aggregate["outside_per_map_count"],
+            "mean_absolute": _optional_mean(
+                aggregate["outside_per_map_sum"],
+                aggregate["outside_per_map_count"],
+            ),
+            "maximum_absolute": aggregate["outside_per_map_max"],
+        },
+    }
+    return {
+        "schema": "ictpolarreal.frequency-cleanup-comparison.v1",
+        "available": True,
+        "scope": (
+            "Artifact integrity, source/target alignment, update coverage, and "
+            "outside-mask changes are measured from hash-validated float32 frozen "
+            "state and 8-bit exported maps. Evidence, consensus, and target formulas "
+            "are recomputed, but the report does not independently recompute the "
+            "weighted medians or guide-derived edge masks. These diagnostics do not "
+            "establish material quality or texture preservation."
+        ),
+        "presentation": {
+            "profile": "olat" if "olat" in profiles else profiles[0],
+            "crop_box_xyxy": list(FREQUENCY_DETAIL_CROP_BOX),
+            "crop_size_pixels": 96,
+            "source_pixels_per_output_pixel": 1,
+            "resampling": "none",
+            "maps": list(FREQUENCY_DETAIL_MAPS),
+        },
+        "aggregate": public_aggregate,
+        "profiles": per_profile,
+    }
+
+
+def _masked_case_png_metrics(
+    prediction: np.ndarray,
+    reference: np.ndarray,
+    mask: np.ndarray,
+) -> dict[str, float]:
+    if prediction.shape != reference.shape or prediction.ndim != 3:
+        raise ValueError("case PNG prediction and reference shapes differ")
+    if mask.shape != reference.shape[:2] or not np.any(mask):
+        raise ValueError("case PNG metric mask is empty or has the wrong shape")
+    selected_prediction = prediction[mask]
+    selected_reference = reference[mask]
+    target_mean = float(np.mean(selected_reference))
+    if not math.isfinite(target_mean) or target_mean <= 1e-8:
+        raise ValueError("case PNG reference has no finite masked intensity")
+    prediction_mean = float(np.mean(selected_prediction))
+    luma = np.asarray([0.2989, 0.5870, 0.1140], dtype=np.float32)
+    prediction_luma = selected_prediction @ luma
+    reference_luma = selected_reference @ luma
+    if (
+        float(np.std(prediction_luma)) <= 1e-8
+        or float(np.std(reference_luma)) <= 1e-8
+    ):
+        correlation = 0.0
+    else:
+        correlation = float(
+            np.corrcoef(prediction_luma, reference_luma)[0, 1]
+        )
+    metrics = {
+        "psnr": image_psnr(prediction, reference, mask),
+        "ssim_global": image_ssim_global(prediction, reference, mask),
+        "mean_intensity_ratio": prediction_mean / target_mean,
+        "luminance_correlation": correlation,
+    }
+    nonfinite = [name for name, value in metrics.items() if not math.isfinite(value)]
+    if nonfinite:
+        raise ValueError(f"case PNG metrics are non-finite: {nonfinite}")
+    return metrics
+
+
+def _scalar_error_heatmap_u8(
+    prediction: np.ndarray,
+    reference: np.ndarray,
+) -> np.ndarray:
+    """Reproduce the acquisition writer's fixed-scale RGB error PNG exactly."""
+    prediction = np.clip(np.asarray(prediction, dtype=np.float32), 0.0, 1.0)
+    reference = np.clip(np.asarray(reference, dtype=np.float32), 0.0, 1.0)
+    if (
+        prediction.shape != reference.shape
+        or prediction.ndim != 3
+        or prediction.shape[-1] < 3
+    ):
+        raise ValueError(
+            "error heatmap inputs must be equal-shape RGB images: "
+            f"{prediction.shape} vs {reference.shape}"
+        )
+    error = np.mean(
+        np.abs(prediction[..., :3] - reference[..., :3]),
+        axis=-1,
+    )
+    normalized = np.clip(error / ACQUISITION_ERROR_HEATMAP_MAX, 0.0, 1.0)
+    heatmap = np.stack(
+        [
+            np.interp(
+                normalized,
+                ACQUISITION_ERROR_HEATMAP_POSITIONS,
+                ACQUISITION_ERROR_HEATMAP_COLORS[:, channel],
+            )
+            for channel in range(3)
+        ],
+        axis=-1,
+    ).astype(np.float32)
+    return (np.clip(heatmap, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+
+
+def _validate_stored_error_heatmap(
+    path: Path,
+    prediction: np.ndarray,
+    reference: np.ndarray,
+    *,
+    label: str,
+) -> tuple[np.ndarray, str]:
+    if not path.is_file():
+        raise FileNotFoundError(f"case PNG error heatmap is missing: {path}")
+    expected = _scalar_error_heatmap_u8(prediction, reference)
+    with Image.open(path) as image:
+        stored = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if stored.shape != expected.shape or not np.array_equal(stored, expected):
+        differing = (
+            int(np.count_nonzero(np.any(stored != expected, axis=-1)))
+            if stored.shape == expected.shape
+            else None
+        )
+        raise ValueError(
+            "stored case PNG error heatmap is stale or differs from the exact "
+            f"acquisition visualization: {label}, differing_pixels={differing}"
+        )
+    return expected, _array_sha256(expected)
+
+
+def _select_case_png_examples(
+    rows: Sequence[dict[str, Any]],
+    *,
+    lighting: str,
+    profiles: Sequence[str],
+) -> dict[str, Any]:
+    expected_profiles = tuple(profiles)
+    per_case: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        if row.get("lighting") == lighting:
+            per_case.setdefault(str(row["case_id"]), []).append(row)
+    if not per_case:
+        raise ValueError(f"no validated case PNG rows for {lighting}")
+    ranked = []
+    for case_id, case_rows in per_case.items():
+        observed_profiles = tuple(sorted(str(row["profile"]) for row in case_rows))
+        if observed_profiles != tuple(sorted(expected_profiles)):
+            raise ValueError(
+                f"{lighting}/{case_id} does not have exactly one validated row "
+                f"for every requested profile: {observed_profiles}"
+            )
+        mean_delta = float(
+            np.mean([float(row["delta"]["psnr"]) for row in case_rows])
+        )
+        if not math.isfinite(mean_delta):
+            raise ValueError(f"{lighting}/{case_id} has non-finite mean PSNR delta")
+        ranked.append(
+            {
+                "case_id": case_id,
+                "mean_profile_delta_psnr_db": mean_delta,
+                "profile_count": len(case_rows),
+                "per_profile_delta_psnr_db": {
+                    str(row["profile"]): float(row["delta"]["psnr"])
+                    for row in sorted(case_rows, key=lambda value: value["profile"])
+                },
+            }
+        )
+    ranked.sort(
+        key=lambda entry: (
+            entry["mean_profile_delta_psnr_db"],
+            entry["case_id"],
+        )
+    )
+    median_index = (len(ranked) - 1) // 2
+    median = {**ranked[median_index], "rank_worst_to_best": median_index + 1}
+    worst = {**ranked[0], "rank_worst_to_best": 1}
+    return {
+        "selection_metric": "mean_profile_delta_psnr_db",
+        "median_policy": "lower_order_statistic_after_delta_then_case_id_sort",
+        "case_count": len(ranked),
+        "median": median,
+        "worst": worst,
+    }
+
+
+def _recorded_suite_case_ids(
+    suite: dict[str, Any],
+    lighting: str,
+) -> tuple[str, ...] | None:
+    if lighting == "olat" and "frame_ids" in suite:
+        values = suite.get("frame_ids")
+        if (
+            not isinstance(values, list)
+            or not values
+            or not all(
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and value >= 0
+                for value in values
+            )
+        ):
+            raise ValueError("recorded OLAT frame IDs are invalid")
+        identifiers = tuple(f"{value:06d}" for value in values)
+        if len(set(identifiers)) != len(identifiers):
+            raise ValueError("recorded OLAT frame IDs contain duplicates")
+        return tuple(sorted(identifiers))
+    for key in ("condition_ids", "case_ids"):
+        if key not in suite:
+            continue
+        values = suite.get(key)
+        if (
+            not isinstance(values, list)
+            or not values
+            or not all(isinstance(value, str) and value for value in values)
+            or len(set(values)) != len(values)
+        ):
+            raise ValueError(f"recorded {lighting} {key} are invalid")
+        return tuple(sorted(values))
+    return None
+
+
+def _recorded_checkpoint_case_ids(
+    acquisition: dict[str, Any],
+    lighting: str,
+) -> tuple[str, ...] | None:
+    if lighting != "hdri":
+        return None
+    signature = acquisition.get("checkpoint_signature")
+    if not isinstance(signature, dict):
+        return None
+    key = "hdri_evaluation_condition_ids"
+    if key not in signature:
+        return None
+    values = signature.get(key)
+    if (
+        not isinstance(values, list)
+        or not values
+        or not all(isinstance(value, str) and value for value in values)
+        or len(set(values)) != len(values)
+    ):
+        raise ValueError("recorded HDRI checkpoint condition IDs are invalid")
+    return tuple(sorted(values))
+
+
+def _recorded_suite_representative(
+    suite: dict[str, Any],
+    lighting: str,
+) -> str | None:
+    representative = suite.get("representative")
+    if representative is None:
+        return None
+    if not isinstance(representative, dict):
+        raise ValueError(f"recorded {lighting} representative is invalid")
+    key = "frame_id" if lighting == "olat" else "condition_id"
+    if key not in representative:
+        return None
+    value = representative.get(key)
+    if lighting == "olat":
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 0
+        ):
+            raise ValueError("recorded OLAT representative frame ID is invalid")
+        return f"{value:06d}"
+    if not isinstance(value, str) or not value:
+        raise ValueError("recorded HDRI representative condition ID is invalid")
+    return value
+
+
+def _recorded_hdri_asset_case_ids(camera: Path) -> tuple[str, ...] | None:
+    manifest_path = camera / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    relative = (
+        manifest.get("evaluation", {}).get("assets", {}).get("conditions")
+        if isinstance(manifest, dict)
+        else None
+    )
+    if relative is None:
+        return None
+    if not isinstance(relative, str) or not relative:
+        raise ValueError("camera manifest has an invalid HDRI conditions path")
+    conditions_path = (camera / relative).resolve()
+    if camera.resolve() not in conditions_path.parents or not conditions_path.is_file():
+        raise ValueError("camera HDRI conditions asset is missing or escapes its root")
+    payload = json.loads(conditions_path.read_text(encoding="utf-8"))
+    conditions = payload.get("conditions") if isinstance(payload, dict) else None
+    if not isinstance(conditions, list):
+        raise ValueError("camera HDRI conditions asset has no condition list")
+    identifiers = tuple(
+        sorted(
+            entry["condition_id"]
+            for entry in conditions
+            if isinstance(entry, dict) and entry.get("split") == "heldout"
+        )
+    )
+    if (
+        not identifiers
+        or len(set(identifiers)) != len(identifiers)
+        or not all(isinstance(identifier, str) and identifier for identifier in identifiers)
+    ):
+        raise ValueError("camera HDRI conditions asset has invalid held-out IDs")
+    recorded_count = payload.get("evaluation_conditions")
+    if (
+        not isinstance(recorded_count, int)
+        or isinstance(recorded_count, bool)
+        or recorded_count != len(identifiers)
+    ):
+        raise ValueError("camera HDRI condition count differs from held-out IDs")
+    return identifiers
+
+
+def _collect_case_png_metrics(
+    baseline_camera: Path,
+    regularized_camera: Path,
+    acquisitions: dict[str, dict[str, dict[str, Any]]],
+    profiles: Sequence[str],
+    mask: np.ndarray,
+) -> dict[str, Any]:
+    if mask.ndim != 2 or not np.any(mask):
+        raise ValueError("case PNG evaluation requires a nonempty 2D mask")
+    rows = []
+    case_ids_by_lighting = {}
+    acquisition_provenance = {}
+    baseline_hdri_asset_ids = _recorded_hdri_asset_case_ids(baseline_camera)
+    regularized_hdri_asset_ids = _recorded_hdri_asset_case_ids(
+        regularized_camera
+    )
+    if baseline_hdri_asset_ids != regularized_hdri_asset_ids:
+        raise ValueError("A/B HDRI condition assets record different case IDs")
+    for lighting in EVALUATION_LIGHTING:
+        baseline_cases_dir = baseline_camera / "evaluation" / lighting / "cases"
+        regularized_cases_dir = (
+            regularized_camera / "evaluation" / lighting / "cases"
+        )
+        baseline_case_ids = tuple(
+            sorted(path.name for path in baseline_cases_dir.iterdir() if path.is_dir())
+        )
+        regularized_case_ids = tuple(
+            sorted(
+                path.name for path in regularized_cases_dir.iterdir() if path.is_dir()
+            )
+        )
+        if not baseline_case_ids or baseline_case_ids != regularized_case_ids:
+            raise ValueError(
+                f"{lighting} case PNG sets are empty or differ between A/B trees"
+            )
+        if (
+            lighting == "hdri"
+            and baseline_hdri_asset_ids is not None
+            and baseline_case_ids != baseline_hdri_asset_ids
+        ):
+            raise ValueError(
+                "HDRI case PNG identifiers differ from the recorded conditions asset"
+            )
+        case_ids_by_lighting[lighting] = list(baseline_case_ids)
+        camera_representatives = {
+            "baseline": _camera_representative_case(
+                baseline_camera,
+                lighting,
+            ),
+            "regularized": _camera_representative_case(
+                regularized_camera,
+                lighting,
+            ),
+        }
+        for variant, camera_representative in camera_representatives.items():
+            if camera_representative not in baseline_case_ids:
+                raise ValueError(
+                    f"{lighting} {variant} camera-summary representative is "
+                    "absent from case PNG metrics"
+                )
+        acquisition_provenance[lighting] = {}
+        observed_count = len(baseline_case_ids)
+        for variant in ("baseline", "regularized"):
+            acquisition_provenance[lighting][variant] = {}
+            for profile in profiles:
+                acquisition = acquisitions[variant][profile]
+                evaluation = acquisition.get("evaluation")
+                evaluations = (
+                    evaluation.get("evaluations")
+                    if isinstance(evaluation, dict)
+                    else None
+                )
+                suite = (
+                    evaluations.get(lighting)
+                    if isinstance(evaluations, dict)
+                    else None
+                )
+                if not isinstance(suite, dict):
+                    raise ValueError(
+                        "acquisition is missing a recorded evaluation suite: "
+                        f"variant={variant}, profile={profile}, lighting={lighting}"
+                    )
+                recorded_count = suite.get("count")
+                if (
+                    not isinstance(recorded_count, int)
+                    or isinstance(recorded_count, bool)
+                    or recorded_count <= 0
+                ):
+                    raise ValueError(
+                        "acquisition recorded evaluation count is invalid: "
+                        f"variant={variant}, profile={profile}, lighting={lighting}"
+                    )
+                if recorded_count != observed_count:
+                    raise ValueError(
+                        "case PNG count differs from acquisition recorded evaluation "
+                        f"count: variant={variant}, profile={profile}, "
+                        f"lighting={lighting}, observed={observed_count}, "
+                        f"recorded={recorded_count}"
+                    )
+                suite_ids = _recorded_suite_case_ids(suite, lighting)
+                checkpoint_ids = _recorded_checkpoint_case_ids(
+                    acquisition,
+                    lighting,
+                )
+                exact_ids = suite_ids or checkpoint_ids
+                if (
+                    suite_ids is not None
+                    and checkpoint_ids is not None
+                    and suite_ids != checkpoint_ids
+                ):
+                    raise ValueError(
+                        f"recorded {lighting} suite/checkpoint identifiers disagree"
+                    )
+                if exact_ids is not None and exact_ids != baseline_case_ids:
+                    raise ValueError(
+                        f"{lighting} case PNG identifiers differ from acquisition "
+                        f"provenance: variant={variant}, profile={profile}"
+                    )
+                recorded_representative = _recorded_suite_representative(
+                    suite,
+                    lighting,
+                )
+                if (
+                    recorded_representative is not None
+                    and recorded_representative not in baseline_case_ids
+                ):
+                    raise ValueError(
+                        f"{lighting} acquisition representative is absent from case "
+                        f"PNG metrics: variant={variant}, profile={profile}"
+                    )
+                if (
+                    recorded_representative is not None
+                    and recorded_representative != camera_representatives[variant]
+                ):
+                    raise ValueError(
+                        f"{lighting} acquisition representative differs from its own "
+                        f"camera summary: variant={variant}, profile={profile}"
+                    )
+                acquisition_provenance[lighting][variant][profile] = {
+                    "recorded_count": recorded_count,
+                    "exact_case_ids_available": exact_ids is not None,
+                    "recorded_representative": recorded_representative,
+                    "camera_summary_representative": camera_representatives[
+                        variant
+                    ],
+                }
+        for case_id in baseline_case_ids:
+            baseline_case = baseline_cases_dir / case_id
+            regularized_case = regularized_cases_dir / case_id
+            baseline_reference_path = baseline_case / "reference.png"
+            regularized_reference_path = regularized_case / "reference.png"
+            if not baseline_reference_path.is_file() or not (
+                regularized_reference_path.is_file()
+            ):
+                raise FileNotFoundError(
+                    f"case PNG reference is missing: {lighting}/{case_id}"
+                )
+            baseline_reference = _read_rgb_map(baseline_reference_path)
+            regularized_reference = _read_rgb_map(regularized_reference_path)
+            if baseline_reference.shape[:2] != mask.shape:
+                raise ValueError(
+                    f"case PNG reference shape differs from fit mask: {lighting}/{case_id}"
+                )
+            if not np.array_equal(baseline_reference, regularized_reference):
+                raise ValueError(
+                    f"case PNG references differ between A/B trees: {lighting}/{case_id}"
+                )
+            reference_hash = _file_sha256(baseline_reference_path)
+            for profile in profiles:
+                relative_prediction = (
+                    Path("evaluation")
+                    / lighting
+                    / "cases"
+                    / case_id
+                    / "predictions"
+                    / f"{profile}.png"
+                )
+                baseline_prediction_path = baseline_camera / relative_prediction
+                regularized_prediction_path = regularized_camera / relative_prediction
+                if not baseline_prediction_path.is_file() or not (
+                    regularized_prediction_path.is_file()
+                ):
+                    raise FileNotFoundError(
+                        "case PNG prediction is missing: "
+                        f"{lighting}/{case_id}/{profile}"
+                    )
+                baseline_prediction = _read_rgb_map(baseline_prediction_path)
+                regularized_prediction = _read_rgb_map(
+                    regularized_prediction_path
+                )
+                relative_error = (
+                    Path("evaluation")
+                    / lighting
+                    / "cases"
+                    / case_id
+                    / "errors"
+                    / f"{profile}.png"
+                )
+                baseline_error_path = baseline_camera / relative_error
+                regularized_error_path = regularized_camera / relative_error
+                _, baseline_error_pixel_hash = _validate_stored_error_heatmap(
+                    baseline_error_path,
+                    baseline_prediction,
+                    baseline_reference,
+                    label=f"baseline/{lighting}/{case_id}/{profile}",
+                )
+                _, regularized_error_pixel_hash = _validate_stored_error_heatmap(
+                    regularized_error_path,
+                    regularized_prediction,
+                    baseline_reference,
+                    label=f"regularized/{lighting}/{case_id}/{profile}",
+                )
+                baseline_metrics = _masked_case_png_metrics(
+                    baseline_prediction,
+                    baseline_reference,
+                    mask,
+                )
+                regularized_metrics = _masked_case_png_metrics(
+                    regularized_prediction,
+                    baseline_reference,
+                    mask,
+                )
+                rows.append(
+                    {
+                        "lighting": lighting,
+                        "case_id": case_id,
+                        "profile": profile,
+                        "display_roles": [],
+                        "files": {
+                            "reference": str(
+                                baseline_reference_path.relative_to(baseline_camera)
+                            ),
+                            "reference_sha256": reference_hash,
+                            "baseline_prediction": str(relative_prediction),
+                            "baseline_prediction_sha256": _file_sha256(
+                                baseline_prediction_path
+                            ),
+                            "regularized_prediction": str(relative_prediction),
+                            "regularized_prediction_sha256": _file_sha256(
+                                regularized_prediction_path
+                            ),
+                            "baseline_error": str(relative_error),
+                            "baseline_error_sha256": _file_sha256(
+                                baseline_error_path
+                            ),
+                            "baseline_error_pixel_sha256": (
+                                baseline_error_pixel_hash
+                            ),
+                            "regularized_error": str(relative_error),
+                            "regularized_error_sha256": _file_sha256(
+                                regularized_error_path
+                            ),
+                            "regularized_error_pixel_sha256": (
+                                regularized_error_pixel_hash
+                            ),
+                        },
+                        "baseline": baseline_metrics,
+                        "regularized": regularized_metrics,
+                        "delta": {
+                            name: regularized_metrics[name] - baseline_metrics[name]
+                            for name in baseline_metrics
+                        },
+                    }
+                )
+    expected_rows = sum(len(case_ids) for case_ids in case_ids_by_lighting.values()) * len(
+        profiles
+    )
+    if len(rows) != expected_rows:
+        raise ValueError("case PNG metric coverage is incomplete")
+    selected_cases = {
+        lighting: _select_case_png_examples(
+            rows,
+            lighting=lighting,
+            profiles=profiles,
+        )
+        for lighting in EVALUATION_LIGHTING
+    }
+    for row in rows:
+        selection = selected_cases[row["lighting"]]
+        roles = []
+        if row["case_id"] == selection["median"]["case_id"]:
+            roles.append("median_psnr_delta")
+        if row["case_id"] == selection["worst"]["case_id"]:
+            roles.append("worst_psnr_delta")
+        row["display_roles"] = roles
+    return {
+        "schema": "ictpolarreal.case-png-evaluation.v2",
+        "mask_pixels": int(np.count_nonzero(mask)),
+        "profiles": list(profiles),
+        "case_ids": case_ids_by_lighting,
+        "selected_cases": selected_cases,
+        "acquisition_provenance": acquisition_provenance,
+        "validated_reference_files": sum(
+            len(case_ids) for case_ids in case_ids_by_lighting.values()
+        ),
+        "validated_prediction_files": 2 * len(rows),
+        "validated_error_files": 2 * len(rows),
+        "error_heatmap_validation": {
+            "schema": "ictpolarreal.scalar-error-heatmap.v1",
+            "reducer": "mean_absolute_rgb",
+            "maximum_error": ACQUISITION_ERROR_HEATMAP_MAX,
+            "colormap_positions": ACQUISITION_ERROR_HEATMAP_POSITIONS.tolist(),
+            "colormap_rgb_u8": np.floor(
+                ACQUISITION_ERROR_HEATMAP_COLORS * 255.0 + 0.5
+            )
+            .astype(np.uint8)
+            .tolist(),
+            "stored_png_validation": "pixel_exact",
+            "report_panels": "recomputed_from_validated_reference_and_prediction",
+        },
+        "presentation": {
+            "overview_case": "median_psnr_delta",
+            "detail_cases": ["median_psnr_delta", "worst_psnr_delta"],
+            "hdri_lighting_thumbnail_fit": "contain_letterbox_no_aspect_distortion",
+        },
+        "rows": rows,
+    }
+
+
 def _collect_evaluation_metrics(
     acquisitions: dict[str, dict[str, dict[str, Any]]],
     profiles: Sequence[str],
 ) -> dict[str, dict[str, dict[str, dict[str, float]]]]:
+    required = (
+        "psnr",
+        "ssim_global",
+        "mean_intensity_ratio",
+        "luminance_correlation",
+    )
     output = {}
     for profile in profiles:
         output[profile] = {}
@@ -1704,6 +3703,19 @@ def _collect_evaluation_metrics(
                 }
                 for variant in ("baseline", "regularized")
             }
+            for variant, metrics in output[profile][lighting].items():
+                missing = [name for name in required if name not in metrics]
+                nonfinite = [
+                    name
+                    for name in required
+                    if name in metrics and not math.isfinite(metrics[name])
+                ]
+                if missing or nonfinite:
+                    raise ValueError(
+                        "relighting evaluation metrics must be finite and complete: "
+                        f"profile={profile}, lighting={lighting}, variant={variant}, "
+                        f"missing={missing}, nonfinite={nonfinite}"
+                    )
     return output
 
 
@@ -1719,6 +3731,8 @@ def _build_summary(
     guide_regions: dict[str, dict[str, Any]],
     guide_diagnostic: dict[str, Any],
     impulse_cleanup: dict[str, Any] | None,
+    frequency_cleanup: dict[str, Any] | None,
+    case_png_metrics: dict[str, Any] | None,
 ) -> dict[str, Any]:
     def aggregate(metric: str, variant: str) -> float:
         return float(
@@ -1840,8 +3854,27 @@ def _build_summary(
                 "delta": float(regularized_ssim - baseline_ssim),
             },
         }
+    scalar_map_cleanup_qualification = (
+        _build_frequency_diagnostic_gates(
+            map_metrics,
+            evaluation_metrics,
+            case_png_metrics,
+            profiles,
+        )
+        if frequency_cleanup is not None
+        and frequency_cleanup.get("available") is True
+        else None
+    )
+    if (
+        frequency_cleanup is not None
+        and scalar_map_cleanup_qualification is not None
+    ):
+        frequency_cleanup["scalar_map_cleanup_qualification"] = (
+            scalar_map_cleanup_qualification
+        )
+    selected_cases = case_png_metrics["selected_cases"]
     return {
-        "schema": "ictpolarreal.regularization-comparison.v3",
+        "schema": "ictpolarreal.regularization-comparison.v4",
         "title": (
             f"{_camera_display_name(baseline_camera.name)} · "
             "Regularization comparison"
@@ -1858,18 +3891,537 @@ def _build_summary(
         "aggregate_map_spatial_statistics": spatial_metrics,
         "guide_edge_preservation": guide_edge_preservation,
         "impulse_cleanup": impulse_cleanup,
+        "frequency_cleanup": frequency_cleanup,
+        "scalar_map_cleanup_qualification": scalar_map_cleanup_qualification,
+        "case_png_evaluation": case_png_metrics,
         "per_map_spatial_statistics": map_metrics,
         "aggregate_evaluation": evaluation_summary,
-        "representative_cases": {},
+        "displayed_evaluation_cases": {
+            lighting: {
+                "overview": {
+                    "role": "median_psnr_delta",
+                    **selected_cases[lighting]["median"],
+                },
+                "detail": {
+                    "median_psnr_delta": selected_cases[lighting]["median"],
+                    "worst_psnr_delta": selected_cases[lighting]["worst"],
+                },
+            }
+            for lighting in EVALUATION_LIGHTING
+        },
         "artifacts": {
             "overview": "overview.png",
             "metrics": "metrics.csv",
             "material": {profile: f"material/{profile}.png" for profile in profiles},
+            "frequency_diagnostics": (
+                {
+                    "hotspot_1to1": "material/frequency_hotspot_1to1.png",
+                    "fullmaps_1to1": "material/frequency_fullmaps_1to1.png",
+                }
+                if frequency_cleanup is not None
+                and frequency_cleanup.get("available") is True
+                else None
+            ),
             "evaluation": {
-                lighting: f"evaluation/{lighting}.png"
+                lighting: {
+                    "sheet": f"evaluation/{lighting}.png",
+                    "median_case": selected_cases[lighting]["median"]["case_id"],
+                    "worst_case": selected_cases[lighting]["worst"]["case_id"],
+                    "shown_case_metric_source": "recomputed_masked_case_pngs",
+                    "error_panels": (
+                        "recomputed_after_pixel_exact_stored_error_validation"
+                    ),
+                    "lighting_thumbnail_fit": (
+                        "contain_letterbox_no_aspect_distortion"
+                        if lighting == "hdri"
+                        else None
+                    ),
+                }
                 for lighting in EVALUATION_LIGHTING
             },
         },
+    }
+
+
+def _build_frequency_diagnostic_gates(
+    map_metrics: dict[str, Any],
+    evaluation_metrics: dict[str, Any],
+    case_png_metrics: dict[str, Any] | None,
+    profiles: Sequence[str],
+) -> dict[str, Any]:
+    def upper_gate(observed: float | None, threshold: float) -> dict[str, Any]:
+        finite = observed is not None and math.isfinite(float(observed))
+        return {
+            "observed": observed,
+            "operator": "<=",
+            "threshold": threshold,
+            "meets_threshold": bool(finite and float(observed) <= threshold),
+        }
+
+    def lower_gate(observed: float | None, threshold: float) -> dict[str, Any]:
+        finite = observed is not None and math.isfinite(float(observed))
+        return {
+            "observed": observed,
+            "operator": ">=",
+            "threshold": threshold,
+            "meets_threshold": bool(finite and float(observed) >= threshold),
+        }
+
+    def relative_reduction_gate(
+        baseline: float | None,
+        regularized: float | None,
+        threshold: float = 0.20,
+    ) -> dict[str, Any]:
+        valid = (
+            baseline is not None
+            and regularized is not None
+            and math.isfinite(float(baseline))
+            and math.isfinite(float(regularized))
+            and float(baseline) > 1e-12
+            and float(regularized) >= 0.0
+        )
+        observed = (
+            float((float(baseline) - float(regularized)) / float(baseline))
+            if valid
+            else None
+        )
+        gate = lower_gate(observed, threshold)
+        gate.update(
+            {
+                "quantity": "relative_reduction_from_baseline",
+                "baseline_value": baseline,
+                "regularized_value": regularized,
+            }
+        )
+        return gate
+
+    def aggregate_delta_gate(
+        baseline: float,
+        regularized: float,
+        threshold: float = 0.0,
+    ) -> dict[str, Any]:
+        gate = lower_gate(float(regularized - baseline), threshold)
+        gate.update(
+            {
+                "quantity": "regularized_minus_baseline",
+                "baseline_value": float(baseline),
+                "regularized_value": float(regularized),
+            }
+        )
+        return gate
+
+    edge_rows = [
+        (
+            map_metrics[profile][name]["baseline"][
+                "guide_edge_gradient_magnitude"
+            ],
+            map_metrics[profile][name]["regularized"][
+                "guide_edge_gradient_magnitude"
+            ],
+            map_metrics[profile][name]["comparison"],
+        )
+        for profile in profiles
+        for name in SCALAR_MAPS
+    ]
+    edge_ratios = []
+    edge_cosines = []
+    zero_baseline_nonzero_candidate_rows = 0
+    for baseline_edge, regularized_edge, comparison in edge_rows:
+        baseline_edge = float(baseline_edge)
+        regularized_edge = float(regularized_edge)
+        both_near_zero = (
+            abs(baseline_edge) <= EDGE_NUMERICAL_ZERO
+            and abs(regularized_edge) <= EDGE_NUMERICAL_ZERO
+        )
+        ratio = comparison["guide_edge_gradient_magnitude_ratio"]
+        if ratio is None:
+            if both_near_zero:
+                ratio = 1.0
+            elif abs(baseline_edge) <= EDGE_NUMERICAL_ZERO:
+                ratio = regularized_edge / EDGE_NUMERICAL_ZERO
+                zero_baseline_nonzero_candidate_rows += 1
+            else:
+                ratio = 0.0
+        cosine = comparison["guide_edge_signed_gradient_cosine"]
+        if cosine is None:
+            cosine = 1.0 if both_near_zero else 0.0
+        edge_ratios.append(float(ratio))
+        edge_cosines.append(float(cosine))
+    baseline_band_energy = sum(
+        map_metrics[profile][name]["baseline"]["guide_textured_band3_8_energy"]
+        for profile in profiles
+        for name in SCALAR_MAPS
+    )
+    regularized_band_energy = sum(
+        map_metrics[profile][name]["regularized"][
+            "guide_textured_band3_8_energy"
+        ]
+        for profile in profiles
+        for name in SCALAR_MAPS
+    )
+    aggregate_band_ratio = (
+        float(math.sqrt(regularized_band_energy / baseline_band_energy))
+        if baseline_band_energy > 1e-18
+        else None
+    )
+    worst_low_frequency_mae = max(
+        float(
+            map_metrics[profile][name]["comparison"][
+                "gaussian3_low_frequency_mae"
+            ]
+        )
+        for profile in profiles
+        for name in SCALAR_MAPS
+    )
+    hotspot = {}
+    for map_name in ("subsurface", "specular"):
+        hotspot[map_name] = {
+            variant: (
+                map_metrics.get("olat", {})
+                .get(map_name, {})
+                .get(variant, {})
+                .get("fixed_hotspot_median5_residual_outlier_fraction_gt_0p05")
+            )
+            for variant in ("baseline", "regularized")
+        }
+    candidate_evaluations = [
+        evaluation_metrics[profile][lighting]["regularized"]
+        for profile in profiles
+        for lighting in EVALUATION_LIGHTING
+    ]
+    aggregate_relighting_baseline_psnr = float(
+        np.mean(
+            [
+                float(evaluation_metrics[profile][lighting]["baseline"]["psnr"])
+                for profile in profiles
+                for lighting in EVALUATION_LIGHTING
+            ]
+        )
+    )
+    aggregate_relighting_regularized_psnr = float(
+        np.mean(
+            [
+                float(evaluation_metrics[profile][lighting]["regularized"]["psnr"])
+                for profile in profiles
+                for lighting in EVALUATION_LIGHTING
+            ]
+        )
+    )
+    aggregate_relighting_baseline_ssim = float(
+        np.mean(
+            [
+                float(
+                    evaluation_metrics[profile][lighting]["baseline"][
+                        "ssim_global"
+                    ]
+                )
+                for profile in profiles
+                for lighting in EVALUATION_LIGHTING
+            ]
+        )
+    )
+    aggregate_relighting_regularized_ssim = float(
+        np.mean(
+            [
+                float(
+                    evaluation_metrics[profile][lighting]["regularized"][
+                        "ssim_global"
+                    ]
+                )
+                for profile in profiles
+                for lighting in EVALUATION_LIGHTING
+            ]
+        )
+    )
+    quiet_pixels = {
+        variant: sum(
+            int(map_metrics[profile][name][variant]["quiet_region_pixels"])
+            for profile in profiles
+            for name in SCALAR_MAPS
+        )
+        for variant in ("baseline", "regularized")
+    }
+    quiet_outliers = {
+        variant: sum(
+            int(
+                map_metrics[profile][name][variant][
+                    "quiet_region_median5_residual_outlier_count_gt_0p05"
+                ]
+            )
+            for profile in profiles
+            for name in SCALAR_MAPS
+        )
+        for variant in ("baseline", "regularized")
+    }
+    aggregate_quiet_outlier_fraction = {
+        variant: (
+            float(quiet_outliers[variant] / quiet_pixels[variant])
+            if quiet_pixels[variant]
+            else None
+        )
+        for variant in ("baseline", "regularized")
+    }
+    edge_gate = {
+        "observed_minimum": min(edge_ratios) if edge_ratios else None,
+        "observed_maximum": max(edge_ratios) if edge_ratios else None,
+        "operator": "within_inclusive_range",
+        "minimum": 0.95,
+        "maximum": 1.05,
+        "near_zero_epsilon": EDGE_NUMERICAL_ZERO,
+        "zero_baseline_nonzero_candidate_rows": (
+            zero_baseline_nonzero_candidate_rows
+        ),
+        "meets_threshold": bool(
+            edge_ratios
+            and min(edge_ratios) >= 0.95
+            and max(edge_ratios) <= 1.05
+        ),
+    }
+    intensity_ratios = [
+        float(metrics["mean_intensity_ratio"]) for metrics in candidate_evaluations
+    ]
+    intensity_gate = {
+        "observed_minimum": min(intensity_ratios),
+        "observed_maximum": max(intensity_ratios),
+        "operator": "within_inclusive_range",
+        "minimum": 0.70,
+        "maximum": 1.20,
+        "meets_threshold": bool(
+            min(intensity_ratios) >= 0.70 and max(intensity_ratios) <= 1.20
+        ),
+    }
+    map_improvement_gates = {
+        "aggregate_quiet_outlier_relative_reduction": relative_reduction_gate(
+            aggregate_quiet_outlier_fraction["baseline"],
+            aggregate_quiet_outlier_fraction["regularized"],
+        ),
+        "olat_fixed_hotspot_subsurface_outlier_relative_reduction": (
+            relative_reduction_gate(
+                hotspot["subsurface"]["baseline"],
+                hotspot["subsurface"]["regularized"],
+            )
+        ),
+        "olat_fixed_hotspot_specular_outlier_relative_reduction": (
+            relative_reduction_gate(
+                hotspot["specular"]["baseline"],
+                hotspot["specular"]["regularized"],
+            )
+        ),
+    }
+    material_safeguard_gates = {
+        "candidate_aggregate_quiet_outlier_fraction": upper_gate(
+            aggregate_quiet_outlier_fraction["regularized"],
+            0.092,
+        ),
+        "candidate_olat_fixed_hotspot_subsurface_outlier_fraction": upper_gate(
+            hotspot["subsurface"]["regularized"], 0.30
+        ),
+        "candidate_olat_fixed_hotspot_specular_outlier_fraction": upper_gate(
+            hotspot["specular"]["regularized"], 0.24
+        ),
+        "aggregate_guide_textured_band3_8_amplitude_ratio": lower_gate(
+            aggregate_band_ratio, 0.90
+        ),
+        "guide_edge_gradient_magnitude_ratio": edge_gate,
+        "guide_edge_signed_gradient_cosine": lower_gate(
+            min(edge_cosines) if edge_cosines else None,
+            0.98,
+        ),
+        "gaussian3_low_frequency_mae": upper_gate(
+            worst_low_frequency_mae,
+            0.01,
+        ),
+    }
+    material_gates = {
+        **map_improvement_gates,
+        **material_safeguard_gates,
+    }
+    relighting_change_gates = {
+        "aggregate_relighting_delta_psnr_db": aggregate_delta_gate(
+            aggregate_relighting_baseline_psnr,
+            aggregate_relighting_regularized_psnr,
+        ),
+        "aggregate_relighting_delta_ssim_global": aggregate_delta_gate(
+            aggregate_relighting_baseline_ssim,
+            aggregate_relighting_regularized_ssim,
+        ),
+    }
+    absolute_sanity_gates = {
+        "candidate_absolute_psnr_db": lower_gate(
+            min(float(metrics["psnr"]) for metrics in candidate_evaluations),
+            18.0,
+        ),
+        "candidate_absolute_ssim_global": lower_gate(
+            min(float(metrics["ssim_global"]) for metrics in candidate_evaluations),
+            0.70,
+        ),
+        "candidate_absolute_mean_intensity_ratio": intensity_gate,
+        "candidate_absolute_luminance_correlation": lower_gate(
+            min(
+                float(metrics["luminance_correlation"])
+                for metrics in candidate_evaluations
+            ),
+            0.80,
+        ),
+    }
+    if (
+        not isinstance(case_png_metrics, dict)
+        or case_png_metrics.get("schema") != "ictpolarreal.case-png-evaluation.v2"
+        or case_png_metrics.get("profiles") != list(profiles)
+        or not isinstance(case_png_metrics.get("rows"), list)
+        or not case_png_metrics["rows"]
+    ):
+        raise ValueError("scalar-map cleanup qualification is missing case PNG metrics")
+    case_rows = case_png_metrics["rows"]
+    candidate_case_metrics = [row["regularized"] for row in case_rows]
+    case_deltas = [row["delta"] for row in case_rows]
+
+    def percentile(values: Sequence[float], value: float) -> float:
+        result = float(np.percentile(np.asarray(values, dtype=np.float64), value))
+        if not math.isfinite(result):
+            raise ValueError("case PNG percentile is non-finite")
+        return result
+
+    case_psnr = [float(metrics["psnr"]) for metrics in candidate_case_metrics]
+    case_ssim = [
+        float(metrics["ssim_global"]) for metrics in candidate_case_metrics
+    ]
+    case_ratio = [
+        float(metrics["mean_intensity_ratio"])
+        for metrics in candidate_case_metrics
+    ]
+    case_correlation = [
+        float(metrics["luminance_correlation"])
+        for metrics in candidate_case_metrics
+    ]
+    case_psnr_delta = [float(delta["psnr"]) for delta in case_deltas]
+    case_ssim_delta = [float(delta["ssim_global"]) for delta in case_deltas]
+    case_worst_ratio_gate = {
+        "observed_minimum": min(case_ratio),
+        "observed_maximum": max(case_ratio),
+        "operator": "within_inclusive_range",
+        "minimum": 0.55,
+        "maximum": 1.35,
+        "meets_threshold": bool(
+            min(case_ratio) >= 0.55 and max(case_ratio) <= 1.35
+        ),
+    }
+    case_percentile_ratio_gate = {
+        "observed_minimum": percentile(case_ratio, 10.0),
+        "observed_maximum": percentile(case_ratio, 90.0),
+        "operator": "within_inclusive_range",
+        "minimum": 0.65,
+        "maximum": 1.25,
+        "meets_threshold": bool(
+            percentile(case_ratio, 10.0) >= 0.65
+            and percentile(case_ratio, 90.0) <= 1.25
+        ),
+    }
+    case_png_gates = {
+        "case_png_worst_psnr_db": lower_gate(min(case_psnr), 15.5),
+        "case_png_p10_psnr_db": lower_gate(percentile(case_psnr, 10.0), 17.0),
+        "case_png_worst_ssim_global": lower_gate(min(case_ssim), 0.50),
+        "case_png_p10_ssim_global": lower_gate(
+            percentile(case_ssim, 10.0), 0.60
+        ),
+        "case_png_worst_mean_intensity_ratio": case_worst_ratio_gate,
+        "case_png_p10_p90_mean_intensity_ratio": case_percentile_ratio_gate,
+        "case_png_worst_luminance_correlation": lower_gate(
+            min(case_correlation), 0.60
+        ),
+        "case_png_p10_luminance_correlation": lower_gate(
+            percentile(case_correlation, 10.0), 0.70
+        ),
+        "case_png_worst_delta_psnr_db": lower_gate(
+            min(case_psnr_delta), -0.25
+        ),
+        "case_png_p10_delta_psnr_db": lower_gate(
+            percentile(case_psnr_delta, 10.0), -0.05
+        ),
+        "case_png_worst_delta_ssim_global": lower_gate(
+            min(case_ssim_delta), -0.005
+        ),
+        "case_png_p10_delta_ssim_global": lower_gate(
+            percentile(case_ssim_delta, 10.0), -0.001
+        ),
+    }
+    gates = {
+        **material_gates,
+        **relighting_change_gates,
+        **absolute_sanity_gates,
+        **case_png_gates,
+    }
+    for gate_name, gate in gates.items():
+        observed = (
+            (gate.get("observed_minimum"), gate.get("observed_maximum"))
+            if gate.get("operator") == "within_inclusive_range"
+            else (gate.get("observed"),)
+        )
+        if any(
+            value is None or not math.isfinite(float(value)) for value in observed
+        ):
+            raise ValueError(
+                "scalar-map cleanup qualification gate has a non-finite "
+                f"observation: {gate_name}"
+            )
+    met = sum(bool(gate["meets_threshold"]) for gate in gates.values())
+    numeric_thresholds_met = met == len(gates)
+    coverage_complete = (
+        len(profiles) == len(QUALIFICATION_PROFILES)
+        and set(profiles) == set(QUALIFICATION_PROFILES)
+    )
+    qualification_status = (
+        "INCOMPLETE"
+        if not coverage_complete
+        else "PASS"
+        if numeric_thresholds_met
+        else "FAIL"
+    )
+    return {
+        "schema": "ictpolarreal.scalar-map-cleanup-qualification.v1",
+        "qualification_name": "scalar_map_cleanup_under_safeguards",
+        "crop_box_xyxy": list(FREQUENCY_DETAIL_CROP_BOX),
+        "gate_count": len(gates),
+        "material_gate_count": len(material_gates),
+        "map_improvement_gate_count": len(map_improvement_gates),
+        "material_safeguard_gate_count": len(material_safeguard_gates),
+        "relighting_change_gate_count": len(relighting_change_gates),
+        "absolute_sanity_gate_count": len(absolute_sanity_gates),
+        "case_png_gate_count": len(case_png_gates),
+        "thresholds_met": met,
+        "all_numeric_thresholds_met": numeric_thresholds_met,
+        "all_thresholds_met": numeric_thresholds_met and coverage_complete,
+        "qualification_status": qualification_status,
+        "qualification_coverage": {
+            "required_profiles": list(QUALIFICATION_PROFILES),
+            "evaluated_profiles": list(profiles),
+            "complete": coverage_complete,
+            "validated_case_rows": len(case_rows),
+            "validated_prediction_files": case_png_metrics[
+                "validated_prediction_files"
+            ],
+            "validated_error_files": case_png_metrics["validated_error_files"],
+            "selected_cases": case_png_metrics["selected_cases"],
+        },
+        "pass_meaning": (
+            "PASS means the required scalar-map outlier reductions were measured "
+            "under absolute, texture, aggregate-relighting, and per-case tail "
+            "safeguards. PASS is not evidence of reconstruction or relighting "
+            "improvement."
+        ),
+        "interpretation": (
+            "Three improvement gates require at least 20% relative reduction in "
+            "aggregate quiet outliers and the fixed OLAT hotspot's subsurface and "
+            "specular outliers. Absolute and texture safeguards remain active. "
+            "Acquisition-aggregate PSNR and SSIM must be neutral or better, while "
+            "twelve masked case-PNG safeguards retain worst-case and tenth-percentile "
+            "tail limits. PASS additionally requires exactly OLAT, HDRI, and MIX fit "
+            "profiles. This qualification establishes scalar-map cleanup under "
+            "safeguards; it does not establish reconstruction improvement. It "
+            "does not establish overall material quality or preservation of all "
+            "texture."
+        ),
+        "gates": gates,
     }
 
 
@@ -1906,19 +4458,142 @@ def _camera_display_name(name: str) -> str:
     return name.strip() or "Camera"
 
 
-def _shared_representative_case(
-    baseline_camera: Path, regularized_camera: Path, lighting: str
-) -> str:
+def _camera_representative_case(camera: Path, lighting: str) -> str:
     summary = json.loads(
-        (baseline_camera / "evaluation" / "summary.json").read_text(encoding="utf-8")
+        (camera / "evaluation" / "summary.json").read_text(encoding="utf-8")
     )
-    case_id = summary["suites"][lighting]["representative_case"]
-    for camera in (baseline_camera, regularized_camera):
-        if not (camera / "evaluation" / lighting / "cases" / case_id).is_dir():
-            raise FileNotFoundError(
-                f"shared {lighting} representative case is missing: {case_id}"
-            )
-    return str(case_id)
+    try:
+        case_id = summary["suites"][lighting]["representative_case"]
+    except (KeyError, TypeError) as exc:
+        raise ValueError(
+            f"{lighting} camera summary has no representative case"
+        ) from exc
+    if not isinstance(case_id, str) or not case_id:
+        raise ValueError(f"{lighting} camera summary representative is invalid")
+    return case_id
+
+
+def _case_png_row(
+    case_png_metrics: dict[str, Any],
+    *,
+    lighting: str,
+    case_id: str,
+    profile: str,
+) -> dict[str, Any]:
+    matches = [
+        row
+        for row in case_png_metrics.get("rows", [])
+        if row.get("lighting") == lighting
+        and row.get("case_id") == case_id
+        and row.get("profile") == profile
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            "displayed evaluation case must have exactly one validated PNG row: "
+            f"{lighting}/{case_id}/{profile}, found={len(matches)}"
+        )
+    return matches[0]
+
+
+def _contain_image(
+    image: Image.Image,
+    size: tuple[int, int],
+    *,
+    fill: tuple[int, int, int] = (18, 18, 18),
+) -> Image.Image:
+    """Aspect-preserving contain fit used for panoramic HDRI thumbnails."""
+    target_width, target_height = size
+    if target_width <= 0 or target_height <= 0:
+        raise ValueError("contained image target size must be positive")
+    source = image.convert("RGB")
+    if source.width <= 0 or source.height <= 0:
+        raise ValueError("contained image source size must be positive")
+    scale = min(target_width / source.width, target_height / source.height)
+    resized_size = (
+        max(1, min(target_width, int(round(source.width * scale)))),
+        max(1, min(target_height, int(round(source.height * scale)))),
+    )
+    resized = source.resize(resized_size, Image.Resampling.LANCZOS)
+    tile = Image.new("RGB", size, fill)
+    tile.paste(
+        resized,
+        (
+            (target_width - resized.width) // 2,
+            (target_height - resized.height) // 2,
+        ),
+    )
+    return tile
+
+
+def _evaluation_case_panels(
+    baseline_camera: Path,
+    regularized_camera: Path,
+    *,
+    lighting: str,
+    case_id: str,
+    profile: str,
+) -> list[tuple[str, Image.Image, bool]]:
+    baseline_case = baseline_camera / "evaluation" / lighting / "cases" / case_id
+    regularized_case = (
+        regularized_camera / "evaluation" / lighting / "cases" / case_id
+    )
+    reference = _read_rgb_map(baseline_case / "reference.png")
+    baseline_prediction = _read_rgb_map(
+        baseline_case / "predictions" / f"{profile}.png"
+    )
+    regularized_prediction = _read_rgb_map(
+        regularized_case / "predictions" / f"{profile}.png"
+    )
+    panels: list[tuple[str, Image.Image, bool]] = []
+    if lighting == "hdri":
+        with Image.open(baseline_case / "lighting.png") as image:
+            panels.append(("Lighting", image.convert("RGB"), True))
+    panels.extend(
+        [
+            (
+                "Reference",
+                Image.fromarray(
+                    np.floor(np.clip(reference, 0.0, 1.0) * 255.0 + 0.5).astype(
+                        np.uint8
+                    )
+                ),
+                False,
+            ),
+            (
+                "Baseline",
+                Image.fromarray(
+                    np.floor(
+                        np.clip(baseline_prediction, 0.0, 1.0) * 255.0 + 0.5
+                    ).astype(np.uint8)
+                ),
+                False,
+            ),
+            (
+                "Regularized",
+                Image.fromarray(
+                    np.floor(
+                        np.clip(regularized_prediction, 0.0, 1.0) * 255.0 + 0.5
+                    ).astype(np.uint8)
+                ),
+                False,
+            ),
+            (
+                "Baseline error",
+                Image.fromarray(
+                    _scalar_error_heatmap_u8(baseline_prediction, reference)
+                ),
+                False,
+            ),
+            (
+                "Regularized error",
+                Image.fromarray(
+                    _scalar_error_heatmap_u8(regularized_prediction, reference)
+                ),
+                False,
+            ),
+        ]
+    )
+    return panels
 
 
 def _write_material_comparison(
@@ -2019,21 +4694,36 @@ def _write_evaluation_comparison(
     regularized_camera: Path,
     profiles: Sequence[str],
     lighting: str,
-    case_id: str,
     metrics: dict[str, Any],
+    case_png_metrics: dict[str, Any],
     output: Path,
 ) -> None:
-    case = baseline_camera / "evaluation" / lighting / "cases" / case_id
+    selection = case_png_metrics["selected_cases"][lighting]
+    selected = (
+        ("Median PSNR-delta case", selection["median"]),
+        ("Worst PSNR-delta case", selection["worst"]),
+    )
+    first_case_id = str(selection["median"]["case_id"])
+    case = baseline_camera / "evaluation" / lighting / "cases" / first_case_id
     with Image.open(case / "reference.png") as reference:
         tile_width, tile_height = reference.size
-    columns = ["Reference", "Baseline", "Regularized", "Baseline error", "Regularized error"]
+    columns = [
+        "Reference",
+        "Baseline",
+        "Regularized",
+        "Baseline error",
+        "Regularized error",
+    ]
     include_lighting = lighting == "hdri"
     if include_lighting:
         columns.insert(0, "Lighting")
-    left = 300
-    top = 190
-    width = left + tile_width * len(columns)
-    height = top + tile_height * len(profiles)
+    left = 360
+    top = 236
+    case_header_height = 78
+    section_gap = 24
+    section_height = case_header_height + tile_height * len(profiles)
+    width = max(1200, left + tile_width * len(columns))
+    height = top + section_height * len(selected) + section_gap
     canvas = Image.new("RGB", (width, height), (18, 18, 18))
     draw = ImageDraw.Draw(canvas)
     draw.text(
@@ -2042,77 +4732,140 @@ def _write_evaluation_comparison(
         font=_font(45, bold=True),
         fill="white",
     )
-    case_label = f"Shared case · {case_id}"
+    aggregate_baseline_psnr = float(
+        np.mean(
+            [
+                metrics[profile][lighting]["baseline"]["psnr"]
+                for profile in profiles
+            ]
+        )
+    )
+    aggregate_regularized_psnr = float(
+        np.mean(
+            [metrics[profile][lighting]["regularized"]["psnr"] for profile in profiles]
+        )
+    )
+    aggregate_baseline_ssim = float(
+        np.mean(
+            [
+                metrics[profile][lighting]["baseline"]["ssim_global"]
+                for profile in profiles
+            ]
+        )
+    )
+    aggregate_regularized_ssim = float(
+        np.mean(
+            [
+                metrics[profile][lighting]["regularized"]["ssim_global"]
+                for profile in profiles
+            ]
+        )
+    )
+    aggregate_label = (
+        f"Acquisition aggregate across {len(profiles)} fit profile(s) · "
+        f"PSNR {aggregate_baseline_psnr:.2f} → {aggregate_regularized_psnr:.2f} "
+        f"({aggregate_regularized_psnr - aggregate_baseline_psnr:+.3f} dB) · "
+        f"SSIM {aggregate_baseline_ssim:.3f} → {aggregate_regularized_ssim:.3f} "
+        f"({aggregate_regularized_ssim - aggregate_baseline_ssim:+.4f})"
+    )
     draw.text(
         (24, 72),
-        case_label,
+        aggregate_label,
         font=_font_for_width(
             draw,
-            case_label,
+            aggregate_label,
             max_width=width - 48,
             preferred_size=27,
-            minimum_size=20,
+            minimum_size=18,
             bold=True,
         ),
         fill="white",
     )
     draw.text(
         (24, 112),
-        "Errors use the acquisition report's fixed visualization scale.",
+        (
+            "Shown-case metrics are recomputed from masked PNGs. Error panels are "
+            f"recomputed at fixed mean-|RGB| scale 0–{ACQUISITION_ERROR_HEATMAP_MAX:g}."
+        ),
         font=_font(24),
         fill=(210, 210, 210),
     )
     for column, name in enumerate(columns):
         _draw_centered_text(
             draw,
-            (left + column * tile_width, 152, tile_width, 36),
+            (left + column * tile_width, 190, tile_width, 38),
             name,
             _font(22, bold=True),
             "white",
         )
-    for row, profile in enumerate(profiles):
-        y = top + row * tile_height
-        baseline_metric = metrics[profile][lighting]["baseline"]
-        regularized_metric = metrics[profile][lighting]["regularized"]
-        draw.multiline_text(
-            (24, y + 24),
-            (
-                f"{profile.upper()} fit\n"
-                f"PSNR {baseline_metric['psnr']:.2f} → {regularized_metric['psnr']:.2f}\n"
-                f"SSIM {baseline_metric['ssim_global']:.3f} → "
-                f"{regularized_metric['ssim_global']:.3f}"
+    for section_index, (role_label, selected_case) in enumerate(selected):
+        section_y = top + section_index * section_height
+        if section_index:
+            section_y += section_gap
+        case_id = str(selected_case["case_id"])
+        case_label = (
+            f"{role_label} · {case_id} · mean shown-case ΔPSNR across profiles "
+            f"{selected_case['mean_profile_delta_psnr_db']:+.3f} dB · "
+            f"rank {selected_case['rank_worst_to_best']}/{selection['case_count']}"
+        )
+        draw.rounded_rectangle(
+            (18, section_y + 4, width - 18, section_y + case_header_height - 4),
+            radius=10,
+            fill=(29, 34, 42),
+        )
+        draw.text(
+            (30, section_y + 22),
+            case_label,
+            font=_font_for_width(
+                draw,
+                case_label,
+                max_width=width - 60,
+                preferred_size=25,
+                minimum_size=16,
+                bold=True,
             ),
-            font=_font(25, bold=True),
-            fill="white",
-            spacing=10,
+            fill=(230, 235, 242),
         )
-        panel_paths = []
-        if include_lighting:
-            panel_paths.append(case / "lighting.png")
-        panel_paths.extend(
-            [
-                case / "reference.png",
-                case / "predictions" / f"{profile}.png",
-                regularized_camera
-                / "evaluation"
-                / lighting
-                / "cases"
-                / case_id
-                / "predictions"
-                / f"{profile}.png",
-                case / "errors" / f"{profile}.png",
-                regularized_camera
-                / "evaluation"
-                / lighting
-                / "cases"
-                / case_id
-                / "errors"
-                / f"{profile}.png",
-            ]
-        )
-        for column, path in enumerate(panel_paths):
-            with Image.open(path) as image:
-                panel = image.convert("RGB")
+        for row_index, profile in enumerate(profiles):
+            y = section_y + case_header_height + row_index * tile_height
+            case_metrics = _case_png_row(
+                case_png_metrics,
+                lighting=lighting,
+                case_id=case_id,
+                profile=profile,
+            )
+            baseline_metric = case_metrics["baseline"]
+            regularized_metric = case_metrics["regularized"]
+            draw.multiline_text(
+                (24, y + 24),
+                (
+                    f"SHOWN CASE · {profile.upper()} fit\n"
+                    f"PSNR {baseline_metric['psnr']:.2f} → "
+                    f"{regularized_metric['psnr']:.2f} "
+                    f"({case_metrics['delta']['psnr']:+.3f} dB)\n"
+                    f"SSIM {baseline_metric['ssim_global']:.3f} → "
+                    f"{regularized_metric['ssim_global']:.3f} "
+                    f"({case_metrics['delta']['ssim_global']:+.4f})"
+                ),
+                font=_font(22, bold=True),
+                fill="white",
+                spacing=9,
+            )
+            panels = _evaluation_case_panels(
+                baseline_camera,
+                regularized_camera,
+                lighting=lighting,
+                case_id=case_id,
+                profile=profile,
+            )
+            if [name for name, _, _ in panels] != columns:
+                raise ValueError("evaluation panel columns differ from report header")
+            for column, (_, image, contain) in enumerate(panels):
+                panel = (
+                    _contain_image(image, (tile_width, tile_height))
+                    if contain
+                    else image.convert("RGB")
+                )
                 if panel.size != (tile_width, tile_height):
                     panel = panel.resize(
                         (tile_width, tile_height), Image.Resampling.LANCZOS
@@ -2127,6 +4880,8 @@ def _write_metrics_csv(
     map_metrics: dict[str, Any],
     evaluation_metrics: dict[str, Any],
     impulse_cleanup: dict[str, Any] | None,
+    frequency_cleanup: dict[str, Any] | None,
+    case_png_metrics: dict[str, Any] | None,
 ) -> None:
     rows = []
     for profile, maps in map_metrics.items():
@@ -2318,6 +5073,271 @@ def _write_metrics_csv(
                             "meaningful_baseline_gradient": "",
                         }
                     )
+    if frequency_cleanup is not None and frequency_cleanup.get("available") is True:
+        for profile, cleanup in frequency_cleanup["profiles"].items():
+            cleanup_rows = (
+                (
+                    "all_maps",
+                    "updated_map_entries",
+                    "",
+                    cleanup["updated"]["map_entries"],
+                ),
+                (
+                    "all_maps",
+                    "updated_map_entry_fraction",
+                    "",
+                    cleanup["updated"]["map_entry_fraction"],
+                ),
+                (
+                    "all_maps",
+                    "consensus_map_entries",
+                    "",
+                    cleanup["consensus"]["map_entries"],
+                ),
+                (
+                    "all_maps",
+                    "consensus_fraction_of_updated_entries",
+                    "",
+                    cleanup["consensus"]["fraction_of_updated_entries"],
+                ),
+                (
+                    "all_maps",
+                    "mean_absolute_distance_to_frozen_target",
+                    cleanup["mean_absolute_distance_to_frozen_target"]["baseline"],
+                    cleanup["mean_absolute_distance_to_frozen_target"]["candidate"],
+                ),
+                (
+                    "all_maps",
+                    "within_export_tolerance_of_frozen_target_fraction",
+                    "",
+                    cleanup["within_export_tolerance_of_frozen_target"]["fraction"],
+                ),
+                (
+                    "all_maps",
+                    "outside_spatial_update_union_mean_absolute_exported_change",
+                    "",
+                    cleanup["exported_change_outside_spatial_update_union"][
+                        "mean_absolute"
+                    ],
+                ),
+                (
+                    "all_maps",
+                    "outside_spatial_update_union_maximum_absolute_exported_change",
+                    "",
+                    cleanup["exported_change_outside_spatial_update_union"][
+                        "maximum_absolute"
+                    ],
+                ),
+            )
+            for target, metric, baseline, candidate in cleanup_rows:
+                delta = (
+                    candidate - baseline
+                    if isinstance(baseline, (int, float))
+                    and isinstance(candidate, (int, float))
+                    else ""
+                )
+                rows.append(
+                    {
+                        "category": "frequency_cleanup",
+                        "profile": profile,
+                        "target": target,
+                        "metric": metric,
+                        "baseline": baseline,
+                        "regularized": candidate,
+                        "delta": delta,
+                        "relative_change_fraction": "",
+                        "magnitude_ratio": "",
+                        "correspondence": "",
+                        "meaningful_baseline_gradient": "",
+                    }
+                )
+            for map_name, map_cleanup in cleanup["maps"].items():
+                map_rows = (
+                    ("updated_entries", "", map_cleanup["updated_entries"]),
+                    (
+                        "updated_fraction_of_fit_foreground",
+                        "",
+                        map_cleanup["updated_fraction_of_fit_foreground"],
+                    ),
+                    (
+                        "consensus_entries",
+                        "",
+                        map_cleanup["consensus_entries"],
+                    ),
+                    (
+                        "mean_absolute_distance_to_frozen_target",
+                        map_cleanup["mean_absolute_distance_to_frozen_target"][
+                            "baseline"
+                        ],
+                        map_cleanup["mean_absolute_distance_to_frozen_target"][
+                            "candidate"
+                        ],
+                    ),
+                    (
+                        "within_export_tolerance_of_frozen_target_fraction",
+                        "",
+                        map_cleanup[
+                            "within_export_tolerance_of_frozen_target"
+                        ]["fraction"],
+                    ),
+                    (
+                        "outside_own_update_mask_maximum_absolute_exported_change",
+                        "",
+                        map_cleanup["exported_change_outside_own_update_mask"][
+                            "maximum_absolute"
+                        ],
+                    ),
+                )
+                for metric, baseline, candidate in map_rows:
+                    delta = (
+                        candidate - baseline
+                        if isinstance(baseline, (int, float))
+                        and isinstance(candidate, (int, float))
+                        else ""
+                    )
+                    rows.append(
+                        {
+                            "category": "frequency_cleanup",
+                            "profile": profile,
+                            "target": map_name,
+                            "metric": metric,
+                            "baseline": baseline,
+                            "regularized": candidate,
+                            "delta": delta,
+                            "relative_change_fraction": "",
+                            "magnitude_ratio": "",
+                            "correspondence": "",
+                            "meaningful_baseline_gradient": "",
+                        }
+                    )
+        gate_report = frequency_cleanup.get("scalar_map_cleanup_qualification")
+        if isinstance(gate_report, dict):
+            for gate_name, gate in gate_report.get("gates", {}).items():
+                if gate.get("operator") == "within_inclusive_range":
+                    gate_rows = (
+                        (
+                            f"{gate_name}_minimum",
+                            gate.get("minimum"),
+                            gate.get("observed_minimum"),
+                        ),
+                        (
+                            f"{gate_name}_maximum",
+                            gate.get("maximum"),
+                            gate.get("observed_maximum"),
+                        ),
+                    )
+                else:
+                    gate_rows = (
+                        (gate_name, gate.get("threshold"), gate.get("observed")),
+                    )
+                for metric, threshold, observed in gate_rows:
+                    comparison_baseline = gate.get("baseline_value")
+                    comparison_regularized = gate.get("regularized_value")
+                    has_comparison_values = isinstance(
+                        comparison_baseline, (int, float)
+                    ) and isinstance(comparison_regularized, (int, float))
+                    rows.append(
+                        {
+                            "category": "scalar_map_cleanup_gate",
+                            "profile": "aggregate",
+                            "target": (
+                                f"{gate.get('operator', '')} {threshold}"
+                                if has_comparison_values
+                                else gate.get("operator", "")
+                            ),
+                            "metric": metric,
+                            "baseline": (
+                                comparison_baseline
+                                if has_comparison_values
+                                else threshold
+                            ),
+                            "regularized": (
+                                comparison_regularized
+                                if has_comparison_values
+                                else observed
+                            ),
+                            "delta": (
+                                comparison_regularized - comparison_baseline
+                                if has_comparison_values
+                                else observed - threshold
+                                if isinstance(observed, (int, float))
+                                and isinstance(threshold, (int, float))
+                                else ""
+                            ),
+                            "relative_change_fraction": (
+                                _relative_change_fraction(
+                                    float(comparison_baseline),
+                                    float(comparison_regularized),
+                                )
+                                if has_comparison_values
+                                else ""
+                            ),
+                            "magnitude_ratio": "",
+                            "correspondence": "",
+                            "meaningful_baseline_gradient": "",
+                            "gate_meets_threshold": gate.get(
+                                "meets_threshold", False
+                            ),
+                        }
+                    )
+            coverage = gate_report.get("qualification_coverage", {})
+            rows.append(
+                {
+                    "category": "scalar_map_cleanup_qualification",
+                    "profile": "aggregate",
+                    "target": "exact_profile_coverage",
+                    "metric": "qualification_status",
+                    "baseline": ",".join(coverage.get("required_profiles", [])),
+                    "regularized": ",".join(
+                        coverage.get("evaluated_profiles", [])
+                    ),
+                    "delta": gate_report.get("qualification_status", ""),
+                    "relative_change_fraction": "",
+                    "magnitude_ratio": "",
+                    "correspondence": "",
+                    "meaningful_baseline_gradient": "",
+                    "gate_meets_threshold": coverage.get("complete", False),
+                }
+            )
+    if case_png_metrics is not None:
+        for lighting, selection in case_png_metrics["selected_cases"].items():
+            for role in ("median", "worst"):
+                selected = selection[role]
+                rows.append(
+                    {
+                        "category": "evaluation_case_selection",
+                        "profile": "aggregate",
+                        "target": f"{lighting}/{selected['case_id']}",
+                        "metric": f"{role}_mean_profile_delta_psnr_db",
+                        "baseline": "",
+                        "regularized": "",
+                        "delta": selected["mean_profile_delta_psnr_db"],
+                        "relative_change_fraction": "",
+                        "magnitude_ratio": "",
+                        "correspondence": "",
+                        "meaningful_baseline_gradient": "",
+                        "gate_meets_threshold": "",
+                    }
+                )
+        for case in case_png_metrics["rows"]:
+            for metric, baseline in case["baseline"].items():
+                regularized = case["regularized"][metric]
+                rows.append(
+                    {
+                        "category": "case_png_relighting",
+                        "profile": case["profile"],
+                        "target": f"{case['lighting']}/{case['case_id']}",
+                        "metric": metric,
+                        "baseline": baseline,
+                        "regularized": regularized,
+                        "delta": case["delta"][metric],
+                        "relative_change_fraction": "",
+                        "magnitude_ratio": "",
+                        "correspondence": "",
+                        "meaningful_baseline_gradient": "",
+                        "gate_meets_threshold": "",
+                    }
+                )
     for profile, suites in evaluation_metrics.items():
         for lighting, variants in suites.items():
             shared = sorted(set(variants["baseline"]) & set(variants["regularized"]))
@@ -2355,6 +5375,7 @@ def _write_metrics_csv(
                 "magnitude_ratio",
                 "correspondence",
                 "meaningful_baseline_gradient",
+                "gate_meets_threshold",
             ),
         )
         writer.writeheader()
@@ -2436,6 +5457,512 @@ def _densest_flagged_crop_box(
     )
 
 
+def _frequency_annotation_layout(
+    profile_cleanup: dict[str, Any],
+) -> dict[str, Any]:
+    cleanup_maps = profile_cleanup.get("maps")
+    if not isinstance(cleanup_maps, dict):
+        raise ValueError("frequency annotation layout is missing map diagnostics")
+    font = _font(17, bold=True)
+    spacing = 5
+    measurement = Image.new("RGB", (1, 1))
+    draw = ImageDraw.Draw(measurement)
+    rows = []
+    maximum_right = FREQUENCY_ANNOTATION_LEFT
+    for map_name in FREQUENCY_DETAIL_MAPS:
+        map_cleanup = cleanup_maps.get(map_name)
+        if not isinstance(map_cleanup, dict):
+            raise ValueError(
+                f"frequency annotation layout is missing {_display_name(map_name)}"
+            )
+        text = (
+            f"{_display_name(map_name)}\n"
+            f"updates {map_cleanup['updated_entries']}\n"
+            f"consensus {map_cleanup['consensus_entries']}"
+        )
+        bounds = draw.multiline_textbbox(
+            (FREQUENCY_ANNOTATION_LEFT, 0),
+            text,
+            font=font,
+            spacing=spacing,
+        )
+        maximum_right = max(maximum_right, int(math.ceil(bounds[2])))
+        rows.append(
+            {
+                "map": map_name,
+                "text": text,
+                "bounds_xyxy": [
+                    int(math.floor(bounds[0])),
+                    int(math.floor(bounds[1])),
+                    int(math.ceil(bounds[2])),
+                    int(math.ceil(bounds[3])),
+                ],
+            }
+        )
+    tile_left = max(
+        FREQUENCY_DETAIL_TILE_LEFT,
+        maximum_right + FREQUENCY_ANNOTATION_GAP,
+    )
+    return {
+        "annotation_left": FREQUENCY_ANNOTATION_LEFT,
+        "annotation_gap": FREQUENCY_ANNOTATION_GAP,
+        "font_size": 17,
+        "spacing": spacing,
+        "tile_left": tile_left,
+        "rows": rows,
+    }
+
+
+def _write_frequency_detail(
+    baseline_camera: Path,
+    regularized_camera: Path,
+    acquisitions: dict[str, dict[str, dict[str, Any]]],
+    frequency_cleanup: dict[str, Any],
+    output: Path,
+) -> None:
+    presentation = frequency_cleanup.get("presentation")
+    if not isinstance(presentation, dict):
+        raise ValueError("frequency detail presentation metadata is missing")
+    profile = presentation.get("profile")
+    if not isinstance(profile, str) or profile not in acquisitions["regularized"]:
+        raise ValueError("frequency detail presentation profile is invalid")
+    crop_box = tuple(presentation.get("crop_box_xyxy", ()))
+    if crop_box != FREQUENCY_DETAIL_CROP_BOX:
+        raise ValueError("frequency detail presentation crop differs from audit")
+    left, top, right, bottom = crop_box
+    tile_width = right - left
+    tile_height = bottom - top
+    if tile_width != 96 or tile_height != 96:
+        raise ValueError("frequency detail crop must be exactly 96x96 pixels")
+    sample_path = (
+        baseline_camera
+        / "material"
+        / profile
+        / "maps"
+        / f"{FREQUENCY_DETAIL_MAPS[0]}.png"
+    )
+    with Image.open(sample_path) as sample:
+        source_width, source_height = sample.size
+    if right > source_width or bottom > source_height:
+        raise ValueError(
+            "frequency detail fixed crop does not fit the exported material maps"
+        )
+    artifact = _load_frequency_frozen_artifact(
+        regularized_camera / "material" / profile,
+        acquisitions["regularized"][profile],
+        (source_height, source_width),
+    )
+
+    annotation_layout = _frequency_annotation_layout(
+        frequency_cleanup["profiles"][profile]
+    )
+    tile_left = annotation_layout["tile_left"]
+    columns = ("Baseline", "Regularized", "Frozen target", "|change| x8")
+    row_stride = tile_height + FREQUENCY_DETAIL_ROW_GAP
+    width = tile_left + len(columns) * tile_width + 24
+    height = FREQUENCY_DETAIL_TILE_TOP + len(FREQUENCY_DETAIL_MAPS) * row_stride + 20
+    canvas = Image.new("RGB", (width, height), (18, 18, 18))
+    draw = ImageDraw.Draw(canvas)
+    draw.text(
+        (18, 12),
+        f"{profile.upper()} frequency-consensus detail · native 1:1",
+        font=_font(25, bold=True),
+        fill="white",
+    )
+    draw.text(
+        (18, 52),
+        "Fixed crop x=96:192, y=160:256 · no resize or interpolation",
+        font=_font(17),
+        fill=(215, 215, 215),
+    )
+    draw.text(
+        (18, 78),
+        "Diagnostic only; material quality and texture preservation require full review.",
+        font=_font(16),
+        fill=(255, 203, 112),
+    )
+    for column, name in enumerate(columns):
+        _draw_centered_text(
+            draw,
+            (
+                tile_left + column * tile_width,
+                100,
+                tile_width,
+                26,
+            ),
+            name,
+            _font(14, bold=True),
+            "white",
+        )
+
+    annotation_font = _font(annotation_layout["font_size"], bold=True)
+    for row, map_name in enumerate(FREQUENCY_DETAIL_MAPS):
+        y = FREQUENCY_DETAIL_TILE_TOP + row * row_stride
+        draw.multiline_text(
+            (annotation_layout["annotation_left"], y + 8),
+            annotation_layout["rows"][row]["text"],
+            font=annotation_font,
+            fill="white",
+            spacing=annotation_layout["spacing"],
+        )
+        baseline_path = (
+            baseline_camera / "material" / profile / "maps" / f"{map_name}.png"
+        )
+        regularized_path = (
+            regularized_camera / "material" / profile / "maps" / f"{map_name}.png"
+        )
+        with Image.open(baseline_path) as image:
+            baseline_crop = image.convert("L").crop(crop_box)
+        with Image.open(regularized_path) as image:
+            regularized_crop = image.convert("L").crop(crop_box)
+        target_u8 = np.floor(
+            np.clip(artifact["maps"][map_name]["target"], 0.0, 1.0) * 255.0
+            + 0.5
+        ).astype(np.uint8)
+        target_u8[~artifact["fit_foreground"]] = 0
+        target_crop = Image.fromarray(target_u8, mode="L").crop(crop_box)
+        baseline_u8 = np.asarray(baseline_crop, dtype=np.uint8)
+        regularized_u8 = np.asarray(regularized_crop, dtype=np.uint8)
+        delta_u8 = np.clip(
+            np.abs(regularized_u8.astype(np.int16) - baseline_u8.astype(np.int16))
+            * 8,
+            0,
+            255,
+        ).astype(np.uint8)
+        panels = (
+            baseline_crop,
+            regularized_crop,
+            target_crop,
+            Image.fromarray(delta_u8, mode="L"),
+        )
+        for column, panel in enumerate(panels):
+            x = tile_left + column * tile_width
+            # Intentionally paste the native 96x96 crop directly.  Any resize,
+            # even nearest-neighbor, would violate this diagnostic's 1:1 contract.
+            canvas.paste(panel.convert("RGB"), (x, y))
+    output.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(output)
+
+
+def _write_frequency_full_maps(
+    baseline_camera: Path,
+    regularized_camera: Path,
+    acquisitions: dict[str, dict[str, dict[str, Any]]],
+    frequency_cleanup: dict[str, Any],
+    output: Path,
+) -> None:
+    presentation = frequency_cleanup.get("presentation")
+    if not isinstance(presentation, dict):
+        raise ValueError("frequency full-map presentation metadata is missing")
+    profile = presentation.get("profile")
+    if not isinstance(profile, str) or profile not in acquisitions["regularized"]:
+        raise ValueError("frequency full-map presentation profile is invalid")
+    sample_path = (
+        baseline_camera
+        / "material"
+        / profile
+        / "maps"
+        / f"{FREQUENCY_DETAIL_MAPS[0]}.png"
+    )
+    with Image.open(sample_path) as sample:
+        tile_width, tile_height = sample.size
+    artifact = _load_frequency_frozen_artifact(
+        regularized_camera / "material" / profile,
+        acquisitions["regularized"][profile],
+        (tile_height, tile_width),
+    )
+    annotation_layout = _frequency_annotation_layout(
+        frequency_cleanup["profiles"][profile]
+    )
+    columns = ("Baseline", "Regularized", "Frozen target", "|change| x8")
+    row_gap = 42
+    tile_left = annotation_layout["tile_left"]
+    tile_top = 130
+    row_stride = tile_height + row_gap
+    width = tile_left + len(columns) * tile_width + 24
+    height = tile_top + len(FREQUENCY_DETAIL_MAPS) * row_stride + 20
+    canvas = Image.new("RGB", (width, height), (18, 18, 18))
+    draw = ImageDraw.Draw(canvas)
+    draw.text(
+        (18, 12),
+        f"{profile.upper()} frequency-consensus full maps · native 1:1",
+        font=_font(25, bold=True),
+        fill="white",
+    )
+    draw.text(
+        (18, 52),
+        "Every map pixel is one output pixel · no resize or interpolation",
+        font=_font(17),
+        fill=(215, 215, 215),
+    )
+    draw.text(
+        (18, 78),
+        "Diagnostic only; material quality and texture preservation require relighting review.",
+        font=_font(16),
+        fill=(255, 203, 112),
+    )
+    for column, name in enumerate(columns):
+        _draw_centered_text(
+            draw,
+            (tile_left + column * tile_width, 100, tile_width, 26),
+            name,
+            _font(15, bold=True),
+            "white",
+        )
+
+    annotation_font = _font(annotation_layout["font_size"], bold=True)
+    for row, map_name in enumerate(FREQUENCY_DETAIL_MAPS):
+        y = tile_top + row * row_stride
+        draw.multiline_text(
+            (annotation_layout["annotation_left"], y + 12),
+            annotation_layout["rows"][row]["text"],
+            font=annotation_font,
+            fill="white",
+            spacing=annotation_layout["spacing"],
+        )
+        with Image.open(
+            baseline_camera / "material" / profile / "maps" / f"{map_name}.png"
+        ) as image:
+            baseline_panel = image.convert("L")
+        with Image.open(
+            regularized_camera
+            / "material"
+            / profile
+            / "maps"
+            / f"{map_name}.png"
+        ) as image:
+            regularized_panel = image.convert("L")
+        target_u8 = np.floor(
+            np.clip(artifact["maps"][map_name]["target"], 0.0, 1.0) * 255.0
+            + 0.5
+        ).astype(np.uint8)
+        target_u8[~artifact["fit_foreground"]] = 0
+        target_panel = Image.fromarray(target_u8, mode="L")
+        baseline_u8 = np.asarray(baseline_panel, dtype=np.uint8)
+        regularized_u8 = np.asarray(regularized_panel, dtype=np.uint8)
+        delta_u8 = np.clip(
+            np.abs(regularized_u8.astype(np.int16) - baseline_u8.astype(np.int16))
+            * 8,
+            0,
+            255,
+        ).astype(np.uint8)
+        panels = (
+            baseline_panel,
+            regularized_panel,
+            target_panel,
+            Image.fromarray(delta_u8, mode="L"),
+        )
+        for column, panel in enumerate(panels):
+            x = tile_left + column * tile_width
+            canvas.paste(panel.convert("RGB"), (x, y))
+    output.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(output)
+
+
+def _overview_pixel_detail_layout(
+    map_names: Sequence[str],
+    captions: Sequence[str],
+    *,
+    display_size: int,
+    canvas_width: int,
+) -> dict[str, Any]:
+    map_names = tuple(map_names)
+    captions = tuple(captions)
+    if (
+        not map_names
+        or len(map_names) != len(captions)
+        or display_size <= 0
+        or canvas_width <= 0
+    ):
+        raise ValueError("overview pixel-detail layout inputs are invalid")
+    draw = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    title_font = _font(27, bold=True)
+    variant_font = _font(20, bold=True)
+    caption_font = _font(19, bold=True)
+    variant_labels = ("Baseline", "Regularized")
+    variant_widths = [
+        draw.textbbox((0, 0), label, font=variant_font)[2]
+        for label in variant_labels
+    ]
+    slot_width = max(display_size, max(variant_widths) + 24)
+    content_width = 2 * slot_width + OVERVIEW_DETAIL_VARIANT_GAP
+    caption_measurements = [
+        draw.multiline_textbbox(
+            (0, 0),
+            caption,
+            font=caption_font,
+            spacing=5,
+            align="center",
+        )
+        for caption in captions
+    ]
+    caption_height = max(
+        72,
+        max(bounds[3] - bounds[1] for bounds in caption_measurements) + 24,
+    )
+    group_widths = []
+    for map_name, caption_bounds in zip(map_names, caption_measurements):
+        title_bounds = draw.textbbox(
+            (0, 0),
+            _display_name(map_name),
+            font=title_font,
+        )
+        group_widths.append(
+            max(
+                content_width + 32,
+                title_bounds[2] - title_bounds[0] + 40,
+                caption_bounds[2] - caption_bounds[0] + 40,
+            )
+        )
+    total_width = sum(group_widths) + OVERVIEW_DETAIL_GROUP_GAP * (
+        len(group_widths) - 1
+    )
+    if total_width > canvas_width - 72:
+        raise ValueError(
+            "overview pixel-detail cards do not fit inside the report canvas"
+        )
+    cursor = (canvas_width - total_width) // 2
+    groups = []
+    for map_name, caption, group_width in zip(
+        map_names,
+        captions,
+        group_widths,
+    ):
+        group_left = cursor
+        content_left = group_left + (group_width - content_width) // 2
+        slots = []
+        label_bounds = []
+        image_boxes = []
+        for variant_index, label in enumerate(variant_labels):
+            slot_left = content_left + variant_index * (
+                slot_width + OVERVIEW_DETAIL_VARIANT_GAP
+            )
+            slot = (slot_left, 0, slot_width, 32)
+            slots.append(slot)
+            label_bounds.append(
+                _centered_text_bounds(draw, slot, label, variant_font)
+            )
+            image_left = slot_left + (slot_width - display_size) // 2
+            image_boxes.append((image_left, 0, display_size, display_size))
+        group_box = (group_left, 0, group_width, 1)
+        groups.append(
+            {
+                "map": map_name,
+                "caption": caption,
+                "box": group_box,
+                "title_bounds": _centered_text_bounds(
+                    draw,
+                    (group_left, 0, group_width, 34),
+                    _display_name(map_name),
+                    title_font,
+                ),
+                "variant_slots": slots,
+                "variant_label_bounds": label_bounds,
+                "image_boxes": image_boxes,
+                "caption_bounds": _centered_multiline_text_bounds(
+                    draw,
+                    (group_left, 0, group_width, caption_height),
+                    caption,
+                    caption_font,
+                    spacing=5,
+                ),
+            }
+        )
+        cursor += group_width + OVERVIEW_DETAIL_GROUP_GAP
+    return {
+        "display_size": display_size,
+        "slot_width": slot_width,
+        "variant_gap": OVERVIEW_DETAIL_VARIANT_GAP,
+        "group_gap": OVERVIEW_DETAIL_GROUP_GAP,
+        "caption_height": caption_height,
+        "total_width": total_width,
+        "groups": groups,
+    }
+
+
+def _frequency_overview_headlines(
+    gate_report: dict[str, Any],
+    relighting_line: str,
+) -> tuple[str, ...]:
+    if not isinstance(gate_report, dict):
+        raise ValueError("frequency overview requires cleanup qualification metadata")
+    gates = gate_report.get("gates")
+    if not isinstance(gates, dict):
+        raise ValueError("frequency overview qualification has no gates")
+
+    def reduction_line(gate_name: str, label: str) -> str:
+        gate = gates.get(gate_name)
+        if not isinstance(gate, dict):
+            raise ValueError(f"frequency overview is missing gate {gate_name}")
+        values = (
+            gate.get("baseline_value"),
+            gate.get("regularized_value"),
+            gate.get("observed"),
+        )
+        if any(
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+            for value in values
+        ):
+            raise ValueError(
+                f"frequency overview gate {gate_name} has invalid headline values"
+            )
+        baseline, regularized, reduction = (float(value) for value in values)
+        return (
+            f"{label}: {100.0 * baseline:.2f}% → "
+            f"{100.0 * regularized:.2f}% · "
+            f"{100.0 * reduction:.1f}% reduction"
+        )
+
+    band_gate = gates.get("aggregate_guide_textured_band3_8_amplitude_ratio")
+    if not isinstance(band_gate, dict):
+        raise ValueError("frequency overview is missing the 3–8 px texture gate")
+    band_ratio = band_gate.get("observed")
+    band_threshold = band_gate.get("threshold")
+    if any(
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(float(value))
+        for value in (band_ratio, band_threshold)
+    ):
+        raise ValueError("frequency overview texture gate has invalid values")
+    try:
+        status = str(gate_report["qualification_status"])
+        thresholds_met = int(gate_report["thresholds_met"])
+        gate_count = int(gate_report["gate_count"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("frequency overview qualification status is invalid") from exc
+    return (
+        (
+            f"Map-cleanup qualification: {status} {thresholds_met}/{gate_count} · "
+            "PASS = cleanup under relighting safeguards, not reconstruction improvement."
+        ),
+        reduction_line(
+            "aggregate_quiet_outlier_relative_reduction",
+            "Aggregate quiet outliers",
+        ),
+        reduction_line(
+            "olat_fixed_hotspot_subsurface_outlier_relative_reduction",
+            "Fixed OLAT subsurface-hotspot outliers",
+        ),
+        reduction_line(
+            "olat_fixed_hotspot_specular_outlier_relative_reduction",
+            "Fixed OLAT specular-hotspot outliers",
+        ),
+        (
+            "Guide-textured 3–8 px amplitude retained: "
+            f"{100.0 * float(band_ratio):.1f}% · safeguard "
+            f"≥{100.0 * float(band_threshold):.0f}%"
+        ),
+        relighting_line,
+        (
+            "Scope: exported-map diagnostics do not establish overall material "
+            "quality or preservation of all texture."
+        ),
+    )
+
+
 def _write_overview(
     baseline_camera: Path,
     regularized_camera: Path,
@@ -2468,9 +5995,12 @@ def _write_overview(
     )
 
     overview_profile = "mix" if "mix" in profiles else profiles[-1]
+    detail_profile = overview_profile
     impulse_cleanup = summary.get("impulse_cleanup")
     impulse_profile_cleanup = None
     impulse_artifact = None
+    frequency_cleanup = summary.get("frequency_cleanup")
+    frequency_profile_cleanup = None
     if (
         isinstance(impulse_cleanup, dict)
         and impulse_cleanup.get("available") is True
@@ -2490,6 +6020,18 @@ def _write_overview(
             acquisition,
             (source_height, source_width),
         )
+    elif (
+        isinstance(frequency_cleanup, dict)
+        and frequency_cleanup.get("available") is True
+    ):
+        presentation = frequency_cleanup.get("presentation")
+        if not isinstance(presentation, dict):
+            raise ValueError("frequency overview is missing presentation metadata")
+        detail_profile = presentation.get("profile")
+        if not isinstance(detail_profile, str) or detail_profile not in profiles:
+            raise ValueError("frequency overview profile is invalid")
+        frequency_profile_cleanup = frequency_cleanup["profiles"][detail_profile]
+        detail_maps = ("subsurface", "specular")
     else:
         ranked_detail_maps = sorted(
             (
@@ -2511,11 +6053,43 @@ def _write_overview(
                 for map_name in ("specular", "roughness")
                 if map_name not in detail_maps
             )[: 2 - len(detail_maps)]
-    detail_source_size = min(128, source_width, source_height)
-    detail_display_size = 256
-    detail_gap = 80
-    detail_heading_height = 160
-    detail_caption_height = 55
+    if frequency_profile_cleanup is not None:
+        detail_source_size = 96
+        detail_display_size = 192
+    else:
+        detail_source_size = min(128, source_width, source_height)
+        detail_display_size = 256
+    detail_captions = []
+    for map_name in detail_maps:
+        comparison = map_metrics[detail_profile][map_name]["comparison"]
+        if impulse_profile_cleanup is not None:
+            cleanup_map = impulse_profile_cleanup["maps"][map_name]
+            detail_captions.append(
+                f"flags {cleanup_map['flagged_centers']}\n"
+                "outside-own-mask max Δ "
+                f"{cleanup_map['exported_change_outside_own_flags']['maximum_absolute']:.6f}"
+            )
+        elif frequency_profile_cleanup is not None:
+            cleanup_map = frequency_profile_cleanup["maps"][map_name]
+            detail_captions.append(
+                f"updates {cleanup_map['updated_entries']}\n"
+                f"consensus {cleanup_map['consensus_entries']}"
+            )
+        else:
+            detail_captions.append(
+                "gradient magnitude ratio "
+                f"{_format_ratio(comparison['guide_edge_gradient_magnitude_ratio'])}\n"
+                "signed cosine "
+                f"{_format_cosine(comparison['guide_edge_signed_gradient_cosine'])}"
+            )
+    detail_layout = _overview_pixel_detail_layout(
+        detail_maps,
+        detail_captions,
+        display_size=detail_display_size,
+        canvas_width=width,
+    )
+    detail_heading_height = 208
+    detail_caption_height = detail_layout["caption_height"]
     detail_top = material_end + 36
     detail_end = (
         detail_top
@@ -2524,7 +6098,9 @@ def _write_overview(
         + detail_caption_height
     )
 
-    olat_case = summary["representative_cases"]["olat"]
+    olat_case = summary["displayed_evaluation_cases"]["olat"]["overview"][
+        "case_id"
+    ]
     with Image.open(
         baseline_camera / "evaluation" / "olat" / "cases" / olat_case / "reference.png"
     ) as image:
@@ -2602,7 +6178,7 @@ def _write_overview(
         f"worst {worst_metric_text(cosine_distribution, ratio=False)}"
     )
     relighting_line = (
-        f"Evaluation: OLAT ΔPSNR {olat['mean_psnr']['delta']:+.3f} dB / "
+        f"Acquisition aggregate: OLAT ΔPSNR {olat['mean_psnr']['delta']:+.3f} dB / "
         f"ΔSSIM {olat['mean_ssim_global']['delta']:+.4f} · HDRI "
         f"ΔPSNR {hdri['mean_psnr']['delta']:+.3f} dB / "
         f"ΔSSIM {hdri['mean_ssim_global']['delta']:+.4f}"
@@ -2612,6 +6188,7 @@ def _write_overview(
         "texture is preserved."
     )
     cleanup = summary.get("impulse_cleanup")
+    frequency = summary.get("frequency_cleanup")
     if isinstance(cleanup, dict) and cleanup.get("available") is True:
         cleanup_aggregate = cleanup["aggregate"]
         flagged = cleanup_aggregate["flagged"]
@@ -2640,6 +6217,14 @@ def _write_overview(
             relighting_line,
             scope_line,
         ]
+    elif isinstance(frequency, dict) and frequency.get("available") is True:
+        gate_report = summary.get("scalar_map_cleanup_qualification")
+        lines = list(
+            _frequency_overview_headlines(
+                gate_report,
+                relighting_line,
+            )
+        )
     else:
         outlier_line = (
             "Quiet-region median-residual outliers (>0.05): "
@@ -2807,32 +6392,34 @@ def _write_overview(
 
     draw.text(
         (36, detail_top + 10),
-        f"Pixel detail check · {overview_profile.upper()} fit",
+        f"Pixel detail check · {detail_profile.upper()} fit",
         font=_font(43, bold=True),
         fill="white",
     )
-    draw.text(
-        (42, detail_top + 65),
-        (
-            (
-                f"Each {detail_source_size}x{detail_source_size} native crop is "
-                "centered on its densest flagged window; "
-            )
-            if impulse_artifact is not None
-            else (
-                f"Centered {detail_source_size}x{detail_source_size} source crop "
-                "shown with nearest-neighbor enlargement; "
-            )
+    if frequency_profile_cleanup is not None:
+        detail_description = (
+            "Fixed 96×96 crop x=96:192, y=160:256 enlarged 2× with "
+            "nearest-neighbor (1 source pixel = 2×2 display pixels).\n"
+            "Native 1:1 crop and full-map audit sheets remain separate."
         )
-        + "each block is one exported-map pixel.",
-        font=_font(24),
+    elif impulse_artifact is not None:
+        detail_description = (
+            f"Each {detail_source_size}×{detail_source_size} native crop is "
+            "centered on its densest flagged window and enlarged with "
+            "nearest-neighbor."
+        )
+    else:
+        detail_description = (
+            f"Centered {detail_source_size}×{detail_source_size} source crop "
+            "shown with nearest-neighbor enlargement."
+        )
+    draw.multiline_text(
+        (42, detail_top + 65),
+        detail_description,
+        font=_font(22),
         fill=(210, 210, 210),
+        spacing=6,
     )
-    detail_total_width = (
-        len(detail_maps) * 2 * detail_display_size
-        + (len(detail_maps) - 1) * detail_gap
-    )
-    detail_left = (width - detail_total_width) // 2
     centered_crop_box = (
         (source_width - detail_source_size) // 2,
         (source_height - detail_source_size) // 2,
@@ -2840,32 +6427,64 @@ def _write_overview(
         (source_height - detail_source_size) // 2 + detail_source_size,
     )
     detail_image_y = detail_top + detail_heading_height
+    card_top = detail_top + 123
+    card_bottom = (
+        detail_image_y
+        + detail_display_size
+        + detail_caption_height
+        - 4
+    )
     for map_index, map_name in enumerate(detail_maps):
-        crop_box = (
-            _densest_flagged_crop_box(
+        group = detail_layout["groups"][map_index]
+        group_x, _, group_width, _ = group["box"]
+        draw.rounded_rectangle(
+            (group_x, card_top, group_x + group_width, card_bottom),
+            radius=12,
+            fill=(20, 23, 28),
+            outline=(72, 78, 88),
+            width=2,
+        )
+        if frequency_profile_cleanup is not None:
+            crop_box = FREQUENCY_DETAIL_CROP_BOX
+        elif impulse_artifact is not None:
+            crop_box = _densest_flagged_crop_box(
                 impulse_artifact["maps"][map_name]["mask"],
                 detail_source_size,
             )
-            if impulse_artifact is not None
-            else centered_crop_box
-        )
-        group_x = detail_left + map_index * (
-            2 * detail_display_size + detail_gap
-        )
+        else:
+            crop_box = centered_crop_box
         _draw_centered_text(
             draw,
-            (group_x, detail_top + 100, 2 * detail_display_size, 30),
+            (group_x, detail_top + 129, group_width, 34),
             _display_name(map_name),
             _font(27, bold=True),
             "white",
         )
+        first_slot = group["variant_slots"][0]
+        second_slot = group["variant_slots"][1]
+        divider_x = (
+            first_slot[0]
+            + first_slot[2]
+            + second_slot[0]
+        ) // 2
+        draw.line(
+            (
+                divider_x,
+                detail_top + 170,
+                divider_x,
+                detail_image_y + detail_display_size,
+            ),
+            fill=(62, 67, 76),
+            width=2,
+        )
         for variant_index, (variant_label, camera) in enumerate(
             (("Baseline", baseline_camera), ("Regularized", regularized_camera))
         ):
-            x = group_x + variant_index * detail_display_size
+            slot_x, _, slot_width, _ = group["variant_slots"][variant_index]
+            image_x, _, _, _ = group["image_boxes"][variant_index]
             _draw_centered_text(
                 draw,
-                (x, detail_top + 130, detail_display_size, 27),
+                (slot_x, detail_top + 168, slot_width, 32),
                 variant_label,
                 _font(20, bold=True),
                 (220, 220, 220),
@@ -2873,45 +6492,37 @@ def _write_overview(
             with Image.open(
                 camera
                 / "material"
-                / overview_profile
+                / detail_profile
                 / "maps"
                 / f"{map_name}.png"
             ) as image:
-                crop = image.convert("RGB").crop(crop_box).resize(
-                    (detail_display_size, detail_display_size),
-                    Image.Resampling.NEAREST,
-                )
-            canvas.paste(crop, (x, detail_image_y))
-        comparison = map_metrics[overview_profile][map_name]["comparison"]
-        if impulse_profile_cleanup is not None:
-            cleanup_map = impulse_profile_cleanup["maps"][map_name]
-            detail_caption = (
-                f"flags {cleanup_map['flagged_centers']} · outside-own-mask max Δ "
-                f"{cleanup_map['exported_change_outside_own_flags']['maximum_absolute']:.6f}"
-            )
-        else:
-            detail_caption = (
-                "gradient magnitude ratio "
-                f"{_format_ratio(comparison['guide_edge_gradient_magnitude_ratio'])} · "
-                "signed cosine "
-                f"{_format_cosine(comparison['guide_edge_signed_gradient_cosine'])}"
-            )
-        _draw_centered_text(
+                crop = image.convert("RGB").crop(crop_box)
+                if crop.size != (detail_display_size, detail_display_size):
+                    crop = crop.resize(
+                        (detail_display_size, detail_display_size),
+                        Image.Resampling.NEAREST,
+                    )
+            canvas.paste(crop, (image_x, detail_image_y))
+        _draw_centered_multiline_text(
             draw,
             (
                 group_x,
-                detail_image_y + detail_display_size + 7,
-                2 * detail_display_size,
-                detail_caption_height - 10,
+                detail_image_y + detail_display_size + 6,
+                group_width,
+                detail_caption_height - 12,
             ),
-            detail_caption,
-            _font(21, bold=True),
+            detail_captions[map_index],
+            _font(19, bold=True),
             "white",
+            spacing=5,
         )
 
     draw.text(
         (36, evaluation_top + 10),
-        f"Relighting spot-check · {overview_profile.upper()} fit",
+        (
+            f"Relighting spot-check · {overview_profile.upper()} fit · "
+            "median ΔPSNR cases"
+        ),
         font=_font(43, bold=True),
         fill="white",
     )
@@ -2921,57 +6532,47 @@ def _write_overview(
             + evaluation_heading_height
             + lighting_index * evaluation_row_height
         )
-        case_id = summary["representative_cases"][lighting]
-        case = baseline_camera / "evaluation" / lighting / "cases" / case_id
-        include_lighting = lighting == "hdri"
-        columns = [
-            "Reference",
-            "Baseline",
-            "Regularized",
-            "Baseline error",
-            "Regularized error",
-        ]
-        panel_paths = [
-            case / "reference.png",
-            case / "predictions" / f"{overview_profile}.png",
-            regularized_camera
-            / "evaluation"
-            / lighting
-            / "cases"
-            / case_id
-            / "predictions"
-            / f"{overview_profile}.png",
-            case / "errors" / f"{overview_profile}.png",
-            regularized_camera
-            / "evaluation"
-            / lighting
-            / "cases"
-            / case_id
-            / "errors"
-            / f"{overview_profile}.png",
-        ]
-        if include_lighting:
-            columns.insert(0, "Lighting")
-            panel_paths.insert(0, case / "lighting.png")
-        evaluation_left = width - len(columns) * evaluation_tile_width - 30
-        metric_baseline = evaluation_metrics[overview_profile][lighting]["baseline"]
-        metric_regularized = evaluation_metrics[overview_profile][lighting][
-            "regularized"
-        ]
-        draw.multiline_text(
-            (36, block_y + 68),
-            (
-                f"{lighting.upper()}\n"
-                f"PSNR {metric_baseline['psnr']:.2f} → "
-                f"{metric_regularized['psnr']:.2f}\n"
-                f"SSIM {metric_baseline['ssim_global']:.3f} → "
-                f"{metric_regularized['ssim_global']:.3f}"
-            ),
-            font=_font(27, bold=True),
-            fill="white",
-            spacing=9,
+        selection = summary["displayed_evaluation_cases"][lighting]["overview"]
+        case_id = selection["case_id"]
+        displayed_case_id = (
+            case_id
+            if len(case_id) <= 31
+            else f"{case_id[:15]}…{case_id[-15:]}"
         )
-        for column, (name, path) in enumerate(zip(columns, panel_paths)):
+        case_metrics = _case_png_row(
+            summary["case_png_evaluation"],
+            lighting=lighting,
+            case_id=case_id,
+            profile=overview_profile,
+        )
+        panels = _evaluation_case_panels(
+            baseline_camera,
+            regularized_camera,
+            lighting=lighting,
+            case_id=case_id,
+            profile=overview_profile,
+        )
+        columns = [name for name, _, _ in panels]
+        evaluation_left = width - len(columns) * evaluation_tile_width - 30
+        metric_baseline = case_metrics["baseline"]
+        metric_regularized = case_metrics["regularized"]
+        draw.multiline_text(
+            (36, block_y + 56),
+            (
+                f"{lighting.upper()} · MEDIAN ΔPSNR CASE\n"
+                f"{displayed_case_id}\n"
+                f"PSNR {metric_baseline['psnr']:.2f} → "
+                f"{metric_regularized['psnr']:.2f} "
+                f"({case_metrics['delta']['psnr']:+.3f} dB)\n"
+                f"SSIM {metric_baseline['ssim_global']:.3f} → "
+                f"{metric_regularized['ssim_global']:.3f} "
+                f"({case_metrics['delta']['ssim_global']:+.4f})"
+            ),
+            font=_font(23, bold=True),
+            fill="white",
+            spacing=7,
+        )
+        for column, (name, image, contain) in enumerate(panels):
             x = evaluation_left + column * evaluation_tile_width
             _draw_centered_text(
                 draw,
@@ -2980,11 +6581,18 @@ def _write_overview(
                 _font(23, bold=True),
                 "white",
             )
-            with Image.open(path) as image:
-                panel = image.convert("RGB").resize(
+            panel = (
+                _contain_image(
+                    image,
+                    (evaluation_tile_width, evaluation_tile_height),
+                    fill=(12, 12, 12),
+                )
+                if contain
+                else image.convert("RGB").resize(
                     (evaluation_tile_width, evaluation_tile_height),
                     Image.Resampling.LANCZOS,
                 )
+            )
             canvas.paste(panel, (x, block_y + 58))
     output.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(output)
@@ -3033,16 +6641,90 @@ def _font_for_width(
     )
 
 
-def _draw_centered_text(draw, box, text, font, fill) -> None:
+def _centered_text_bounds(draw, box, text, font) -> tuple[float, float, float, float]:
     x, y, width, height = box
     bounds = draw.textbbox((0, 0), text, font=font)
     text_width = bounds[2] - bounds[0]
     text_height = bounds[3] - bounds[1]
+    origin_x = x + (width - text_width) / 2 - bounds[0]
+    origin_y = y + (height - text_height) / 2 - bounds[1]
+    return (
+        origin_x + bounds[0],
+        origin_y + bounds[1],
+        origin_x + bounds[2],
+        origin_y + bounds[3],
+    )
+
+
+def _centered_multiline_text_bounds(
+    draw,
+    box,
+    text,
+    font,
+    *,
+    spacing: int,
+) -> tuple[float, float, float, float]:
+    x, y, width, height = box
+    bounds = draw.multiline_textbbox(
+        (0, 0),
+        text,
+        font=font,
+        spacing=spacing,
+        align="center",
+    )
+    text_width = bounds[2] - bounds[0]
+    text_height = bounds[3] - bounds[1]
+    origin_x = x + (width - text_width) / 2 - bounds[0]
+    origin_y = y + (height - text_height) / 2 - bounds[1]
+    return (
+        origin_x + bounds[0],
+        origin_y + bounds[1],
+        origin_x + bounds[2],
+        origin_y + bounds[3],
+    )
+
+
+def _draw_centered_text(draw, box, text, font, fill) -> None:
+    bounds = _centered_text_bounds(draw, box, text, font)
+    raw_bounds = draw.textbbox((0, 0), text, font=font)
     draw.text(
-        (x + (width - text_width) / 2, y + (height - text_height) / 2 - bounds[1]),
+        (bounds[0] - raw_bounds[0], bounds[1] - raw_bounds[1]),
         text,
         font=font,
         fill=fill,
+    )
+
+
+def _draw_centered_multiline_text(
+    draw,
+    box,
+    text,
+    font,
+    fill,
+    *,
+    spacing: int,
+) -> None:
+    bounds = _centered_multiline_text_bounds(
+        draw,
+        box,
+        text,
+        font,
+        spacing=spacing,
+    )
+    raw_bounds = draw.multiline_textbbox(
+        (0, 0),
+        text,
+        font=font,
+        spacing=spacing,
+        align="center",
+    )
+    draw.multiline_text(
+        (bounds[0] - raw_bounds[0], bounds[1] - raw_bounds[1]),
+        text,
+        font=font,
+        fill=fill,
+        spacing=spacing,
+        align="center",
     )
 
 
@@ -3058,6 +6740,7 @@ def _display_regularizer(kind: str) -> str:
         "l1": "L1 TV",
         "edge-charbonnier": "edge-aware Charbonnier",
         "impulse-median": "post-fit impulse proximal",
+        "frequency-consensus": "post-fit frequency consensus",
     }.get(kind, kind)
 
 
@@ -3068,13 +6751,25 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     )
 
 
-def _validate_report(stage: Path, profiles: Sequence[str]) -> None:
+def _validate_report(
+    stage: Path,
+    profiles: Sequence[str],
+    *,
+    require_frequency_detail: bool = False,
+) -> None:
     required = [stage / "overview.png", stage / "summary.json", stage / "metrics.csv"]
     required.extend(stage / "material" / f"{profile}.png" for profile in profiles)
     required.extend(
         stage / "evaluation" / f"{lighting}.png"
         for lighting in EVALUATION_LIGHTING
     )
+    if require_frequency_detail:
+        required.extend(
+            (
+                stage / "material" / "frequency_hotspot_1to1.png",
+                stage / "material" / "frequency_fullmaps_1to1.png",
+            )
+        )
     missing = [str(path) for path in required if not path.is_file()]
     if missing:
         raise RuntimeError(f"regularization report is incomplete: {missing}")

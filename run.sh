@@ -117,7 +117,7 @@ Options:
                             Disney BRDF learning rate. Default: ${END2END_LEARNING_RATE}
   --end2end-tv-weight FLOAT
                             Masked scalar-map regularizer weight; 0 disables it. Default: ${END2END_TV_WEIGHT}
-  --end2end-tv-kind KIND    l1, edge-charbonnier, or impulse-median. Default: ${END2END_TV_KIND}
+  --end2end-tv-kind KIND    l1, edge-charbonnier, impulse-median, or frequency-consensus. Default: ${END2END_TV_KIND}
   --end2end-eval-lights N  OLATs held out for relighting evaluation. Default: ${END2END_EVAL_LIGHTS}
   --end2end-profiles LIST   Independent olat,hdri,mix fits; comma-separated or all. Default: ${END2END_PROFILES}
   --end2end-hdri-root PATH HDR/EXR maps used to synthesize environment targets. Default: ${END2END_HDRI_ROOT}
@@ -288,8 +288,8 @@ parse_args() {
     exit 2
   fi
   case "${END2END_TV_KIND}" in
-    l1|edge-charbonnier|impulse-median) ;;
-    *) echo "--end2end-tv-kind must be l1, edge-charbonnier, or impulse-median; got: ${END2END_TV_KIND}" >&2; exit 2 ;;
+    l1|edge-charbonnier|impulse-median|frequency-consensus) ;;
+    *) echo "--end2end-tv-kind must be l1, edge-charbonnier, impulse-median, or frequency-consensus; got: ${END2END_TV_KIND}" >&2; exit 2 ;;
   esac
   if ! [[ "${END2END_HDRI_COUNT}" =~ ^[1-9][0-9]*$ ]]; then
     echo "--end2end-hdri-count must be a positive integer; got: ${END2END_HDRI_COUNT}" >&2
@@ -674,6 +674,14 @@ ensure_data_for_all() {
 }
 
 process_materials() {
+  if [[ "${MATERIAL_ACQUISITION}" == "end2end" \
+    && -z "${SLURM_JOB_ID:-}" \
+    && "${ICTPOLARREAL_SLURM_WORKER:-0}" != "1" ]]; then
+    echo "[slurm] End-to-end material acquisition must run inside a Slurm" \
+      "allocation. Re-run process with --slurm (or inspect it first with" \
+      "--slurm-dry-run)." >&2
+    return 2
+  fi
   cd "${REPO_ROOT}"
   activate_env || true
   local light_root_args=()

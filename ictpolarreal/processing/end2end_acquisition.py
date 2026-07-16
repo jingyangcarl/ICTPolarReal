@@ -56,7 +56,12 @@ DISNEY_TV_SCALAR_NAMES = (
     "clearcoat",
     "clearcoatGloss",
 )
-TV_KINDS = ("l1", "edge-charbonnier", "impulse-median")
+TV_KINDS = (
+    "l1",
+    "edge-charbonnier",
+    "impulse-median",
+    "frequency-consensus",
+)
 EDGE_CHARBONNIER_EPSILON = 0.02
 EDGE_CHARBONNIER_ALBEDO_SIGMA = 0.05
 EDGE_CHARBONNIER_NORMAL_SIGMA = 0.02
@@ -72,6 +77,22 @@ IMPULSE_MEDIAN_ALBEDO_EDGE_THRESHOLD = 0.05
 IMPULSE_MEDIAN_NORMAL_EDGE_THRESHOLD = 0.02
 IMPULSE_PROXIMAL_LOGIT_EPSILON = 1e-6
 IMPULSE_FROZEN_ARTIFACT_NAME = "impulse_median_frozen.npz"
+FREQUENCY_CONSENSUS_REFERENCE_WEIGHT = 1.25e-3
+FREQUENCY_CONSENSUS_BASE_BLEND = 0.40
+FREQUENCY_CONSENSUS_EVIDENCE_THRESHOLD = 0.05
+FREQUENCY_CONSENSUS_MIN_EVIDENCE_MAPS = 2
+FREQUENCY_CONSENSUS_OWN_DEVIATION = 0.025
+FREQUENCY_CONSENSUS_MEDIAN3_TARGET_WEIGHT = 0.90
+FREQUENCY_CONSENSUS_MEDIAN7_TARGET_WEIGHT = 0.10
+FREQUENCY_CONSENSUS_ALBEDO_SIGMA = 0.05
+FREQUENCY_CONSENSUS_NORMAL_SIGMA = 0.02
+FREQUENCY_CONSENSUS_SPATIAL_SIGMA3 = 1.0
+FREQUENCY_CONSENSUS_SPATIAL_SIGMA7 = 2.5
+FREQUENCY_CONSENSUS_EDGE_PERCENTILE = 80.0
+FREQUENCY_CONSENSUS_MAX_CHUNK_SAMPLES = 1 << 22
+FREQUENCY_CONSENSUS_LOGIT_EPSILON = 1e-6
+FREQUENCY_CONSENSUS_EVALUATION_MEAN_MSE_TOLERANCE = 1e-8
+FREQUENCY_FROZEN_ARTIFACT_NAME = "frequency_consensus_frozen.npz"
 REPORT_PROFILES = ("olat", "hdri", "mix")
 ERROR_HEATMAP_MAX = 0.25
 
@@ -682,6 +703,11 @@ def _fit_disney_profile(
         enabled=tv_kind == "impulse-median" and tv_weight > 0.0,
         shrink_per_iteration=tv_weight,
     )
+    frequency_stage = _frequency_consensus_stage_plan(
+        steps,
+        enabled=tv_kind == "frequency-consensus" and tv_weight > 0.0,
+        weight=tv_weight,
+    )
     edge_pair_weights = None
     if tv_kind == "edge-charbonnier":
         edge_pair_weights = _edge_aware_pair_weights(
@@ -696,6 +722,10 @@ def _fit_disney_profile(
     impulse_median_bundle = None
     impulse_cleanup_applied = False
     impulse_cleanup_diagnostic = None
+    frequency_consensus_bundle = None
+    frequency_cleanup_applied = False
+    frequency_cleanup_diagnostic = None
+    pre_cleanup_evaluation_losses = None
 
     def render_olat(stack_index: int):
         prediction, _, _ = model(
@@ -732,6 +762,24 @@ def _fit_disney_profile(
         residual = (render_hdri(condition_index, evaluation=evaluation) - target) * mask_chw
         return residual.square().sum() / foreground_values
 
+    def evaluation_loss_snapshot() -> dict[str, list[float]]:
+        was_training = model.training
+        model.eval()
+        try:
+            with torch.no_grad():
+                return {
+                    "olat": [
+                        float(olat_loss(int(index)).cpu())
+                        for index in evaluation_indices
+                    ],
+                    "hdri": [
+                        float(hdri_loss(index, evaluation=True).cpu())
+                        for index in range(len(hdri_evaluation_conditions))
+                    ],
+                }
+        finally:
+            model.train(was_training)
+
     def scalar_total_variation():
         return _masked_disney_scalar_total_variation(
             torch,
@@ -764,7 +812,7 @@ def _fit_disney_profile(
     checkpoint_path = checkpoint_dir / "latest.pt"
     checkpoint_temp_path = checkpoint_dir / "latest.tmp"
     signature = {
-        "schema": "ictpolarreal.end2end-checkpoint.v12",
+        "schema": "ictpolarreal.end2end-checkpoint.v13",
         "profile": profile,
         "model": MODEL_NAME,
         "height": height,
@@ -793,8 +841,14 @@ def _fit_disney_profile(
             "parameters": list(DISNEY_TV_SCALAR_NAMES),
             "settings": regularization_settings,
             **(
-                {"stage_plan": impulse_stage}
-                if tv_kind == "impulse-median"
+                {
+                    "stage_plan": (
+                        impulse_stage
+                        if tv_kind == "impulse-median"
+                        else frequency_stage
+                    )
+                }
+                if tv_kind in {"impulse-median", "frequency-consensus"}
                 else {}
             ),
         },
@@ -838,6 +892,9 @@ def _fit_disney_profile(
                 f"Checkpoint {checkpoint_path} has invalid next_step={start_step}"
             )
         initial_evaluation_losses = checkpoint["initial_evaluation_losses"]
+        pre_cleanup_evaluation_losses = checkpoint.get(
+            "pre_cleanup_evaluation_losses"
+        )
         try:
             (
                 impulse_median_bundle,
@@ -850,25 +907,37 @@ def _fit_disney_profile(
                 next_step=start_step,
                 expected_shape=(height, width),
             )
+            (
+                frequency_consensus_bundle,
+                frequency_cleanup_applied,
+                frequency_cleanup_diagnostic,
+            ) = _checkpoint_frequency_consensus_state(
+                torch,
+                checkpoint,
+                frequency_stage,
+                next_step=start_step,
+                expected_shape=(height, width),
+                model=model,
+            )
+            if frequency_stage["enabled"] and start_step >= steps:
+                _validate_frequency_evaluation_snapshot(
+                    pre_cleanup_evaluation_losses,
+                    label="pre-cleanup checkpoint",
+                )
+            elif pre_cleanup_evaluation_losses is not None:
+                raise ValueError(
+                    "checkpoint contains pre-cleanup evaluation before frequency boundary"
+                )
         except ValueError as exc:
             raise RuntimeError(
                 f"Checkpoint {checkpoint_path} cannot resume the frozen "
-                "impulse-median stage"
+                f"{tv_kind} stage"
             ) from exc
         print(
             f"[end2end:{profile}] resuming at iteration {start_step}/{steps}", flush=True
         )
     if initial_evaluation_losses is None:
-        with torch.no_grad():
-            initial_evaluation_losses = {
-                "olat": [
-                    float(olat_loss(int(index)).cpu()) for index in evaluation_indices
-                ],
-                "hdri": [
-                    float(hdri_loss(index, evaluation=True).cpu())
-                    for index in range(len(hdri_evaluation_conditions))
-                ],
-            }
+        initial_evaluation_losses = evaluation_loss_snapshot()
 
     def save_checkpoint(next_step: int) -> None:
         torch.save(
@@ -881,6 +950,10 @@ def _fit_disney_profile(
                 "impulse_median_bundle": impulse_median_bundle,
                 "impulse_cleanup_applied": impulse_cleanup_applied,
                 "impulse_cleanup_diagnostic": impulse_cleanup_diagnostic,
+                "frequency_consensus_bundle": frequency_consensus_bundle,
+                "frequency_cleanup_applied": frequency_cleanup_applied,
+                "frequency_cleanup_diagnostic": frequency_cleanup_diagnostic,
+                "pre_cleanup_evaluation_losses": pre_cleanup_evaluation_losses,
             },
             checkpoint_temp_path,
         )
@@ -909,6 +982,33 @@ def _fit_disney_profile(
             f"{impulse_stage['detector_after_data_step']}/{steps}: froze "
             f"{total_flagged} centers ({counts}); "
             "data optimization is complete",
+            flush=True,
+        )
+
+    def freeze_frequency_consensus_bundle() -> None:
+        nonlocal frequency_consensus_bundle
+        frequency_consensus_bundle = _build_frequency_consensus_bundle(
+            torch,
+            model,
+            mask_hwc,
+            torch.as_tensor(base_color, device=device),
+            torch.as_tensor(normal, device=device),
+            created_after_step=frequency_stage["detector_after_data_step"],
+            strength=frequency_stage["strength"],
+        )
+        total_updated = sum(
+            entry["updated_count"]
+            for entry in frequency_consensus_bundle["maps"].values()
+        )
+        total_consensus = sum(
+            entry["consensus_count"]
+            for entry in frequency_consensus_bundle["maps"].values()
+        )
+        print(
+            f"[end2end:{profile}] frequency-consensus post-fit detector at "
+            f"{frequency_stage['detector_after_data_step']}/{steps}: froze "
+            f"{total_updated} updates ({total_consensus} cross-map consensus); "
+            f"strength={frequency_stage['strength']:.4f}; data optimization is complete",
             flush=True,
         )
 
@@ -947,6 +1047,13 @@ def _fit_disney_profile(
             f"(total={impulse_stage['total_shrink']:.7g})",
             flush=True,
         )
+    if frequency_stage["enabled"]:
+        print(
+            f"[end2end:{profile}] frequency-consensus plan: {steps} data-only "
+            "Adam iterations, then one deterministic frozen post-fit update at "
+            f"strength={frequency_stage['strength']:.4f}; no cleanup optimizer steps",
+            flush=True,
+        )
     model.train()
     for step in range(start_step, steps):
         progress = step / max(steps - 1, 1)
@@ -960,9 +1067,10 @@ def _fit_disney_profile(
             data_loss = olat_loss(final_index)
         else:
             data_loss = hdri_loss(final_index, evaluation=False)
-        stage_label = "data-fit" if tv_kind == "impulse-median" else "joint"
+        post_fit_kind = tv_kind in {"impulse-median", "frequency-consensus"}
+        stage_label = "data-fit" if post_fit_kind else "joint"
         regularization_active = (
-            tv_weight > 0.0 and tv_kind != "impulse-median"
+            tv_weight > 0.0 and not post_fit_kind
         )
         regularization_loss = (
             scalar_regularization()
@@ -984,7 +1092,7 @@ def _fit_disney_profile(
         final_regularization_loss = float(regularization_loss.detach().cpu())
         final_objective = float(objective.detach().cpu())
         if step == 0 or (step + 1) % log_every == 0 or step + 1 == steps:
-            if tv_kind == "impulse-median":
+            if post_fit_kind:
                 print(
                     f"[end2end:{profile}] iteration {step + 1}/{steps} "
                     f"stage={stage_label} kind={final_kind} {final_label} "
@@ -1002,9 +1110,16 @@ def _fit_disney_profile(
                     f"lr={optimizer.param_groups[0]['lr']:.3e}",
                     flush=True,
                 )
-        reached_data_fit_boundary = impulse_stage["enabled"] and step + 1 == steps
+        reached_data_fit_boundary = (
+            (impulse_stage["enabled"] or frequency_stage["enabled"])
+            and step + 1 == steps
+        )
         if reached_data_fit_boundary:
-            freeze_impulse_median_bundle()
+            if impulse_stage["enabled"]:
+                freeze_impulse_median_bundle()
+            else:
+                pre_cleanup_evaluation_losses = evaluation_loss_snapshot()
+                freeze_frequency_consensus_bundle()
             save_checkpoint(step + 1)
         elif (step + 1) % checkpoint_every == 0 or step + 1 == steps:
             save_checkpoint(step + 1)
@@ -1029,6 +1144,29 @@ def _fit_disney_profile(
             f"{impulse_cleanup_diagnostic['flagged_centers']} "
             f"mean_distance={impulse_cleanup_diagnostic['mean_distance_before']:.7f}"
             f"->{impulse_cleanup_diagnostic['mean_distance_after']:.7f}; "
+            "no data gradients or optimizer steps",
+            flush=True,
+        )
+
+    if frequency_stage["enabled"] and not frequency_cleanup_applied:
+        if frequency_consensus_bundle is None:
+            raise RuntimeError(
+                f"{profile} frequency-consensus cleanup reached post-fit stage "
+                "without a frozen bundle"
+            )
+        frequency_cleanup_diagnostic = _apply_frequency_consensus_update(
+            torch,
+            model,
+            frequency_consensus_bundle,
+        )
+        frequency_cleanup_applied = True
+        save_checkpoint(steps)
+        print(
+            f"[end2end:{profile}] post-fit frequency-consensus update: "
+            f"moved={frequency_cleanup_diagnostic['moved_entries']}/"
+            f"{frequency_cleanup_diagnostic['updated_entries']} "
+            f"mean_distance={frequency_cleanup_diagnostic['mean_distance_before']:.7f}"
+            f"->{frequency_cleanup_diagnostic['mean_distance_after']:.7f}; "
             "no data gradients or optimizer steps",
             flush=True,
         )
@@ -1066,7 +1204,7 @@ def _fit_disney_profile(
         else:
             final_loss = float(hdri_loss(final_index, evaluation=False).cpu())
         final_tv = float(scalar_total_variation().cpu())
-        if tv_kind == "impulse-median":
+        if tv_kind in {"impulse-median", "frequency-consensus"}:
             final_regularization_loss = 0.0
             final_objective = final_loss
         else:
@@ -1079,7 +1217,15 @@ def _fit_disney_profile(
     maps_dir = material_dir / "maps"
     _write_material_maps(maps_dir, maps, material_foreground)
     state = {name: value.detach().cpu() for name, value in model.state_dict().items()}
-    torch.save(state, material_dir / "disney_brdf.pt")
+    model_path = material_dir / "disney_brdf.pt"
+    torch.save(state, model_path)
+    model_artifact = {
+        "schema": "ictpolarreal.disney-state-artifact.v1",
+        "path": model_path.name,
+        "sha256": _file_sha256(model_path),
+        "bytes": int(model_path.stat().st_size),
+        "format": "pytorch_state_dict",
+    }
     evaluation_summary = {
         "schema": "ictpolarreal.profile-evaluation.v1",
         "profile": profile,
@@ -1095,8 +1241,49 @@ def _fit_disney_profile(
         material_dir,
         impulse_median_bundle,
     )
+    frequency_bundle_provenance = _finalize_frequency_frozen_artifact(
+        material_dir,
+        frequency_consensus_bundle,
+    )
+    frequency_evaluation_guard = None
+    if frequency_stage["enabled"]:
+        frequency_evaluation_guard = _frequency_evaluation_guard(
+            pre_cleanup_evaluation_losses,
+            {
+                "olat": [float(value) for value in olat_losses],
+                "hdri": [float(value) for value in hdri_losses],
+            },
+        )
+        _require_frequency_evaluation_guard_accepted(frequency_evaluation_guard)
+    if tv_kind == "impulse-median":
+        regularization_result = {
+            "weight_semantics": "constrained_shrink_per_cleanup_iteration",
+            "stage_plan": impulse_stage,
+            "frozen_bundle": impulse_bundle_provenance,
+            "cleanup_applied": bool(impulse_cleanup_applied),
+            "cleanup_diagnostic": impulse_cleanup_diagnostic,
+            "data_objective_only": True,
+        }
+    elif tv_kind == "frequency-consensus":
+        regularization_result = {
+            "weight_semantics": "normalized_post_fit_strength",
+            "stage_plan": frequency_stage,
+            "frozen_bundle": frequency_bundle_provenance,
+            "cleanup_applied": bool(frequency_cleanup_applied),
+            "cleanup_diagnostic": frequency_cleanup_diagnostic,
+            "evaluation_guard": frequency_evaluation_guard,
+            "data_objective_only": True,
+        }
+    else:
+        regularization_result = {
+            "weight_semantics": "objective_coefficient",
+            "final_regularization_loss": final_regularization_loss,
+            "weighted_final_regularization_loss": float(
+                tv_weight * final_regularization_loss
+            ),
+        }
     metrics = {
-        "schema": "ictpolarreal.end2end-disney.v12",
+        "schema": "ictpolarreal.end2end-disney.v13",
         "material_acquisition": "end2end",
         "lighting_profile": profile,
         "model": MODEL_NAME,
@@ -1110,6 +1297,7 @@ def _fit_disney_profile(
         "resumed_from_step": int(start_step),
         "learning_rate": float(learning_rate),
         "base_color_source": base_color_source,
+        "model_artifact": model_artifact,
         "final_training_condition_mse": final_loss,
         "final_training_objective": final_objective,
         "regularization": {
@@ -1118,24 +1306,7 @@ def _fit_disney_profile(
             "parameters": list(DISNEY_TV_SCALAR_NAMES),
             "settings": regularization_settings,
             "final_total_variation": final_tv,
-            **(
-                {
-                    "weight_semantics": "constrained_shrink_per_cleanup_iteration",
-                    "stage_plan": impulse_stage,
-                    "frozen_bundle": impulse_bundle_provenance,
-                    "cleanup_applied": bool(impulse_cleanup_applied),
-                    "cleanup_diagnostic": impulse_cleanup_diagnostic,
-                    "data_objective_only": True,
-                }
-                if tv_kind == "impulse-median"
-                else {
-                    "weight_semantics": "objective_coefficient",
-                    "final_regularization_loss": final_regularization_loss,
-                    "weighted_final_regularization_loss": float(
-                        tv_weight * final_regularization_loss
-                    ),
-                }
-            ),
+            **regularization_result,
         },
         "fit_conditions": {
             "olat": int(len(train_indices)) if profile in {"olat", "mix"} else 0,
@@ -1179,7 +1350,7 @@ def _fit_disney_profile(
         },
         "paths": {
             "material_maps": _relative_path(maps_dir, camera_dir),
-            "model": _relative_path(material_dir / "disney_brdf.pt", camera_dir),
+            "model": _relative_path(model_path, camera_dir),
             "evaluation": "evaluation",
             "evaluation_suites": {
                 "olat": "evaluation/olat",
@@ -1368,6 +1539,36 @@ def _write_combined_evaluation_csv(
     _write_metric_rows(evaluation_dir / "metrics.csv", rows)
 
 
+def _model_artifact_complete(
+    material_dir: Path,
+    acquisition: dict[str, Any],
+) -> bool:
+    checkpoint_signature = acquisition.get("checkpoint_signature")
+    requires_hashed_model = (
+        acquisition.get("schema") == "ictpolarreal.end2end-disney.v13"
+        or (
+            isinstance(checkpoint_signature, dict)
+            and checkpoint_signature.get("schema")
+            == "ictpolarreal.end2end-checkpoint.v13"
+        )
+    )
+    if not requires_hashed_model:
+        return True
+    model_artifact = acquisition.get("model_artifact")
+    model_path = material_dir / "disney_brdf.pt"
+    if not isinstance(model_artifact, dict) or not model_path.is_file():
+        return False
+    if (
+        model_artifact.get("schema") != "ictpolarreal.disney-state-artifact.v1"
+        or model_artifact.get("path") != model_path.name
+        or not isinstance(model_artifact.get("sha256"), str)
+        or not isinstance(model_artifact.get("bytes"), int)
+        or model_path.stat().st_size != model_artifact["bytes"]
+    ):
+        return False
+    return _file_sha256(model_path) == model_artifact["sha256"]
+
+
 def _profile_outputs_complete(
     material_dir: Path,
     evaluation_dir: Path,
@@ -1393,7 +1594,11 @@ def _profile_outputs_complete(
     )
     if not all(path.is_file() for path in required):
         return False
+    if not _model_artifact_complete(material_dir, acquisition):
+        return False
     if not _impulse_frozen_artifact_complete(material_dir, acquisition):
+        return False
+    if not _frequency_frozen_artifact_complete(material_dir, acquisition):
         return False
 
     staged_required = [evaluation_dir / "summary.json", evaluation_dir / "metrics.csv"]
@@ -2608,8 +2813,8 @@ def _checkpoint_signatures_match(
 def _adapter_provenance() -> dict[str, Any]:
     lighting_path = Path(__file__).resolve().with_name("lighting_profiles.py")
     return {
-        "schema": "ictpolarreal.profile-acquisition-adapter.v6",
-        "algorithm_version": "ictpolarreal-impulse-proximal-v5",
+        "schema": "ictpolarreal.profile-acquisition-adapter.v7",
+        "algorithm_version": "ictpolarreal-frequency-consensus-v1",
         "lighting_profiles_sha256": hashlib.sha256(
             lighting_path.read_bytes()
         ).hexdigest(),
@@ -2811,6 +3016,57 @@ def _regularization_settings(kind: str) -> dict[str, Any]:
                 "- normal_difference/normal_sigma)"
             ),
         }
+    if kind == "frequency-consensus":
+        return {
+            "map_domain": "constrained_0_1_full_precision",
+            "stage": "full_data_fit_then_one_frozen_frequency_consensus_update",
+            "data_optimizer": "original Adam cosine schedule on data loss only",
+            "detector_boundary": "after_all_data_fit_steps",
+            "cleanup_optimizer_steps": 0,
+            "guide": "full_precision_normalized_albedo_and_normal",
+            "foreground": "exact_fit_foreground",
+            "weighted_median_windows": [3, 7],
+            "weighted_median_formula": (
+                "fit_mask*exp(-distance_squared/(2*spatial_sigma_squared)"
+                "-mean_abs_albedo_difference/albedo_sigma"
+                "-(1-normal_cosine)/normal_sigma)"
+            ),
+            "spatial_sigma3": FREQUENCY_CONSENSUS_SPATIAL_SIGMA3,
+            "spatial_sigma7": FREQUENCY_CONSENSUS_SPATIAL_SIGMA7,
+            "albedo_sigma": FREQUENCY_CONSENSUS_ALBEDO_SIGMA,
+            "normal_sigma": FREQUENCY_CONSENSUS_NORMAL_SIGMA,
+            "weighted_median_execution": "deterministic_row_chunked_unfold_sort",
+            "maximum_chunk_samples": FREQUENCY_CONSENSUS_MAX_CHUNK_SAMPLES,
+            "edge_score": (
+                "mean_abs_albedo_difference/albedo_sigma"
+                "+(1-normal_cosine)/normal_sigma"
+            ),
+            "edge_percentile": FREQUENCY_CONSENSUS_EDGE_PERCENTILE,
+            "edge_guides": [
+                "full_precision_normalized_albedo_and_normal",
+                "exact_png_quantized_exported_baseColor_and_normal",
+            ],
+            "edge_rule": (
+                "freeze_union_of_both_endpoints_from_full_precision_and_"
+                "png_quantized_edge_pairs"
+            ),
+            "base_target": (
+                f"value+{FREQUENCY_CONSENSUS_BASE_BLEND:g}*(median3-value)"
+            ),
+            "cross_map_evidence": (
+                f"count(abs(value-median7)>{FREQUENCY_CONSENSUS_EVIDENCE_THRESHOLD:g})"
+            ),
+            "minimum_evidence_maps": FREQUENCY_CONSENSUS_MIN_EVIDENCE_MAPS,
+            "own_deviation_threshold": FREQUENCY_CONSENSUS_OWN_DEVIATION,
+            "consensus_target": (
+                f"{FREQUENCY_CONSENSUS_MEDIAN3_TARGET_WEIGHT:g}*median3+"
+                f"{FREQUENCY_CONSENSUS_MEDIAN7_TARGET_WEIGHT:g}*median7"
+            ),
+            "weight_reference": FREQUENCY_CONSENSUS_REFERENCE_WEIGHT,
+            "strength_formula": "min(max(tv_weight/weight_reference,0),1)",
+            "update": "one_exact_logit_assignment_to_frozen_target",
+            "outside_update_mask": "raw_parameter_bit_identical_to_data_fit",
+        }
     return {
         "map_domain": "constrained_0_1",
         "stage": "full_data_fit_then_post_fit_frozen_impulse_proximal",
@@ -2884,11 +3140,131 @@ def _impulse_median_stage_plan(
     }
 
 
+def _frequency_consensus_stage_plan(
+    steps: int,
+    *,
+    enabled: bool,
+    weight: float = 0.0,
+) -> dict[str, Any]:
+    if steps <= 0:
+        raise ValueError("end2end steps must be a positive integer")
+    if not math.isfinite(weight) or weight < 0.0:
+        raise ValueError("frequency-consensus weight must be finite and non-negative")
+    strength = (
+        min(weight / FREQUENCY_CONSENSUS_REFERENCE_WEIGHT, 1.0)
+        if enabled
+        else 0.0
+    )
+    return {
+        "enabled": bool(enabled),
+        "data_fit_steps": int(steps),
+        "detector_after_data_step": int(steps) if enabled else None,
+        "post_fit_updates": 1 if enabled else 0,
+        "weight_reference": float(FREQUENCY_CONSENSUS_REFERENCE_WEIGHT),
+        "strength": float(strength),
+        "cleanup_optimizer_steps": 0,
+    }
+
+
 def _final_regularization_value(scalar_regularization, *, weight: float) -> float:
     """Evaluate a fitted regularizer only when it contributes to the objective."""
     if weight == 0.0:
         return 0.0
     return float(scalar_regularization().cpu())
+
+
+def _validate_frequency_evaluation_snapshot(snapshot, *, label: str) -> None:
+    if not isinstance(snapshot, dict) or set(snapshot) != {"olat", "hdri"}:
+        raise ValueError(f"frequency-consensus {label} has invalid suites")
+    for suite in ("olat", "hdri"):
+        losses = snapshot[suite]
+        if (
+            not isinstance(losses, list)
+            or not losses
+            or any(
+                not isinstance(value, float)
+                or not math.isfinite(value)
+                or value < 0.0
+                for value in losses
+            )
+        ):
+            raise ValueError(f"frequency-consensus {label} {suite} losses are invalid")
+
+
+def _frequency_evaluation_guard(pre_cleanup, post_cleanup) -> dict[str, Any]:
+    _validate_frequency_evaluation_snapshot(pre_cleanup, label="pre-cleanup")
+    _validate_frequency_evaluation_snapshot(post_cleanup, label="post-cleanup")
+    suites = {}
+    for name in ("olat", "hdri"):
+        before = pre_cleanup[name]
+        after = post_cleanup[name]
+        if len(before) != len(after):
+            raise ValueError(
+                f"frequency-consensus {name} heldout count changed across cleanup"
+            )
+        deltas = [float(post - pre) for pre, post in zip(before, after)]
+        before_mean = float(np.mean(before)) if before else 0.0
+        after_mean = float(np.mean(after)) if after else 0.0
+        suites[name] = {
+            "pre_cleanup_mse": list(before),
+            "post_cleanup_mse": list(after),
+            "post_minus_pre_mse": deltas,
+            "pre_cleanup_mean_mse": before_mean,
+            "post_cleanup_mean_mse": after_mean,
+            "post_minus_pre_mean_mse": float(after_mean - before_mean),
+            "worsened": bool(after_mean > before_mean),
+        }
+    return {
+        "schema": "ictpolarreal.frequency-consensus-evaluation-guard.v1",
+        "same_checkpoint": True,
+        "suites": suites,
+    }
+
+
+def _frequency_evaluation_guard_regressed_suites(guard) -> list[str] | None:
+    suites = guard.get("suites") if isinstance(guard, dict) else None
+    if not isinstance(suites, dict):
+        return None
+    # Keep the v13 serialized guard unchanged so profiles produced by jobs
+    # already in flight remain directly comparable.  Its stored losses and
+    # means are sufficient to derive this validator-only acceptance rule.
+    tolerance = FREQUENCY_CONSENSUS_EVALUATION_MEAN_MSE_TOLERANCE
+    regressed = []
+    for name in ("olat", "hdri"):
+        record = suites.get(name)
+        if not isinstance(record, dict):
+            return None
+        before_mean = record.get("pre_cleanup_mean_mse")
+        after_mean = record.get("post_cleanup_mean_mse")
+        if (
+            not isinstance(before_mean, float)
+            or not isinstance(after_mean, float)
+            or not math.isfinite(before_mean)
+            or not math.isfinite(after_mean)
+            or before_mean < 0.0
+            or after_mean < 0.0
+        ):
+            return None
+        if after_mean - before_mean > tolerance:
+            regressed.append(name)
+    return regressed
+
+
+def _require_frequency_evaluation_guard_accepted(guard) -> None:
+    regressed = _frequency_evaluation_guard_regressed_suites(guard)
+    if regressed is None:
+        raise RuntimeError(
+            "frequency-consensus same-checkpoint evaluation guard is invalid"
+        )
+    if regressed:
+        details = ", ".join(
+            f"{name}={guard['suites'][name]['post_minus_pre_mean_mse']:+.9g}"
+            for name in regressed
+        )
+        raise RuntimeError(
+            "frequency-consensus cleanup worsened heldout mean MSE beyond "
+            f"{FREQUENCY_CONSENSUS_EVALUATION_MEAN_MSE_TOLERANCE:.1e}: {details}"
+        )
 
 
 def _checkpoint_impulse_median_state(
@@ -2928,6 +3304,133 @@ def _checkpoint_impulse_median_state(
     if not cleanup_applied and cleanup_diagnostic is not None:
         raise ValueError("pending impulse cleanup has a premature diagnostic")
     return bundle, cleanup_applied, cleanup_diagnostic
+
+
+def _checkpoint_frequency_consensus_state(
+    torch,
+    checkpoint: dict[str, Any],
+    stage_plan: dict[str, Any],
+    *,
+    next_step: int,
+    expected_shape: tuple[int, int],
+    model=None,
+):
+    bundle = checkpoint.get("frequency_consensus_bundle")
+    cleanup_applied = checkpoint.get("frequency_cleanup_applied", False)
+    cleanup_diagnostic = checkpoint.get("frequency_cleanup_diagnostic")
+    if not isinstance(cleanup_applied, bool):
+        raise ValueError("checkpoint frequency-consensus cleanup state must be boolean")
+    if not stage_plan["enabled"]:
+        if bundle is not None or cleanup_applied or cleanup_diagnostic is not None:
+            raise ValueError(
+                "checkpoint contains frequency-consensus state for a disabled stage"
+            )
+        return None, False, None
+    boundary = int(stage_plan["data_fit_steps"])
+    if next_step < boundary:
+        if bundle is not None or cleanup_applied or cleanup_diagnostic is not None:
+            raise ValueError(
+                "checkpoint contains frequency-consensus state before data fit completed"
+            )
+        return None, False, None
+    _validate_frequency_consensus_bundle(
+        torch,
+        bundle,
+        expected_shape=expected_shape,
+        expected_created_after_step=boundary,
+        expected_strength=float(stage_plan["strength"]),
+    )
+    if cleanup_applied:
+        _validate_frequency_cleanup_diagnostic(cleanup_diagnostic, bundle)
+        if model is None:
+            raise ValueError(
+                "applied frequency-consensus checkpoint requires loaded model validation"
+            )
+        _validate_frequency_applied_model(torch, model, bundle)
+    if not cleanup_applied and cleanup_diagnostic is not None:
+        raise ValueError("pending frequency-consensus cleanup has a premature diagnostic")
+    return bundle, cleanup_applied, cleanup_diagnostic
+
+
+def _validate_frequency_cleanup_diagnostic(diagnostic, bundle) -> None:
+    if not isinstance(diagnostic, dict) or diagnostic.get("schema") != (
+        "ictpolarreal.frequency-consensus-diagnostic.v1"
+    ):
+        raise ValueError("applied frequency-consensus cleanup has invalid diagnostic")
+    total_updated = sum(
+        entry["updated_count"] for entry in bundle["maps"].values()
+    )
+    total_consensus = sum(
+        entry["consensus_count"] for entry in bundle["maps"].values()
+    )
+    if diagnostic.get("strength") != bundle["strength"]:
+        raise ValueError("frequency-consensus diagnostic strength is stale")
+    if diagnostic.get("updated_entries") != total_updated:
+        raise ValueError("frequency-consensus diagnostic updated count is stale")
+    if diagnostic.get("consensus_entries") != total_consensus:
+        raise ValueError("frequency-consensus diagnostic consensus count is stale")
+    moved = diagnostic.get("moved_entries")
+    if not isinstance(moved, int) or not 0 <= moved <= total_updated:
+        raise ValueError("frequency-consensus diagnostic moved count is invalid")
+    for key in ("mean_distance_before", "mean_distance_after"):
+        value = diagnostic.get(key)
+        if not isinstance(value, float) or not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"frequency-consensus diagnostic {key} is invalid")
+    maps = diagnostic.get("maps")
+    if not isinstance(maps, dict) or set(maps) != set(DISNEY_TV_SCALAR_NAMES):
+        raise ValueError("frequency-consensus diagnostic has wrong scalar maps")
+    moved_sum = 0
+    for name in DISNEY_TV_SCALAR_NAMES:
+        record = maps[name]
+        entry = bundle["maps"][name]
+        if not isinstance(record, dict):
+            raise ValueError(f"frequency-consensus diagnostic map {name} is invalid")
+        if record.get("updated_entries") != entry["updated_count"]:
+            raise ValueError(f"frequency-consensus diagnostic update count {name} is stale")
+        if record.get("consensus_entries") != entry["consensus_count"]:
+            raise ValueError(
+                f"frequency-consensus diagnostic consensus count {name} is stale"
+            )
+        map_moved = record.get("moved_entries")
+        if not isinstance(map_moved, int) or not 0 <= map_moved <= entry["updated_count"]:
+            raise ValueError(f"frequency-consensus diagnostic moved count {name} is invalid")
+        moved_sum += map_moved
+        for key in ("mean_distance_before", "mean_distance_after"):
+            value = record.get(key)
+            if not isinstance(value, float) or not math.isfinite(value) or value < 0.0:
+                raise ValueError(
+                    f"frequency-consensus diagnostic {key} {name} is invalid"
+                )
+    if moved_sum != moved:
+        raise ValueError("frequency-consensus diagnostic per-map moved counts are stale")
+
+
+def _validate_frequency_applied_model(torch, model, bundle) -> None:
+    constrained = model._param_maps()
+    for name in DISNEY_TV_SCALAR_NAMES:
+        scalar = constrained[name]
+        if scalar.ndim == 3 and scalar.shape[-1] == 1:
+            scalar = scalar[..., 0]
+        entry = bundle["maps"][name]
+        source = entry["source"].to(device=scalar.device, dtype=scalar.dtype)
+        target = entry["target"].to(device=scalar.device, dtype=scalar.dtype)
+        update_mask = entry["mask"].to(device=scalar.device)
+        if not torch.equal(scalar[~update_mask], source[~update_mask]):
+            raise ValueError(
+                f"applied frequency-consensus model changed source outside mask {name}"
+            )
+        bounded = target[update_mask].clamp(
+            FREQUENCY_CONSENSUS_LOGIT_EPSILON,
+            1.0 - FREQUENCY_CONSENSUS_LOGIT_EPSILON,
+        )
+        expected = torch.sigmoid(torch.logit(bounded))
+        tolerance = max(float(torch.finfo(scalar.dtype).eps) * 4.0, 1e-7)
+        if not torch.allclose(
+            scalar[update_mask], expected, rtol=0.0, atol=tolerance
+        ):
+            raise ValueError(
+                f"applied frequency-consensus model does not match target {name}"
+            )
 
 
 def _fit_pair_masks(mask_hwc):
@@ -3022,6 +3525,967 @@ def _window_patches(torch, values, window_size: int):
     return unfolded[0].transpose(0, 1).reshape(
         height, width, channels, window_size * window_size
     )
+
+
+def _weighted_samples_median(torch, patches, weights):
+    if tuple(weights.shape) != tuple(patches.shape):
+        raise ValueError(
+            f"weighted median weights must have shape {tuple(patches.shape)}, "
+            f"got {tuple(weights.shape)}"
+        )
+    sorted_values, order = patches.sort(dim=-1)
+    sorted_weights = weights.gather(-1, order)
+    cumulative = sorted_weights.cumsum(dim=-1)
+    cutoff = 0.5 * cumulative[..., -1:]
+    index = (cumulative >= cutoff).to(dtype=torch.int64).argmax(dim=-1)
+    return sorted_values.gather(-1, index.unsqueeze(-1))[..., 0]
+
+
+def _frequency_consensus_chunk_rows(width: int, window_size: int) -> int:
+    if width <= 0:
+        raise ValueError("frequency-consensus width must be positive")
+    if window_size <= 0 or window_size % 2 != 1:
+        raise ValueError("frequency-consensus window must be a positive odd integer")
+    samples_per_row = width * window_size * window_size
+    return max(1, FREQUENCY_CONSENSUS_MAX_CHUNK_SAMPLES // samples_per_row)
+
+
+def _row_chunk_window_patches(torch, values, window_size: int, y0: int, y1: int):
+    height = values.shape[0]
+    radius = window_size // 2
+    source_start = max(0, y0 - radius)
+    source_stop = min(height, y1 + radius)
+    slab = values[source_start:source_stop]
+    slab_patches = _window_patches(torch, slab, window_size)
+    center_start = y0 - source_start
+    return slab_patches[center_start : center_start + (y1 - y0)]
+
+
+def _joint_guide_weighted_median_chunked(
+    torch,
+    scalar,
+    foreground,
+    albedo,
+    normal,
+    *,
+    window_size: int,
+    spatial_sigma: float,
+):
+    height, width = scalar.shape
+    chunk_rows = _frequency_consensus_chunk_rows(width, window_size)
+    output = torch.empty_like(scalar)
+    radius = window_size // 2
+    coordinate = torch.arange(
+        -radius,
+        radius + 1,
+        dtype=scalar.dtype,
+        device=scalar.device,
+    )
+    yy, xx = torch.meshgrid(coordinate, coordinate, indexing="ij")
+    spatial = (xx.square() + yy.square()).reshape(-1) / (
+        2.0 * spatial_sigma * spatial_sigma
+    )
+    foreground_float = foreground.to(dtype=scalar.dtype)
+    for y0 in range(0, height, chunk_rows):
+        y1 = min(height, y0 + chunk_rows)
+        scalar_patches = _row_chunk_window_patches(
+            torch, scalar, window_size, y0, y1
+        )[..., 0, :]
+        mask_patches = _row_chunk_window_patches(
+            torch, foreground_float, window_size, y0, y1
+        )[..., 0, :]
+        albedo_patches = _row_chunk_window_patches(
+            torch, albedo, window_size, y0, y1
+        )
+        normal_patches = _row_chunk_window_patches(
+            torch, normal, window_size, y0, y1
+        )
+        center_albedo = albedo[y0:y1].unsqueeze(-1)
+        center_normal = normal[y0:y1].unsqueeze(-1)
+        albedo_difference = (albedo_patches - center_albedo).abs().mean(dim=2)
+        normal_difference = (
+            1.0
+            - (normal_patches * center_normal).sum(dim=2).clamp(-1.0, 1.0)
+        ).clamp_min(0.0)
+        weights = mask_patches * torch.exp(
+            -spatial
+            - albedo_difference / FREQUENCY_CONSENSUS_ALBEDO_SIGMA
+            - normal_difference / FREQUENCY_CONSENSUS_NORMAL_SIGMA
+        )
+        output[y0:y1] = _weighted_samples_median(
+            torch, scalar_patches, weights
+        )
+    return output, min(height, chunk_rows)
+
+
+def _frequency_consensus_guide_state(
+    torch,
+    mask_hwc,
+    albedo_hwc,
+    normal_hwc,
+):
+    mask = mask_hwc.detach()
+    if mask.ndim == 3 and mask.shape[-1] == 1:
+        mask = mask[..., 0]
+    if mask.ndim != 2:
+        raise ValueError(
+            "frequency-consensus mask must have shape (H,W) or (H,W,1), "
+            f"got {tuple(mask_hwc.shape)}"
+        )
+    foreground = mask > 0.5
+    albedo = albedo_hwc.detach()
+    normal = normal_hwc.detach()
+    expected_guide_shape = (*foreground.shape, 3)
+    if tuple(albedo.shape) != expected_guide_shape:
+        raise ValueError(
+            f"frequency-consensus albedo guide must have shape {expected_guide_shape}, "
+            f"got {tuple(albedo.shape)}"
+        )
+    if tuple(normal.shape) != expected_guide_shape:
+        raise ValueError(
+            f"frequency-consensus normal guide must have shape {expected_guide_shape}, "
+            f"got {tuple(normal.shape)}"
+        )
+    if albedo.dtype != torch.float32 or normal.dtype != torch.float32:
+        raise ValueError("frequency-consensus guides must be full-precision float32")
+    if not bool(torch.isfinite(albedo).all()) or not bool(torch.isfinite(normal).all()):
+        raise ValueError("frequency-consensus guides must be finite")
+    normal = normal / normal.square().sum(dim=-1, keepdim=True).sqrt().clamp_min(1e-8)
+    holes = (~foreground).to(dtype=albedo.dtype)[None, None]
+    padded_holes = torch.nn.functional.pad(holes, (2, 2, 2, 2), value=1.0)
+    full5 = torch.nn.functional.max_pool2d(
+        padded_holes, kernel_size=5, stride=1
+    )[0, 0] == 0.0
+
+    horizontal_valid = full5[:, 1:] & full5[:, :-1]
+    vertical_valid = full5[1:, :] & full5[:-1, :]
+
+    def edge_state(edge_albedo, edge_normal):
+        horizontal_score = (
+            (edge_albedo[:, 1:] - edge_albedo[:, :-1]).abs().mean(dim=-1)
+            / FREQUENCY_CONSENSUS_ALBEDO_SIGMA
+            + (
+                1.0
+                - (edge_normal[:, 1:] * edge_normal[:, :-1])
+                .sum(dim=-1)
+                .clamp(-1.0, 1.0)
+            ).clamp_min(0.0)
+            / FREQUENCY_CONSENSUS_NORMAL_SIGMA
+        )
+        vertical_score = (
+            (edge_albedo[1:, :] - edge_albedo[:-1, :]).abs().mean(dim=-1)
+            / FREQUENCY_CONSENSUS_ALBEDO_SIGMA
+            + (
+                1.0
+                - (edge_normal[1:, :] * edge_normal[:-1, :])
+                .sum(dim=-1)
+                .clamp(-1.0, 1.0)
+            ).clamp_min(0.0)
+            / FREQUENCY_CONSENSUS_NORMAL_SIGMA
+        )
+        valid_scores = torch.cat(
+            [horizontal_score[horizontal_valid], vertical_score[vertical_valid]]
+        )
+        if valid_scores.numel() == 0:
+            raise ValueError("frequency-consensus foreground has no valid guide pairs")
+        threshold = torch.quantile(
+            valid_scores.float(), FREQUENCY_CONSENSUS_EDGE_PERCENTILE / 100.0
+        ).to(dtype=albedo.dtype)
+        minimum_strength = threshold.clamp_min(1e-6)
+        horizontal_edge = horizontal_valid & (horizontal_score >= minimum_strength)
+        vertical_edge = vertical_valid & (vertical_score >= minimum_strength)
+        protected = torch.zeros_like(foreground)
+        protected[:, :-1] |= horizontal_edge
+        protected[:, 1:] |= horizontal_edge
+        protected[:-1, :] |= vertical_edge
+        protected[1:, :] |= vertical_edge
+        return protected, float(threshold.detach().cpu())
+
+    edge_protected_full, edge_threshold_full = edge_state(albedo, normal)
+
+    def png_quantized_unit(values):
+        return torch.floor(values.clamp(0.0, 1.0) * 255.0 + 0.5) / 255.0
+
+    png_albedo = png_quantized_unit(albedo)
+    png_normal = png_quantized_unit(normal * 0.5 + 0.5) * 2.0 - 1.0
+    png_normal = png_normal / png_normal.square().sum(
+        dim=-1, keepdim=True
+    ).sqrt().clamp_min(1e-8)
+    edge_protected_png, edge_threshold_png = edge_state(png_albedo, png_normal)
+    edge_protected = edge_protected_full | edge_protected_png
+    # Match the accepted CPU candidate exactly: centers need a complete 5x5 fit
+    # neighborhood (radius two), while masked guide weights make the 7x7 median
+    # well-defined without allowing background samples to contribute.
+    update_safe = full5 & ~edge_protected
+    return {
+        "median_albedo": albedo,
+        "median_normal": normal,
+        "fit_foreground": foreground.detach(),
+        "full_foreground5": full5.detach(),
+        "edge_protected_full_precision": edge_protected_full.detach(),
+        "edge_protected_png_quantized": edge_protected_png.detach(),
+        "edge_protected": edge_protected.detach(),
+        "update_safe": update_safe.detach(),
+        "edge_threshold_full_precision": edge_threshold_full,
+        "edge_threshold_png_quantized": edge_threshold_png,
+    }
+
+
+def _build_frequency_consensus_bundle(
+    torch,
+    model,
+    mask_hwc,
+    albedo_hwc,
+    normal_hwc,
+    *,
+    created_after_step: int,
+    strength: float,
+):
+    if not math.isfinite(strength) or not 0.0 < strength <= 1.0:
+        raise ValueError("frequency-consensus strength must be finite and in (0,1]")
+    guide = _frequency_consensus_guide_state(
+        torch,
+        mask_hwc,
+        albedo_hwc,
+        normal_hwc,
+    )
+    expected_shape = tuple(guide["update_safe"].shape)
+    maps = {}
+    with torch.no_grad():
+        constrained = model._param_maps()
+        for name in DISNEY_TV_SCALAR_NAMES:
+            scalar = constrained[name].detach()
+            if scalar.ndim == 3 and scalar.shape[-1] == 1:
+                scalar = scalar[..., 0]
+            if scalar.ndim != 2 or tuple(scalar.shape) != expected_shape:
+                raise ValueError(
+                    f"Disney scalar {name} must have shape {expected_shape}, "
+                    f"got {tuple(scalar.shape)}"
+                )
+            source = scalar.clone()
+            median3, chunk_rows3 = _joint_guide_weighted_median_chunked(
+                torch,
+                source,
+                guide["fit_foreground"],
+                guide["median_albedo"],
+                guide["median_normal"],
+                window_size=3,
+                spatial_sigma=FREQUENCY_CONSENSUS_SPATIAL_SIGMA3,
+            )
+            median7, chunk_rows7 = _joint_guide_weighted_median_chunked(
+                torch,
+                source,
+                guide["fit_foreground"],
+                guide["median_albedo"],
+                guide["median_normal"],
+                window_size=7,
+                spatial_sigma=FREQUENCY_CONSENSUS_SPATIAL_SIGMA7,
+            )
+            maps[name] = {
+                "source": source,
+                "median3": median3,
+                "median7": median7,
+            }
+
+        evidence_count = torch.stack(
+            [
+                (maps[name]["source"] - maps[name]["median7"]).abs()
+                > FREQUENCY_CONSENSUS_EVIDENCE_THRESHOLD
+                for name in DISNEY_TV_SCALAR_NAMES
+            ]
+        ).sum(dim=0)
+        for name in DISNEY_TV_SCALAR_NAMES:
+            entry = maps[name]
+            source = entry["source"]
+            median3 = entry["median3"]
+            median7 = entry["median7"]
+            base_target = source + FREQUENCY_CONSENSUS_BASE_BLEND * (
+                median3 - source
+            )
+            consensus_mask = (
+                (evidence_count >= FREQUENCY_CONSENSUS_MIN_EVIDENCE_MAPS)
+                & ((source - median7).abs() > FREQUENCY_CONSENSUS_OWN_DEVIATION)
+                & guide["update_safe"]
+            )
+            consensus_target = (
+                FREQUENCY_CONSENSUS_MEDIAN3_TARGET_WEIGHT * median3
+                + FREQUENCY_CONSENSUS_MEDIAN7_TARGET_WEIGHT * median7
+            )
+            desired = torch.where(consensus_mask, consensus_target, base_target)
+            target = torch.where(
+                guide["update_safe"],
+                source + strength * (desired - source),
+                source,
+            )
+            update_mask = guide["update_safe"] & (target != source)
+            entry.update(
+                {
+                    "target": target.detach(),
+                    "mask": update_mask.detach(),
+                    "consensus_mask": consensus_mask.detach(),
+                    "updated_count": int(update_mask.sum().item()),
+                    "consensus_count": int(consensus_mask.sum().item()),
+                }
+            )
+    bundle = {
+        "schema": "ictpolarreal.frequency-consensus-bundle.v1",
+        "created_after_step": int(created_after_step),
+        "strength": float(strength),
+        "median_chunk_rows": {
+            "3x3": int(chunk_rows3),
+            "7x7": int(chunk_rows7),
+        },
+        "edge_threshold_full_precision": guide["edge_threshold_full_precision"],
+        "edge_threshold_png_quantized": guide["edge_threshold_png_quantized"],
+        "fit_foreground": guide["fit_foreground"].detach().clone(),
+        "full_foreground5": guide["full_foreground5"].detach().clone(),
+        "edge_protected_full_precision": guide[
+            "edge_protected_full_precision"
+        ].detach().clone(),
+        "edge_protected_png_quantized": guide[
+            "edge_protected_png_quantized"
+        ].detach().clone(),
+        "edge_protected": guide["edge_protected"].detach().clone(),
+        "update_safe": guide["update_safe"].detach().clone(),
+        "evidence_count": evidence_count.detach().clone(),
+        "maps": maps,
+    }
+    bundle["tensor_hashes"] = _frequency_consensus_tensor_hashes(bundle)
+    _validate_frequency_consensus_bundle(
+        torch,
+        bundle,
+        expected_shape=expected_shape,
+        expected_strength=strength,
+    )
+    return bundle
+
+
+def _frequency_consensus_tensor_hashes(bundle) -> dict[str, Any]:
+    root = {}
+    for key in (
+        "fit_foreground",
+        "full_foreground5",
+        "edge_protected_full_precision",
+        "edge_protected_png_quantized",
+        "edge_protected",
+        "update_safe",
+        "evidence_count",
+    ):
+        root[key] = _array_sha256(bundle[key].detach().cpu().numpy())
+    maps = {}
+    for name in DISNEY_TV_SCALAR_NAMES:
+        entry = bundle["maps"][name]
+        maps[name] = {}
+        for key in ("source", "median3", "median7", "target"):
+            maps[name][key] = _array_sha256(
+                entry[key].detach().float().cpu().numpy()
+            )
+        for key in ("mask", "consensus_mask"):
+            maps[name][key] = _array_sha256(entry[key].detach().cpu().numpy())
+    return {"root": root, "maps": maps}
+
+
+def _validate_frequency_consensus_bundle(
+    torch,
+    bundle,
+    *,
+    expected_shape: tuple[int, int],
+    expected_created_after_step: int | None = None,
+    expected_strength: float | None = None,
+    verify_counts: bool = True,
+) -> None:
+    if not isinstance(bundle, dict) or bundle.get("schema") != (
+        "ictpolarreal.frequency-consensus-bundle.v1"
+    ):
+        raise ValueError("invalid or missing frequency-consensus frozen bundle")
+    if expected_created_after_step is not None and bundle.get(
+        "created_after_step"
+    ) != int(expected_created_after_step):
+        raise ValueError(
+            "frequency-consensus frozen bundle was created at the wrong stage boundary"
+        )
+    strength = bundle.get("strength")
+    if not isinstance(strength, float) or not 0.0 < strength <= 1.0:
+        raise ValueError("frequency-consensus frozen bundle has invalid strength")
+    if expected_strength is not None and strength != float(expected_strength):
+        raise ValueError("frequency-consensus frozen bundle has stale strength")
+    chunk_rows = bundle.get("median_chunk_rows")
+    expected_chunks = {
+        "3x3": min(
+            expected_shape[0],
+            _frequency_consensus_chunk_rows(expected_shape[1], 3),
+        ),
+        "7x7": min(
+            expected_shape[0],
+            _frequency_consensus_chunk_rows(expected_shape[1], 7),
+        ),
+    }
+    if chunk_rows != expected_chunks:
+        raise ValueError("frequency-consensus frozen bundle has stale chunk plan")
+    for key in (
+        "edge_threshold_full_precision",
+        "edge_threshold_png_quantized",
+    ):
+        value = bundle.get(key)
+        if not isinstance(value, float) or not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"frequency-consensus {key} is invalid")
+    for key in (
+        "fit_foreground",
+        "full_foreground5",
+        "edge_protected_full_precision",
+        "edge_protected_png_quantized",
+        "edge_protected",
+        "update_safe",
+    ):
+        value = bundle.get(key)
+        if (
+            not isinstance(value, torch.Tensor)
+            or tuple(value.shape) != expected_shape
+            or value.dtype != torch.bool
+            or value.requires_grad
+        ):
+            raise ValueError(f"frequency-consensus {key} mask is invalid")
+    fit_foreground = bundle["fit_foreground"]
+    holes = (~fit_foreground).to(dtype=torch.float32)[None, None]
+    expected_full5 = torch.nn.functional.max_pool2d(
+        torch.nn.functional.pad(holes, (2, 2, 2, 2), value=1.0),
+        kernel_size=5,
+        stride=1,
+    )[0, 0] == 0.0
+    if not torch.equal(bundle["full_foreground5"], expected_full5):
+        raise ValueError("frequency-consensus full-foreground mask is stale")
+    expected_edge_union = (
+        bundle["edge_protected_full_precision"]
+        | bundle["edge_protected_png_quantized"]
+    )
+    if not torch.equal(bundle["edge_protected"], expected_edge_union):
+        raise ValueError("frequency-consensus edge-protection union is stale")
+    expected_update_safe = expected_full5 & ~expected_edge_union
+    if not torch.equal(bundle["update_safe"], expected_update_safe):
+        raise ValueError("frequency-consensus update-safe mask is stale")
+    evidence_count = bundle.get("evidence_count")
+    if (
+        not isinstance(evidence_count, torch.Tensor)
+        or tuple(evidence_count.shape) != expected_shape
+        or evidence_count.dtype != torch.int64
+        or evidence_count.requires_grad
+    ):
+        raise ValueError("frequency-consensus evidence count is invalid")
+    if bool((evidence_count < 0).any()) or bool(
+        (evidence_count > len(DISNEY_TV_SCALAR_NAMES)).any()
+    ):
+        raise ValueError("frequency-consensus evidence count is out of range")
+    maps = bundle.get("maps")
+    if not isinstance(maps, dict) or set(maps) != set(DISNEY_TV_SCALAR_NAMES):
+        raise ValueError("frequency-consensus bundle has the wrong scalar maps")
+    for name in DISNEY_TV_SCALAR_NAMES:
+        entry = maps[name]
+        if not isinstance(entry, dict):
+            raise ValueError(f"frequency-consensus frozen map {name} is invalid")
+        for key in ("source", "median3", "median7", "target"):
+            value = entry.get(key)
+            if (
+                not isinstance(value, torch.Tensor)
+                or tuple(value.shape) != expected_shape
+                or value.dtype != torch.float32
+                or value.requires_grad
+                or not bool(torch.isfinite(value).all())
+                or bool((value < 0.0).any())
+                or bool((value > 1.0).any())
+            ):
+                raise ValueError(f"frequency-consensus {key} {name} is invalid")
+        for key in ("mask", "consensus_mask"):
+            value = entry.get(key)
+            if (
+                not isinstance(value, torch.Tensor)
+                or tuple(value.shape) != expected_shape
+                or value.dtype != torch.bool
+                or value.requires_grad
+            ):
+                raise ValueError(f"frequency-consensus {key} {name} is invalid")
+        for key in ("updated_count", "consensus_count"):
+            if not isinstance(entry.get(key), int) or entry[key] < 0:
+                raise ValueError(f"frequency-consensus {key} {name} is invalid")
+        if verify_counts:
+            if entry["updated_count"] != int(entry["mask"].sum().item()):
+                raise ValueError(f"frequency-consensus updated count {name} is stale")
+            if entry["consensus_count"] != int(
+                entry["consensus_mask"].sum().item()
+            ):
+                raise ValueError(f"frequency-consensus consensus count {name} is stale")
+    expected_evidence = torch.stack(
+        [
+            (maps[name]["source"] - maps[name]["median7"]).abs()
+            > FREQUENCY_CONSENSUS_EVIDENCE_THRESHOLD
+            for name in DISNEY_TV_SCALAR_NAMES
+        ]
+    ).sum(dim=0)
+    if not torch.equal(evidence_count, expected_evidence):
+        raise ValueError("frequency-consensus evidence count does not match maps")
+    for name in DISNEY_TV_SCALAR_NAMES:
+        entry = maps[name]
+        source = entry["source"]
+        median3 = entry["median3"]
+        median7 = entry["median7"]
+        expected_consensus = (
+            (evidence_count >= FREQUENCY_CONSENSUS_MIN_EVIDENCE_MAPS)
+            & ((source - median7).abs() > FREQUENCY_CONSENSUS_OWN_DEVIATION)
+            & expected_update_safe
+        )
+        if not torch.equal(entry["consensus_mask"], expected_consensus):
+            raise ValueError(f"frequency-consensus consensus mask {name} is stale")
+        base_target = source + FREQUENCY_CONSENSUS_BASE_BLEND * (
+            median3 - source
+        )
+        consensus_target = (
+            FREQUENCY_CONSENSUS_MEDIAN3_TARGET_WEIGHT * median3
+            + FREQUENCY_CONSENSUS_MEDIAN7_TARGET_WEIGHT * median7
+        )
+        desired = torch.where(expected_consensus, consensus_target, base_target)
+        expected_target = torch.where(
+            expected_update_safe,
+            source + strength * (desired - source),
+            source,
+        )
+        if not torch.equal(entry["target"], expected_target):
+            raise ValueError(f"frequency-consensus frozen target {name} is stale")
+        expected_mask = expected_update_safe & (expected_target != source)
+        if not torch.equal(entry["mask"], expected_mask):
+            raise ValueError(f"frequency-consensus update mask {name} is stale")
+    tensor_hashes = bundle.get("tensor_hashes")
+    expected_root_hash_keys = {
+        "fit_foreground",
+        "full_foreground5",
+        "edge_protected_full_precision",
+        "edge_protected_png_quantized",
+        "edge_protected",
+        "update_safe",
+        "evidence_count",
+    }
+    expected_map_hash_keys = {
+        "source",
+        "median3",
+        "median7",
+        "target",
+        "mask",
+        "consensus_mask",
+    }
+    if (
+        not isinstance(tensor_hashes, dict)
+        or set(tensor_hashes) != {"root", "maps"}
+        or set(tensor_hashes.get("root", {})) != expected_root_hash_keys
+        or set(tensor_hashes.get("maps", {})) != set(DISNEY_TV_SCALAR_NAMES)
+        or any(
+            set(tensor_hashes["maps"].get(name, {})) != expected_map_hash_keys
+            for name in DISNEY_TV_SCALAR_NAMES
+        )
+        or tensor_hashes != _frequency_consensus_tensor_hashes(bundle)
+    ):
+        raise ValueError("frequency-consensus frozen bundle tensor hashes do not match")
+
+
+def _frequency_consensus_bundle_provenance(bundle) -> dict[str, Any] | None:
+    if bundle is None:
+        return None
+    maps = {}
+    for name in DISNEY_TV_SCALAR_NAMES:
+        entry = bundle["maps"][name]
+        maps[name] = {
+            "updated_entries": int(entry["updated_count"]),
+            "consensus_entries": int(entry["consensus_count"]),
+            "source_sha256": _array_sha256(
+                entry["source"].detach().float().cpu().numpy()
+            ),
+            "median3_sha256": _array_sha256(
+                entry["median3"].detach().float().cpu().numpy()
+            ),
+            "median7_sha256": _array_sha256(
+                entry["median7"].detach().float().cpu().numpy()
+            ),
+            "target_sha256": _array_sha256(
+                entry["target"].detach().float().cpu().numpy()
+            ),
+            "mask_sha256": _array_sha256(entry["mask"].detach().cpu().numpy()),
+            "consensus_mask_sha256": _array_sha256(
+                entry["consensus_mask"].detach().cpu().numpy()
+            ),
+        }
+    return {
+        "schema": bundle["schema"],
+        "created_after_step": int(bundle["created_after_step"]),
+        "strength": float(bundle["strength"]),
+        "median_chunk_rows": dict(bundle["median_chunk_rows"]),
+        "edge_threshold_full_precision": float(
+            bundle["edge_threshold_full_precision"]
+        ),
+        "edge_threshold_png_quantized": float(
+            bundle["edge_threshold_png_quantized"]
+        ),
+        "fit_foreground_sha256": _array_sha256(
+            bundle["fit_foreground"].detach().cpu().numpy()
+        ),
+        "edge_protected_full_precision_sha256": _array_sha256(
+            bundle["edge_protected_full_precision"].detach().cpu().numpy()
+        ),
+        "edge_protected_png_quantized_sha256": _array_sha256(
+            bundle["edge_protected_png_quantized"].detach().cpu().numpy()
+        ),
+        "edge_protected_sha256": _array_sha256(
+            bundle["edge_protected"].detach().cpu().numpy()
+        ),
+        "update_safe_sha256": _array_sha256(
+            bundle["update_safe"].detach().cpu().numpy()
+        ),
+        "evidence_count_sha256": _array_sha256(
+            bundle["evidence_count"].detach().cpu().numpy()
+        ),
+        "tensor_hashes": bundle["tensor_hashes"],
+        "maps": maps,
+        "total_updated_entries": int(
+            sum(entry["updated_entries"] for entry in maps.values())
+        ),
+        "total_consensus_entries": int(
+            sum(entry["consensus_entries"] for entry in maps.values())
+        ),
+    }
+
+
+def _write_frequency_frozen_artifact(path: Path, bundle) -> dict[str, Any]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.tmp")
+    payload = {
+        "metadata": np.asarray(
+            json.dumps(
+                {
+                    "schema": "ictpolarreal.frequency-frozen-artifact.v1",
+                    "created_after_step": int(bundle["created_after_step"]),
+                    "strength": float(bundle["strength"]),
+                    "median_chunk_rows": dict(bundle["median_chunk_rows"]),
+                    "edge_threshold_full_precision": float(
+                        bundle["edge_threshold_full_precision"]
+                    ),
+                    "edge_threshold_png_quantized": float(
+                        bundle["edge_threshold_png_quantized"]
+                    ),
+                    "maps": list(DISNEY_TV_SCALAR_NAMES),
+                    "tensor_hashes": bundle["tensor_hashes"],
+                },
+                sort_keys=True,
+            )
+        ),
+        "fit_foreground": bundle["fit_foreground"].detach().cpu().numpy(),
+        "full_foreground5": bundle["full_foreground5"].detach().cpu().numpy(),
+        "edge_protected_full_precision": bundle[
+            "edge_protected_full_precision"
+        ].detach().cpu().numpy(),
+        "edge_protected_png_quantized": bundle[
+            "edge_protected_png_quantized"
+        ].detach().cpu().numpy(),
+        "edge_protected": bundle["edge_protected"].detach().cpu().numpy(),
+        "update_safe": bundle["update_safe"].detach().cpu().numpy(),
+        "evidence_count": bundle["evidence_count"].detach().cpu().numpy(),
+    }
+    for name in DISNEY_TV_SCALAR_NAMES:
+        entry = bundle["maps"][name]
+        for key in ("source", "median3", "median7", "target", "mask", "consensus_mask"):
+            payload[f"{name}__{key}"] = entry[key].detach().float().cpu().numpy() \
+                if key not in {"mask", "consensus_mask"} \
+                else entry[key].detach().cpu().numpy()
+    with temporary.open("wb") as stream:
+        np.savez_compressed(stream, **payload)
+    temporary.replace(path)
+    return {
+        "schema": "ictpolarreal.frequency-frozen-artifact.v1",
+        "path": path.name,
+        "sha256": _file_sha256(path),
+        "bytes": int(path.stat().st_size),
+        "format": "numpy_npz_compressed",
+    }
+
+
+def _finalize_frequency_frozen_artifact(
+    material_dir: Path,
+    bundle,
+) -> dict[str, Any] | None:
+    path = material_dir / FREQUENCY_FROZEN_ARTIFACT_NAME
+    if bundle is None:
+        path.unlink(missing_ok=True)
+        return None
+    provenance = _frequency_consensus_bundle_provenance(bundle)
+    provenance["artifact"] = _write_frequency_frozen_artifact(path, bundle)
+    return provenance
+
+
+def _frequency_completion_records_valid(
+    regularization,
+    frozen_bundle,
+    evaluations,
+) -> bool:
+    if regularization.get("cleanup_applied") is not True:
+        return False
+    diagnostic = regularization.get("cleanup_diagnostic")
+    if not isinstance(diagnostic, dict) or diagnostic.get("schema") != (
+        "ictpolarreal.frequency-consensus-diagnostic.v1"
+    ):
+        return False
+    stage_plan = regularization.get("stage_plan")
+    if (
+        not isinstance(stage_plan, dict)
+        or diagnostic.get("strength") != stage_plan.get("strength")
+        or diagnostic.get("strength") != frozen_bundle.get("strength")
+        or diagnostic.get("updated_entries")
+        != frozen_bundle.get("total_updated_entries")
+        or diagnostic.get("consensus_entries")
+        != frozen_bundle.get("total_consensus_entries")
+    ):
+        return False
+    moved = diagnostic.get("moved_entries")
+    total_updated = frozen_bundle.get("total_updated_entries")
+    if (
+        not isinstance(moved, int)
+        or not isinstance(total_updated, int)
+        or not 0 <= moved <= total_updated
+    ):
+        return False
+    maps = diagnostic.get("maps")
+    frozen_maps = frozen_bundle.get("maps")
+    if (
+        not isinstance(maps, dict)
+        or not isinstance(frozen_maps, dict)
+        or set(maps) != set(DISNEY_TV_SCALAR_NAMES)
+        or set(frozen_maps) != set(DISNEY_TV_SCALAR_NAMES)
+    ):
+        return False
+    moved_sum = 0
+    for name in DISNEY_TV_SCALAR_NAMES:
+        record = maps[name]
+        frozen = frozen_maps[name]
+        frozen_updated = frozen.get("updated_entries")
+        frozen_consensus = frozen.get("consensus_entries")
+        if (
+            not isinstance(record, dict)
+            or not isinstance(frozen_updated, int)
+            or not isinstance(frozen_consensus, int)
+            or frozen_updated < 0
+            or frozen_consensus < 0
+            or record.get("updated_entries") != frozen_updated
+            or record.get("consensus_entries") != frozen_consensus
+        ):
+            return False
+        map_moved = record.get("moved_entries")
+        if (
+            not isinstance(map_moved, int)
+            or not 0 <= map_moved <= frozen_updated
+        ):
+            return False
+        moved_sum += map_moved
+        for key in ("mean_distance_before", "mean_distance_after"):
+            value = record.get(key)
+            if not isinstance(value, float) or not math.isfinite(value) or value < 0.0:
+                return False
+    if moved_sum != moved:
+        return False
+    for key in ("mean_distance_before", "mean_distance_after"):
+        value = diagnostic.get(key)
+        if not isinstance(value, float) or not math.isfinite(value) or value < 0.0:
+            return False
+
+    guard = regularization.get("evaluation_guard")
+    if (
+        not isinstance(guard, dict)
+        or guard.get("schema")
+        != "ictpolarreal.frequency-consensus-evaluation-guard.v1"
+        or guard.get("same_checkpoint") is not True
+        or set(guard.get("suites", {})) != {"olat", "hdri"}
+        or not isinstance(evaluations, dict)
+    ):
+        return False
+    for suite in ("olat", "hdri"):
+        record = guard["suites"][suite]
+        if not isinstance(record, dict):
+            return False
+        before = record.get("pre_cleanup_mse")
+        after = record.get("post_cleanup_mse")
+        deltas = record.get("post_minus_pre_mse")
+        if (
+            not isinstance(before, list)
+            or not isinstance(after, list)
+            or not isinstance(deltas, list)
+            or not before
+            or len(before) != len(after)
+            or len(before) != len(deltas)
+            or any(
+                not isinstance(value, float) or not math.isfinite(value)
+                for values in (before, after, deltas)
+                for value in values
+            )
+            or any(value < 0.0 for values in (before, after) for value in values)
+            or any(delta != post - pre for pre, post, delta in zip(before, after, deltas))
+        ):
+            return False
+        before_mean = float(np.mean(before)) if before else 0.0
+        after_mean = float(np.mean(after)) if after else 0.0
+        if (
+            record.get("pre_cleanup_mean_mse") != before_mean
+            or record.get("post_cleanup_mean_mse") != after_mean
+            or record.get("post_minus_pre_mean_mse") != after_mean - before_mean
+            or record.get("worsened") is not (after_mean > before_mean)
+        ):
+            return False
+        final_suite = evaluations.get(suite)
+        final_metrics = (
+            final_suite.get("metrics") if isinstance(final_suite, dict) else None
+        )
+        final_count = (
+            final_suite.get("count") if isinstance(final_suite, dict) else None
+        )
+        final_mse = (
+            final_metrics.get("mse") if isinstance(final_metrics, dict) else None
+        )
+        if (
+            not isinstance(final_count, int)
+            or isinstance(final_count, bool)
+            or final_count != len(after)
+            or not isinstance(final_mse, (int, float))
+            or isinstance(final_mse, bool)
+            or not math.isfinite(float(final_mse))
+            or float(final_mse) < 0.0
+            or not math.isclose(
+                float(final_mse),
+                after_mean,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        ):
+            return False
+    return _frequency_evaluation_guard_regressed_suites(guard) == []
+
+
+def _frequency_frozen_artifact_complete(
+    material_dir: Path,
+    acquisition: dict[str, Any],
+) -> bool:
+    regularization = acquisition.get("regularization")
+    signature = acquisition.get("checkpoint_signature")
+    signature_regularization = (
+        signature.get("regularization") if isinstance(signature, dict) else None
+    )
+
+    def enabled_frequency(value) -> bool:
+        if not isinstance(value, dict) or value.get("kind") != "frequency-consensus":
+            return False
+        stage_plan = value.get("stage_plan")
+        return isinstance(stage_plan, dict) and stage_plan.get("enabled") is True
+
+    top_level_enabled = enabled_frequency(regularization)
+    signature_enabled = enabled_frequency(signature_regularization)
+    if not top_level_enabled and not signature_enabled:
+        return True
+    if not top_level_enabled or not signature_enabled:
+        return False
+    for key in ("kind", "weight", "parameters", "settings", "stage_plan"):
+        if regularization.get(key) != signature_regularization.get(key):
+            return False
+    frozen_bundle = regularization.get("frozen_bundle")
+    evaluation = acquisition.get("evaluation")
+    evaluations = (
+        evaluation.get("evaluations") if isinstance(evaluation, dict) else None
+    )
+    if not isinstance(frozen_bundle, dict) or not _frequency_completion_records_valid(
+        regularization, frozen_bundle, evaluations
+    ):
+        return False
+    artifact = frozen_bundle.get("artifact") if isinstance(frozen_bundle, dict) else None
+    if not isinstance(artifact, dict):
+        return False
+    if (
+        artifact.get("schema") != "ictpolarreal.frequency-frozen-artifact.v1"
+        or artifact.get("path") != FREQUENCY_FROZEN_ARTIFACT_NAME
+        or not isinstance(artifact.get("sha256"), str)
+        or not isinstance(artifact.get("bytes"), int)
+    ):
+        return False
+    path = material_dir / FREQUENCY_FROZEN_ARTIFACT_NAME
+    if not path.is_file() or path.stat().st_size != artifact["bytes"]:
+        return False
+    return _file_sha256(path) == artifact["sha256"]
+
+
+def _apply_frequency_consensus_update(torch, model, bundle) -> dict[str, Any]:
+    constrained = model._param_maps()
+    reference = constrained[DISNEY_TV_SCALAR_NAMES[0]]
+    if reference.ndim == 3 and reference.shape[-1] == 1:
+        reference = reference[..., 0]
+    expected_shape = tuple(reference.shape)
+    _validate_frequency_consensus_bundle(
+        torch,
+        bundle,
+        expected_shape=expected_shape,
+    )
+    per_map = {}
+    total_moved = 0
+    all_before = []
+    all_after = []
+    with torch.no_grad():
+        for name in DISNEY_TV_SCALAR_NAMES:
+            scalar = constrained[name]
+            if scalar.ndim == 3 and scalar.shape[-1] == 1:
+                scalar = scalar[..., 0]
+            raw_parameter = getattr(model, f"{name}_un", None)
+            if raw_parameter is None or tuple(raw_parameter.shape) != (1, *expected_shape):
+                raise ValueError(
+                    f"Disney unconstrained scalar {name}_un must have shape "
+                    f"{(1, *expected_shape)}"
+                )
+            entry = bundle["maps"][name]
+            source = entry["source"].to(device=scalar.device, dtype=scalar.dtype)
+            if not torch.equal(scalar, source):
+                raise ValueError(
+                    f"frequency-consensus source map {name} no longer matches fitted state"
+                )
+            update_mask = entry["mask"].to(device=scalar.device)
+            target = entry["target"].to(device=scalar.device, dtype=scalar.dtype)
+            before = (scalar[update_mask] - target[update_mask]).abs()
+            if update_mask.any():
+                raw_parameter[0][update_mask] = torch.logit(
+                    target[update_mask].clamp(
+                        FREQUENCY_CONSENSUS_LOGIT_EPSILON,
+                        1.0 - FREQUENCY_CONSENSUS_LOGIT_EPSILON,
+                    )
+                )
+            actual = model._param_maps()[name]
+            if actual.ndim == 3 and actual.shape[-1] == 1:
+                actual = actual[..., 0]
+            after = (actual[update_mask] - target[update_mask]).abs()
+            moved = int(torch.count_nonzero(actual[update_mask] != source[update_mask]).item())
+            total_moved += moved
+            all_before.append(before)
+            all_after.append(after)
+            per_map[name] = {
+                "updated_entries": int(entry["updated_count"]),
+                "consensus_entries": int(entry["consensus_count"]),
+                "moved_entries": moved,
+                "mean_distance_before": float(before.mean().cpu()) if before.numel() else 0.0,
+                "mean_distance_after": float(after.mean().cpu()) if after.numel() else 0.0,
+            }
+    before_all = torch.cat([value for value in all_before if value.numel()]) \
+        if any(value.numel() for value in all_before) else None
+    after_all = torch.cat([value for value in all_after if value.numel()]) \
+        if any(value.numel() for value in all_after) else None
+    return {
+        "schema": "ictpolarreal.frequency-consensus-diagnostic.v1",
+        "strength": float(bundle["strength"]),
+        "updated_entries": int(
+            sum(entry["updated_count"] for entry in bundle["maps"].values())
+        ),
+        "consensus_entries": int(
+            sum(entry["consensus_count"] for entry in bundle["maps"].values())
+        ),
+        "moved_entries": int(total_moved),
+        "mean_distance_before": float(before_all.mean().cpu()) if before_all is not None else 0.0,
+        "mean_distance_after": float(after_all.mean().cpu()) if after_all is not None else 0.0,
+        "maps": per_map,
+    }
 
 
 def _impulse_median_guide_support(
@@ -3467,7 +4931,7 @@ def _disney_scalar_regularization(
             epsilon=EDGE_CHARBONNIER_EPSILON,
         )
     raise ValueError(
-        "impulse-median is a post-fit proximal update, not a differentiable loss"
+        f"{kind} is a post-fit update, not a differentiable loss"
     )
 
 

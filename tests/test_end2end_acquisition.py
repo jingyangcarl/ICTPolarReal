@@ -760,6 +760,36 @@ def _toy_disney_scalar_model(torch, values):
     return ToyDisneyScalarModel()
 
 
+def _frequency_consensus_inputs(
+    torch,
+    values,
+    *,
+    mask=None,
+    albedo=None,
+    normal=None,
+    strength=1.0,
+):
+    model = _toy_disney_scalar_model(torch, values)
+    height, width = next(iter(values.values())).shape
+    if mask is None:
+        mask = torch.ones((height, width, 1), dtype=torch.float32)
+    if albedo is None:
+        albedo = torch.full((height, width, 3), 0.5, dtype=torch.float32)
+    if normal is None:
+        normal = torch.zeros((height, width, 3), dtype=torch.float32)
+        normal[..., 2] = 1.0
+    bundle = end2end_acquisition._build_frequency_consensus_bundle(
+        torch,
+        model,
+        mask,
+        albedo,
+        normal,
+        created_after_step=90,
+        strength=strength,
+    )
+    return model, bundle
+
+
 def _manual_impulse_bundle(torch, model, targets):
     maps = {}
     constrained = model._param_maps()
@@ -826,8 +856,8 @@ def test_impulse_median_settings_record_frozen_detector_and_schedule():
     assert settings["detector_boundary"] == "after_all_data_fit_steps"
     assert settings["unflagged_parameter_update"].startswith("none_bit_identical")
     assert settings["local_maximum_tie_policy"] == "retain_all_equal_maxima"
-    assert adapter["schema"] == "ictpolarreal.profile-acquisition-adapter.v6"
-    assert adapter["algorithm_version"] == "ictpolarreal-impulse-proximal-v5"
+    assert adapter["schema"] == "ictpolarreal.profile-acquisition-adapter.v7"
+    assert adapter["algorithm_version"] == "ictpolarreal-frequency-consensus-v1"
 
 
 def test_zero_weight_final_regularization_does_not_require_impulse_bundle():
@@ -1132,6 +1162,583 @@ def test_impulse_median_checkpoint_requires_exact_frozen_bundle_after_boundary()
             next_step=90,
             expected_shape=(9, 9),
         )
+
+
+def test_frequency_consensus_settings_and_weight_strength_are_versioned():
+    settings = end2end_acquisition._regularization_settings("frequency-consensus")
+    enabled = end2end_acquisition._frequency_consensus_stage_plan(
+        33000,
+        enabled=True,
+        weight=0.00125,
+    )
+    half = end2end_acquisition._frequency_consensus_stage_plan(
+        33000,
+        enabled=True,
+        weight=0.000625,
+    )
+    disabled = end2end_acquisition._frequency_consensus_stage_plan(
+        33000,
+        enabled=False,
+        weight=0.0,
+    )
+
+    assert "frequency-consensus" in end2end_acquisition.TV_KINDS
+    assert settings["weighted_median_windows"] == [3, 7]
+    assert settings["edge_percentile"] == pytest.approx(80.0)
+    assert settings["base_target"].startswith("value+0.4")
+    assert settings["minimum_evidence_maps"] == 2
+    assert settings["own_deviation_threshold"] == pytest.approx(0.025)
+    assert enabled == {
+        "enabled": True,
+        "data_fit_steps": 33000,
+        "detector_after_data_step": 33000,
+        "post_fit_updates": 1,
+        "weight_reference": pytest.approx(0.00125),
+        "strength": pytest.approx(1.0),
+        "cleanup_optimizer_steps": 0,
+    }
+    assert half["strength"] == pytest.approx(0.5)
+    assert disabled["strength"] == 0.0
+    assert disabled["post_fit_updates"] == 0
+
+
+@pytest.mark.parametrize("empty_suite", ["olat", "hdri"])
+def test_frequency_evaluation_guard_rejects_empty_suites(empty_suite):
+    pre = {"olat": [0.1], "hdri": [0.2]}
+    post = {"olat": [0.09], "hdri": [0.19]}
+    pre[empty_suite] = []
+    post[empty_suite] = []
+
+    with pytest.raises(ValueError, match=rf"pre-cleanup {empty_suite} losses are invalid"):
+        end2end_acquisition._frequency_evaluation_guard(pre, post)
+
+
+def test_frequency_consensus_removes_joint_fine_noise_but_retains_coherent_detail():
+    torch = pytest.importorskip("torch")
+    shape = (17, 17)
+    values = {
+        name: torch.full(shape, 0.3, dtype=torch.float32)
+        for name in end2end_acquisition.DISNEY_TV_SCALAR_NAMES
+    }
+    # A coherent three-pixel feature survives median3 and keeps at least 90% of
+    # its contrast even when median7 sees it as cross-map evidence.
+    for value in values.values():
+        value[7:10, 5:12] = 0.7
+    values["metallic"][12, 12] = 0.9
+    values["roughness"][12, 12] = 0.9
+    values["subsurface"][4, 12] = 0.34
+    model, bundle = _frequency_consensus_inputs(torch, values)
+    duplicate_model, duplicate = _frequency_consensus_inputs(torch, values)
+
+    for name in end2end_acquisition.DISNEY_TV_SCALAR_NAMES:
+        for key in ("source", "median3", "median7", "target", "mask"):
+            assert torch.equal(bundle["maps"][name][key], duplicate["maps"][name][key])
+    raw_before = {
+        name: getattr(model, f"{name}_un").detach().clone()
+        for name in end2end_acquisition.DISNEY_TV_SCALAR_NAMES
+    }
+    diagnostic = end2end_acquisition._apply_frequency_consensus_update(
+        torch,
+        model,
+        bundle,
+    )
+    maps = model._param_maps()
+
+    assert maps["metallic"][12, 12].item() == pytest.approx(0.3, abs=1e-6)
+    assert maps["roughness"][12, 12].item() == pytest.approx(0.3, abs=1e-6)
+    assert maps["subsurface"][4, 12].item() == pytest.approx(0.324, abs=1e-6)
+    assert maps["anisotropic"][8, 8].item() >= 0.66 - 1e-6
+    assert diagnostic["moved_entries"] > 0
+    for name in end2end_acquisition.DISNEY_TV_SCALAR_NAMES:
+        update_mask = bundle["maps"][name]["mask"].unsqueeze(0)
+        assert torch.equal(
+            getattr(model, f"{name}_un")[~update_mask],
+            raw_before[name][~update_mask],
+        )
+    # Applying a frozen bundle to anything except its exact pre-clean state fails closed.
+    with torch.no_grad():
+        duplicate_model.metallic_un[0, 8, 8] += 0.01
+    with pytest.raises(ValueError, match="no longer matches fitted state"):
+        end2end_acquisition._apply_frequency_consensus_update(
+            torch,
+            duplicate_model,
+            bundle,
+        )
+
+
+def test_frequency_consensus_freezes_guide_edges_and_foreground_boundary():
+    torch = pytest.importorskip("torch")
+    shape = (17, 17)
+    values = {
+        name: torch.full(shape, 0.3, dtype=torch.float32)
+        for name in end2end_acquisition.DISNEY_TV_SCALAR_NAMES
+    }
+    for value in values.values():
+        value[8, 8] = 0.9
+        value[1, 1] = 0.9
+    albedo = torch.full((*shape, 3), 0.2, dtype=torch.float32)
+    albedo[:, 9:] = 0.8
+    normal = torch.zeros((*shape, 3), dtype=torch.float32)
+    normal[..., 2] = 1.0
+    model, bundle = _frequency_consensus_inputs(
+        torch,
+        values,
+        albedo=albedo,
+        normal=normal,
+    )
+    raw_before = model.metallic_un.detach().clone()
+
+    assert bundle["edge_protected"][8, 8]
+    assert bundle["edge_protected"][8, 9]
+    assert not bundle["update_safe"][1, 1]
+    assert not bundle["maps"]["metallic"]["mask"][8, 8]
+    assert not bundle["maps"]["metallic"]["mask"][1, 1]
+    end2end_acquisition._apply_frequency_consensus_update(torch, model, bundle)
+    assert torch.equal(model.metallic_un[0, 8, 8], raw_before[0, 8, 8])
+    assert torch.equal(model.metallic_un[0, 1, 1], raw_before[0, 1, 1])
+
+
+def test_frequency_consensus_edge_protection_unions_full_and_png_guides():
+    torch = pytest.importorskip("torch")
+    torch.manual_seed(0)
+    shape = (17, 17)
+    mask = torch.ones((*shape, 1), dtype=torch.float32)
+    albedo = 0.5 + 0.01 * torch.rand((*shape, 3), dtype=torch.float32)
+    normal = torch.zeros((*shape, 3), dtype=torch.float32)
+    normal[..., 2] = 1.0
+
+    guide = end2end_acquisition._frequency_consensus_guide_state(
+        torch, mask, albedo, normal
+    )
+
+    full = guide["edge_protected_full_precision"]
+    png = guide["edge_protected_png_quantized"]
+    assert torch.count_nonzero(png & ~full) > 0
+    assert torch.equal(guide["edge_protected"], full | png)
+    assert torch.equal(
+        guide["update_safe"],
+        guide["full_foreground5"] & ~(full | png),
+    )
+
+
+def test_frequency_consensus_chunked_median_matches_full_reference_and_caps_rows():
+    torch = pytest.importorskip("torch")
+    torch.manual_seed(4)
+    height, width, window = 13, 15, 7
+    scalar = torch.rand((height, width), dtype=torch.float32)
+    foreground = torch.ones((height, width), dtype=torch.bool)
+    albedo = torch.rand((height, width, 3), dtype=torch.float32)
+    normal = torch.zeros((height, width, 3), dtype=torch.float32)
+    normal[..., 2] = 1.0
+    chunked, rows = end2end_acquisition._joint_guide_weighted_median_chunked(
+        torch,
+        scalar,
+        foreground,
+        albedo,
+        normal,
+        window_size=window,
+        spatial_sigma=end2end_acquisition.FREQUENCY_CONSENSUS_SPATIAL_SIGMA7,
+    )
+    scalar_patches = end2end_acquisition._window_patches(
+        torch, scalar, window
+    )[..., 0, :]
+    mask_patches = end2end_acquisition._window_patches(
+        torch, foreground.float(), window
+    )[..., 0, :]
+    albedo_patches = end2end_acquisition._window_patches(
+        torch, albedo, window
+    )
+    normal_patches = end2end_acquisition._window_patches(
+        torch, normal, window
+    )
+    albedo_difference = (albedo_patches - albedo.unsqueeze(-1)).abs().mean(dim=2)
+    normal_difference = (
+        1.0 - (normal_patches * normal.unsqueeze(-1)).sum(dim=2).clamp(-1.0, 1.0)
+    ).clamp_min(0.0)
+    coordinate = torch.arange(-3, 4, dtype=torch.float32)
+    yy, xx = torch.meshgrid(coordinate, coordinate, indexing="ij")
+    spatial = (xx.square() + yy.square()).reshape(-1) / (2.0 * 2.5 * 2.5)
+    weights = mask_patches * torch.exp(
+        -spatial
+        - albedo_difference / end2end_acquisition.FREQUENCY_CONSENSUS_ALBEDO_SIGMA
+        - normal_difference / end2end_acquisition.FREQUENCY_CONSENSUS_NORMAL_SIGMA
+    )
+    reference = end2end_acquisition._weighted_samples_median(
+        torch, scalar_patches, weights
+    )
+    assert torch.equal(chunked, reference)
+    assert rows == height
+    large_rows = end2end_acquisition._frequency_consensus_chunk_rows(2048, 7)
+    assert large_rows < 2048
+    assert (
+        large_rows * 2048 * 7 * 7
+        <= end2end_acquisition.FREQUENCY_CONSENSUS_MAX_CHUNK_SAMPLES
+    )
+
+
+def test_frequency_consensus_bundle_rejects_nonfinite_and_semantic_tampering():
+    torch = pytest.importorskip("torch")
+    values = {
+        name: torch.full((11, 11), 0.3, dtype=torch.float32)
+        for name in end2end_acquisition.DISNEY_TV_SCALAR_NAMES
+    }
+    values["metallic"][5, 5] = 0.9
+    values["roughness"][5, 5] = 0.9
+    _model, bundle = _frequency_consensus_inputs(torch, values)
+    bad_evidence = {
+        **bundle,
+        "evidence_count": torch.zeros_like(bundle["evidence_count"]),
+    }
+    bad_evidence["tensor_hashes"] = (
+        end2end_acquisition._frequency_consensus_tensor_hashes(bad_evidence)
+    )
+    with pytest.raises(ValueError, match="evidence count does not match maps"):
+        end2end_acquisition._validate_frequency_consensus_bundle(
+            torch, bad_evidence, expected_shape=(11, 11)
+        )
+    bad_target = {
+        **bundle,
+        "maps": {
+            **bundle["maps"],
+            "metallic": {
+                **bundle["maps"]["metallic"],
+                "target": bundle["maps"]["metallic"]["target"].clone(),
+            },
+        },
+    }
+    bad_target["maps"]["metallic"]["target"][5, 5] = float("nan")
+    bad_target["tensor_hashes"] = (
+        end2end_acquisition._frequency_consensus_tensor_hashes(bad_target)
+    )
+    with pytest.raises(ValueError, match="target metallic is invalid"):
+        end2end_acquisition._validate_frequency_consensus_bundle(
+            torch, bad_target, expected_shape=(11, 11)
+        )
+
+
+def test_frequency_consensus_artifact_and_resume_fail_closed(tmp_path):
+    torch = pytest.importorskip("torch")
+    values = {
+        name: torch.full((11, 11), 0.3, dtype=torch.float32)
+        for name in end2end_acquisition.DISNEY_TV_SCALAR_NAMES
+    }
+    values["metallic"][5, 5] = 0.9
+    values["roughness"][5, 5] = 0.9
+    model, bundle = _frequency_consensus_inputs(torch, values)
+    stage = end2end_acquisition._frequency_consensus_stage_plan(
+        90,
+        enabled=True,
+        weight=0.00125,
+    )
+    pending = end2end_acquisition._checkpoint_frequency_consensus_state(
+        torch,
+        {
+            "frequency_consensus_bundle": bundle,
+            "frequency_cleanup_applied": False,
+            "frequency_cleanup_diagnostic": None,
+        },
+        stage,
+        next_step=90,
+        expected_shape=(11, 11),
+    )
+    assert pending[0] is bundle
+    assert pending[1:] == (False, None)
+    with pytest.raises(ValueError, match="missing frequency-consensus frozen bundle"):
+        end2end_acquisition._checkpoint_frequency_consensus_state(
+            torch,
+            {"frequency_consensus_bundle": None},
+            stage,
+            next_step=90,
+            expected_shape=(11, 11),
+        )
+    tampered_bundle = {
+        **bundle,
+        "maps": {
+            **bundle["maps"],
+            "metallic": {
+                **bundle["maps"]["metallic"],
+                "target": bundle["maps"]["metallic"]["target"].clone(),
+            },
+        },
+    }
+    tampered_bundle["maps"]["metallic"]["target"][5, 5] += 0.01
+    with pytest.raises(ValueError, match="frozen target metallic is stale"):
+        end2end_acquisition._checkpoint_frequency_consensus_state(
+            torch,
+            {"frequency_consensus_bundle": tampered_bundle},
+            stage,
+            next_step=90,
+            expected_shape=(11, 11),
+        )
+
+    diagnostic = end2end_acquisition._apply_frequency_consensus_update(
+        torch, model, bundle
+    )
+    applied = end2end_acquisition._checkpoint_frequency_consensus_state(
+        torch,
+        {
+            "frequency_consensus_bundle": bundle,
+            "frequency_cleanup_applied": True,
+            "frequency_cleanup_diagnostic": diagnostic,
+        },
+        stage,
+        next_step=90,
+        expected_shape=(11, 11),
+        model=model,
+    )
+    assert applied[0] is bundle
+    assert applied[1] is True
+    assert applied[2] is diagnostic
+    stale_diagnostic = {**diagnostic, "strength": 0.5}
+    with pytest.raises(ValueError, match="diagnostic strength is stale"):
+        end2end_acquisition._checkpoint_frequency_consensus_state(
+            torch,
+            {
+                "frequency_consensus_bundle": bundle,
+                "frequency_cleanup_applied": True,
+                "frequency_cleanup_diagnostic": stale_diagnostic,
+            },
+            stage,
+            next_step=90,
+            expected_shape=(11, 11),
+            model=model,
+        )
+    bad_model = _toy_disney_scalar_model(torch, values)
+    end2end_acquisition._apply_frequency_consensus_update(
+        torch, bad_model, bundle
+    )
+    with torch.no_grad():
+        bad_model.metallic_un[0, 0, 0] += 0.01
+    with pytest.raises(ValueError, match="changed source outside mask"):
+        end2end_acquisition._checkpoint_frequency_consensus_state(
+            torch,
+            {
+                "frequency_consensus_bundle": bundle,
+                "frequency_cleanup_applied": True,
+                "frequency_cleanup_diagnostic": diagnostic,
+            },
+            stage,
+            next_step=90,
+            expected_shape=(11, 11),
+            model=bad_model,
+        )
+
+    provenance = end2end_acquisition._finalize_frequency_frozen_artifact(
+        tmp_path,
+        bundle,
+    )
+    signature_regularization = {
+        "kind": "frequency-consensus",
+        "weight": 0.00125,
+        "parameters": list(end2end_acquisition.DISNEY_TV_SCALAR_NAMES),
+        "settings": end2end_acquisition._regularization_settings(
+            "frequency-consensus"
+        ),
+        "stage_plan": stage,
+    }
+    acquisition = {
+        "regularization": {
+            **signature_regularization,
+            "frozen_bundle": provenance,
+            "cleanup_applied": True,
+            "cleanup_diagnostic": diagnostic,
+            "evaluation_guard": end2end_acquisition._frequency_evaluation_guard(
+                {"olat": [0.1], "hdri": [0.2]},
+                {"olat": [0.099], "hdri": [0.2]},
+            ),
+        },
+        "checkpoint_signature": {
+            "regularization": dict(signature_regularization),
+        },
+        "evaluation": {
+            "evaluations": {
+                "olat": {"count": 1, "metrics": {"mse": 0.099}},
+                "hdri": {"count": 1, "metrics": {"mse": 0.2}},
+            }
+        },
+    }
+    artifact_path = tmp_path / end2end_acquisition.FREQUENCY_FROZEN_ARTIFACT_NAME
+    assert end2end_acquisition._frequency_frozen_artifact_complete(
+        tmp_path,
+        acquisition,
+    )
+    assert set(acquisition["regularization"]["evaluation_guard"]) == {
+        "schema",
+        "same_checkpoint",
+        "suites",
+    }
+
+    tolerance = (
+        end2end_acquisition.FREQUENCY_CONSENSUS_EVALUATION_MEAN_MSE_TOLERANCE
+    )
+    within_tolerance = json.loads(json.dumps(acquisition))
+    within_tolerance["regularization"]["evaluation_guard"] = (
+        end2end_acquisition._frequency_evaluation_guard(
+            {"olat": [0.1], "hdri": [0.2]},
+            {"olat": [0.1 + 0.5 * tolerance], "hdri": [0.2]},
+        )
+    )
+    within_tolerance["evaluation"]["evaluations"]["olat"]["metrics"]["mse"] = (
+        0.1 + 0.5 * tolerance
+    )
+    assert within_tolerance["regularization"]["evaluation_guard"]["suites"][
+        "olat"
+    ]["worsened"] is True
+    end2end_acquisition._require_frequency_evaluation_guard_accepted(
+        within_tolerance["regularization"]["evaluation_guard"]
+    )
+    assert end2end_acquisition._frequency_frozen_artifact_complete(
+        tmp_path,
+        within_tolerance,
+    )
+
+    regressed = json.loads(json.dumps(acquisition))
+    regressed["regularization"]["evaluation_guard"] = (
+        end2end_acquisition._frequency_evaluation_guard(
+            {"olat": [0.1], "hdri": [0.2]},
+            {"olat": [0.101], "hdri": [0.199]},
+        )
+    )
+    regressed["evaluation"]["evaluations"]["olat"]["metrics"]["mse"] = 0.101
+    regressed["evaluation"]["evaluations"]["hdri"]["metrics"]["mse"] = 0.199
+    with pytest.raises(RuntimeError, match="worsened heldout mean MSE"):
+        end2end_acquisition._require_frequency_evaluation_guard_accepted(
+            regressed["regularization"]["evaluation_guard"]
+        )
+    assert not end2end_acquisition._frequency_frozen_artifact_complete(
+        tmp_path,
+        regressed,
+    )
+
+    corrupt_decision = json.loads(json.dumps(acquisition))
+    corrupt_decision["regularization"]["evaluation_guard"]["suites"]["olat"][
+        "worsened"
+    ] = True
+    assert not end2end_acquisition._frequency_frozen_artifact_complete(
+        tmp_path,
+        corrupt_decision,
+    )
+    corrupt_arithmetic = json.loads(json.dumps(acquisition))
+    corrupt_arithmetic["regularization"]["evaluation_guard"]["suites"]["olat"][
+        "post_minus_pre_mse"
+    ][0] += 0.01
+    assert not end2end_acquisition._frequency_frozen_artifact_complete(
+        tmp_path,
+        corrupt_arithmetic,
+    )
+    empty_stored_suite = json.loads(json.dumps(acquisition))
+    empty_record = empty_stored_suite["regularization"]["evaluation_guard"][
+        "suites"
+    ]["olat"]
+    empty_record.update(
+        {
+            "pre_cleanup_mse": [],
+            "post_cleanup_mse": [],
+            "post_minus_pre_mse": [],
+            "pre_cleanup_mean_mse": 0.0,
+            "post_cleanup_mean_mse": 0.0,
+            "post_minus_pre_mean_mse": 0.0,
+            "worsened": False,
+        }
+    )
+    assert not end2end_acquisition._frequency_frozen_artifact_complete(
+        tmp_path,
+        empty_stored_suite,
+    )
+    incomplete = json.loads(json.dumps(acquisition))
+    incomplete["regularization"]["cleanup_applied"] = False
+    assert not end2end_acquisition._frequency_frozen_artifact_complete(
+        tmp_path, incomplete
+    )
+    missing_diagnostic = json.loads(json.dumps(acquisition))
+    missing_diagnostic["regularization"].pop("cleanup_diagnostic")
+    assert not end2end_acquisition._frequency_frozen_artifact_complete(
+        tmp_path, missing_diagnostic
+    )
+    missing_guard = json.loads(json.dumps(acquisition))
+    missing_guard["regularization"].pop("evaluation_guard")
+    assert not end2end_acquisition._frequency_frozen_artifact_complete(
+        tmp_path, missing_guard
+    )
+    missing_final_evaluation = json.loads(json.dumps(acquisition))
+    missing_final_evaluation.pop("evaluation")
+    assert not end2end_acquisition._frequency_frozen_artifact_complete(
+        tmp_path, missing_final_evaluation
+    )
+    mismatched_final_count = json.loads(json.dumps(acquisition))
+    mismatched_final_count["evaluation"]["evaluations"]["olat"]["count"] = 2
+    assert not end2end_acquisition._frequency_frozen_artifact_complete(
+        tmp_path, mismatched_final_count
+    )
+    mismatched_final_mse = json.loads(json.dumps(acquisition))
+    mismatched_final_mse["evaluation"]["evaluations"]["hdri"]["metrics"][
+        "mse"
+    ] += 1e-6
+    assert not end2end_acquisition._frequency_frozen_artifact_complete(
+        tmp_path, mismatched_final_mse
+    )
+    invalid_final_types = json.loads(json.dumps(acquisition))
+    invalid_final_types["evaluation"]["evaluations"]["olat"]["count"] = True
+    invalid_final_types["evaluation"]["evaluations"]["hdri"]["metrics"][
+        "mse"
+    ] = float("nan")
+    assert not end2end_acquisition._frequency_frozen_artifact_complete(
+        tmp_path, invalid_final_types
+    )
+    with np.load(artifact_path, allow_pickle=False) as frozen:
+        metadata = json.loads(str(frozen["metadata"].item()))
+        assert metadata["schema"] == "ictpolarreal.frequency-frozen-artifact.v1"
+        assert set(metadata["tensor_hashes"]) == {"root", "maps"}
+        assert "edge_threshold_full_precision" in metadata
+        assert "edge_threshold_png_quantized" in metadata
+        assert "edge_protected_full_precision" in frozen
+        assert "edge_protected_png_quantized" in frozen
+        np.testing.assert_array_equal(
+            frozen["metallic__source"],
+            bundle["maps"]["metallic"]["source"].numpy(),
+        )
+        np.testing.assert_array_equal(
+            frozen["metallic__target"],
+            bundle["maps"]["metallic"]["target"].numpy(),
+        )
+    with artifact_path.open("ab") as stream:
+        stream.write(b"tampered")
+    assert not end2end_acquisition._frequency_frozen_artifact_complete(
+        tmp_path,
+        acquisition,
+    )
+
+
+def test_v13_model_artifact_completion_validates_hash_and_size(tmp_path):
+    model_path = tmp_path / "disney_brdf.pt"
+    model_path.write_bytes(b"exact-fitted-state")
+    artifact = {
+        "schema": "ictpolarreal.disney-state-artifact.v1",
+        "path": "disney_brdf.pt",
+        "sha256": end2end_acquisition._file_sha256(model_path),
+        "bytes": model_path.stat().st_size,
+        "format": "pytorch_state_dict",
+    }
+    acquisition = {
+        "schema": "ictpolarreal.end2end-disney.v13",
+        "checkpoint_signature": {
+            "schema": "ictpolarreal.end2end-checkpoint.v13"
+        },
+        "model_artifact": artifact,
+    }
+
+    assert end2end_acquisition._model_artifact_complete(tmp_path, acquisition)
+    assert not end2end_acquisition._model_artifact_complete(
+        tmp_path,
+        {key: value for key, value in acquisition.items() if key != "model_artifact"},
+    )
+    model_path.write_bytes(b"tampered-fitted-state")
+    assert not end2end_acquisition._model_artifact_complete(tmp_path, acquisition)
+    # Recorded pre-v13 runs remain reorganizable; only v13 is fail-closed on hashes.
+    assert end2end_acquisition._model_artifact_complete(
+        tmp_path,
+        {"schema": "ictpolarreal.end2end-disney.v12"},
+    )
 
 
 def test_end2end_view_is_constant_optical_axis(tmp_path):
@@ -1893,6 +2500,129 @@ def test_prepare_materials_dispatches_acquisition_mode(
         assert calls[0]["end2end_primary_profile"] == "mix"
 
 
+def _run_process_shell(
+    tmp_path: Path,
+    *,
+    material_acquisition: str,
+    allocation_marker: tuple[str, str] | None = None,
+) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+    repo_root = Path(__file__).resolve().parents[1]
+    data_root = tmp_path / "data"
+    output_root = tmp_path / "outputs"
+    imaginaire_root = tmp_path / "imaginaire"
+    imaginaire_root.mkdir()
+    hdri_root = tmp_path / "hdris"
+    hdri_root.mkdir()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "conda").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    python_log = tmp_path / "python.log"
+    (fake_bin / "python").write_text(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$ICTPOLARREAL_TEST_PYTHON_LOG\"\n",
+        encoding="utf-8",
+    )
+    for executable in ("conda", "python"):
+        (fake_bin / executable).chmod(0o755)
+
+    environment = os.environ.copy()
+    environment["ENV_NAME"] = "__ictpolarreal_pytest_missing_env__"
+    environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+    environment["ICTPOLARREAL_TEST_PYTHON_LOG"] = str(python_log)
+    environment.pop("SLURM_JOB_ID", None)
+    environment.pop("ICTPOLARREAL_SLURM_WORKER", None)
+    if allocation_marker is not None:
+        environment[allocation_marker[0]] = allocation_marker[1]
+
+    arguments = [
+        "bash",
+        str(repo_root / "run.sh"),
+        "process",
+        "--data-root",
+        str(data_root),
+        "--output-root",
+        str(output_root),
+        "--material-acquisition",
+        material_acquisition,
+        "--max-lights",
+        "4",
+        "--min-lights",
+        "4",
+    ]
+    if material_acquisition == "end2end":
+        arguments.extend(
+            [
+                "--imaginaire-root",
+                str(imaginaire_root),
+                "--end2end-hdri-root",
+                str(hdri_root),
+            ]
+        )
+    result = subprocess.run(
+        arguments,
+        cwd=repo_root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    invocations = (
+        python_log.read_text(encoding="utf-8").splitlines()
+        if python_log.is_file()
+        else []
+    )
+    return result, invocations
+
+
+def test_run_sh_allows_default_material_acquisition_locally(tmp_path):
+    result, invocations = _run_process_shell(
+        tmp_path,
+        material_acquisition="default",
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert any(
+        "ictpolarreal.processing.prepare_materials" in line
+        for line in invocations
+    )
+
+
+def test_run_sh_rejects_local_end2end_material_acquisition(tmp_path):
+    result, invocations = _run_process_shell(
+        tmp_path,
+        material_acquisition="end2end",
+    )
+
+    assert result.returncode == 2
+    assert "must run inside a Slurm allocation" in result.stderr
+    assert "--slurm-dry-run" in result.stderr
+    assert not any(
+        "ictpolarreal.processing.prepare_materials" in line for line in invocations
+    )
+
+
+@pytest.mark.parametrize(
+    ("marker", "value"),
+    [("SLURM_JOB_ID", "12345"), ("ICTPOLARREAL_SLURM_WORKER", "1")],
+)
+def test_run_sh_allows_end2end_inside_slurm_worker(
+    tmp_path,
+    marker,
+    value,
+):
+    result, invocations = _run_process_shell(
+        tmp_path,
+        material_acquisition="end2end",
+        allocation_marker=(marker, value),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert any(
+        "ictpolarreal.processing.prepare_materials" in line
+        for line in invocations
+    )
+
+
 def test_slurm_dry_run_propagates_end2end_selector_and_options(tmp_path):
     repo_root = Path(__file__).resolve().parents[1]
     data_root = tmp_path / "data"
@@ -1912,6 +2642,8 @@ def test_slurm_dry_run_propagates_end2end_selector_and_options(tmp_path):
     environment = os.environ.copy()
     environment["ENV_NAME"] = "__ictpolarreal_pytest_missing_env__"
     environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+    environment.pop("SLURM_JOB_ID", None)
+    environment.pop("ICTPOLARREAL_SLURM_WORKER", None)
     result = subprocess.run(
         [
             "bash",
