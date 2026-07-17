@@ -236,6 +236,51 @@ def test_load_parallel_targets_reports_missing_recorded_frame():
         )
 
 
+def test_replay_target_loader_matches_acquisition_polarization_order(
+    monkeypatch, tmp_path,
+):
+    frame_ids = np.asarray([12, 4], dtype=np.int64)
+    for polarization in ("cross", "parallel"):
+        for frame_id in frame_ids:
+            (tmp_path / f"{polarization}_{int(frame_id)}.png").touch()
+    sample = SimpleNamespace(
+        light_path=lambda polarization, frame_id: (
+            tmp_path / f"{polarization}_{frame_id}.png"
+        )
+    )
+    calls = []
+
+    def fake_read(path, *, channels):
+        calls.append(Path(path).stem)
+        polarization, raw_frame_id = Path(path).stem.split("_")
+        value = int(raw_frame_id) + (100 if polarization == "cross" else 0)
+        return np.full((2, 1, channels), value, dtype=np.float32)
+
+    monkeypatch.setattr(render_saved_material, "read_image", fake_read)
+
+    targets = render_saved_material.load_parallel_targets_in_acquisition_order(
+        sample, frame_ids, height=2, width=1
+    )
+
+    assert calls == ["cross_12", "parallel_12", "cross_4", "parallel_4"]
+    np.testing.assert_array_equal(targets[:, 0, 0, 0], [12.0, 4.0])
+
+
+def test_replay_target_loader_requires_both_polarizations(tmp_path):
+    parallel = tmp_path / "parallel.png"
+    parallel.touch()
+    sample = SimpleNamespace(
+        light_path=lambda polarization, _frame_id: (
+            None if polarization == "cross" else parallel
+        )
+    )
+
+    with pytest.raises(FileNotFoundError, match="missing cross OLAT frame 9"):
+        render_saved_material.load_parallel_targets_in_acquisition_order(
+            sample, [9], height=2, width=1
+        )
+
+
 def test_presentation_alpha_preserves_clean_soft_mask_values():
     mask = np.asarray(
         [[[0.0], [0.25]], [[0.75], [1.0]]], dtype=np.float32

@@ -469,6 +469,58 @@ def load_parallel_targets(
     return np.maximum(stack, 0.0).astype(np.float32, copy=False)
 
 
+def load_parallel_targets_in_acquisition_order(
+    sample: CameraSample,
+    frame_ids: Sequence[int] | np.ndarray,
+    *,
+    height: int,
+    width: int,
+) -> np.ndarray:
+    """Replay the production cross/parallel EXR read and allocation order.
+
+    OpenCV's PIZ decoder can produce a few unstable boundary samples when the
+    parallel files are decoded in isolation.  The acquisition loader retains
+    each cross image, then each parallel image, before stacking both lists.
+    Repeating that exact order makes the checkpointed raw-target hash stable.
+    """
+    cross_images: list[np.ndarray] = []
+    parallel_images: list[np.ndarray] = []
+    for frame_id in np.asarray(frame_ids, dtype=np.int64):
+        paths = {
+            polarization: sample.light_path(polarization, int(frame_id))
+            for polarization in ("cross", "parallel")
+        }
+        for polarization in ("cross", "parallel"):
+            path = paths[polarization]
+            if path is None or not path.is_file():
+                raise FileNotFoundError(
+                    f"missing {polarization} OLAT frame {int(frame_id)}: {path}"
+                )
+            image = read_image(path, channels=3)
+            if image.shape != (height, width, 3):
+                raise ValueError(
+                    f"{polarization} OLAT frame {int(frame_id)} has shape "
+                    f"{image.shape}, expected {(height, width, 3)}"
+                )
+            target = np.asarray(image, dtype=np.float32)
+            if polarization == "cross":
+                cross_images.append(target)
+            else:
+                parallel_images.append(target)
+
+    # Preserve both production stack allocations before releasing the unused
+    # polarization branch.  This ordering is part of decoded-pixel replay.
+    cross_stack = np.stack(cross_images, axis=0).astype(np.float32, copy=False)
+    parallel_stack = np.stack(parallel_images, axis=0).astype(
+        np.float32, copy=False
+    )
+    del cross_stack, cross_images, parallel_images
+    parallel_stack = np.nan_to_num(
+        parallel_stack, copy=False, nan=0.0, posinf=0.0, neginf=0.0
+    )
+    return np.maximum(parallel_stack, 0.0).astype(np.float32, copy=False)
+
+
 def _presentation_alpha(mask: np.ndarray, height: int, width: int) -> np.ndarray:
     """Preserve the clean dataset mask's soft edge for report rendering."""
     image = np.asarray(mask, dtype=np.float32)
@@ -597,7 +649,7 @@ def prepare_replay_inputs(
     sample = CameraSample(object_name, camera, data_root / object_name / camera)
     if not sample.camera_dir.is_dir():
         raise FileNotFoundError(f"camera sample does not exist: {sample.camera_dir}")
-    parallel_targets_hwc = load_parallel_targets(
+    parallel_targets_hwc = load_parallel_targets_in_acquisition_order(
         sample, frame_ids, height=height, width=width
     )
     input_hashes = acquisition.get("input_hashes", {})
@@ -1566,6 +1618,7 @@ def render_saved_material(
                 f"{lighting_preset} requires a recorded validation condition index"
             )
     gpu = require_slurm_cuda(torch)
+    _root, disney_module, _source = _load_imaginaire_disney(imaginaire_root)
     lighting = load_recorded_lighting(camera_dir)
     if validation_condition_index is not None:
         _validate_requested_indices(
@@ -1601,7 +1654,6 @@ def render_saved_material(
             int(condition.record["absolute_index"])
             for condition in render_conditions
         ]
-    _root, disney_module, _source = _load_imaginaire_disney(imaginaire_root)
     config = disney_module.DisneyParamConfig(per_pixel=True, height_mode="none")
     model = disney_module.DisneyBRDFSimplifiedMultiLayer(
         replay.height, replay.width, device=device, cfg=config
