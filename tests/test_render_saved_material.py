@@ -349,7 +349,9 @@ def test_sample_sd_environment_matches_truncating_nearest_pixel_contract():
     torch.testing.assert_close(samples[3], environment[0, 1])
 
 
-def test_prepare_sd_renderings_preset_is_calibration_then_exact_rank_order(monkeypatch):
+def test_prepare_sd_fit_support_preset_is_calibration_then_exact_rank_order(
+    monkeypatch, tmp_path
+):
     torch = pytest.importorskip("torch")
     root = Path("/synthetic/hdr")
     paths = [root / name for name in render_saved_material.SD_OLAT_EXPECTED_TOP32]
@@ -391,37 +393,62 @@ def test_prepare_sd_renderings_preset_is_calibration_then_exact_rank_order(monke
         return "a" * 64
 
     monkeypatch.setattr(render_saved_material, "_file_sha256", fake_hash)
+    fit_support = np.asarray(
+        [1, 2, 4, 5, 7, 8, 10, 11, 12, 14, 15, 17, 18, 20, 21, 23,
+         24, 25, 27, 28, 30, 31, 33, 34, 36, 37, 38, 40, 41, 43, 44, 46,
+         47, 48],
+        dtype=np.int64,
+    )
+    angles = np.linspace(0.0, 2.0 * np.pi, 50, endpoint=False)
+    z = np.linspace(-0.9, 0.9, 50)
+    radius = np.sqrt(1.0 - z * z)
+    light_directions = np.stack(
+        [radius * np.cos(angles), radius * np.sin(angles), z], axis=1
+    ).astype(np.float32)
+    acquisition = {
+        "fit_conditions": {"olat": 34},
+        "light_split": {
+            "fit_stack_indices": fit_support.tolist(),
+            "selection": {
+                "fit_count": 34,
+                "mode": "holdout_every_third_available_light",
+            },
+        },
+    }
+    acquisition_path = tmp_path / "material" / "olat" / "acquisition.json"
+    acquisition_path.parent.mkdir(parents=True)
+    acquisition_path.write_text(json.dumps(acquisition), encoding="utf-8")
+    support_sha256 = render_saved_material._array_sha256(fit_support)
     replay = render_saved_material.ReplayInputs(
-        acquisition={},
-        model_path=Path("model.pt"),
+        acquisition=acquisition,
+        acquisition_path=acquisition_path,
+        model_path=acquisition_path.with_name("disney_brdf.pt"),
         height=2,
         width=4,
-        light_ids=np.arange(4, dtype=np.int64),
-        frame_ids=np.arange(4, dtype=np.int64),
-        parallel_targets=np.zeros((4, 3, 2, 4), dtype=np.float32),
-        light_directions=np.asarray(
-            [
-                [1.0, 0.0, 0.0],
-                [-1.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0],
-                [0.0, -1.0, 0.0],
-            ],
-            dtype=np.float32,
-        ),
+        light_ids=np.arange(50, dtype=np.int64),
+        frame_ids=np.arange(50, dtype=np.int64),
+        parallel_targets=np.zeros((50, 3, 2, 4), dtype=np.float32),
+        light_directions=light_directions,
         view_directions=np.zeros((2, 4, 3), dtype=np.float32),
         fit_foreground=np.ones((2, 4, 1), dtype=np.float32),
         presentation_alpha=np.ones((2, 4, 1), dtype=np.float32),
         presentation_mask_path=Path("mask.png"),
-        hash_checks={},
+        hash_checks={
+            "fit_support_indices": {
+                "actual_sha256": support_sha256,
+                "expected_sha256": support_sha256,
+                "passed": True,
+            }
+        },
     )
     lighting = render_saved_material.RecordedLighting(
         manifest={},
         conditions=(),
         condition_ids=np.asarray([]),
         splits=np.asarray([]),
-        weights=np.zeros((0, 4, 3), dtype=np.float32),
-        fit_support_indices=np.arange(4, dtype=np.int64),
-        evaluation_support_indices=np.arange(4, dtype=np.int64),
+        weights=np.zeros((0, 50, 3), dtype=np.float32),
+        fit_support_indices=fit_support,
+        evaluation_support_indices=np.setdiff1d(np.arange(50), fit_support),
     )
 
     preset = render_saved_material.prepare_sd_renderings_preset(
@@ -432,6 +459,7 @@ def test_prepare_sd_renderings_preset_is_calibration_then_exact_rank_order(monke
         c04_lights_path=c04_path,
         device="synthetic",
         projection_height=2,
+        lighting_preset=render_saved_material.SD_RENDERINGS_FIT_SUPPORT_PRESET,
     )
 
     assert len(preset.conditions) == 36
@@ -447,9 +475,92 @@ def test_prepare_sd_renderings_preset_is_calibration_then_exact_rank_order(monke
     assert [entry.record["source_rank"] for entry in preset.conditions[4:]] == list(
         range(1, 33)
     )
-    assert all(entry.weights.shape == (4, 3) for entry in preset.conditions)
-    assert preset.provenance["schema"] == render_saved_material.SD_RENDERINGS_SCHEMA
+    assert all(entry.weights.shape == (50, 3) for entry in preset.conditions)
+    assert preset.provenance["schema"] == (
+        render_saved_material.SD_RENDERINGS_FIT_SUPPORT_SCHEMA
+    )
+    assert preset.provenance["historical_lighting_exact"] is False
+    assert preset.provenance["projection"]["support_count"] == 34
+    assert preset.provenance["available_fit_support"]["fit_count"] == 34
     assert preset.provenance["orientation"]["horizontal_shift_fraction"] == 0.5
+
+    with pytest.raises(ValueError, match="historical 164-light fit support"):
+        render_saved_material.prepare_sd_renderings_preset(
+            torch=torch,
+            replay=replay,
+            lighting=lighting,
+            hdri_root=root,
+            c04_lights_path=c04_path,
+            device="synthetic",
+            projection_height=2,
+            lighting_preset=render_saved_material.SD_RENDERINGS_PRESET,
+        )
+
+    full_support = np.arange(164, dtype=np.int64)
+    full_acquisition = {
+        "fit_conditions": {"olat": 164},
+        "light_split": {
+            "fit_stack_indices": full_support.tolist(),
+            "selection": {
+                "fit_count": 164,
+                "mode": "lsx_visible_hemisphere_164",
+            },
+        },
+    }
+    full_acquisition_path = tmp_path / "full" / "acquisition.json"
+    full_acquisition_path.parent.mkdir()
+    full_acquisition_path.write_text(
+        json.dumps(full_acquisition), encoding="utf-8"
+    )
+    full_angles = np.linspace(0.0, 2.0 * np.pi, 164, endpoint=False)
+    full_z = np.linspace(-0.99, 0.99, 164)
+    full_radius = np.sqrt(1.0 - full_z * full_z)
+    full_directions = np.stack(
+        [
+            full_radius * np.cos(full_angles),
+            full_radius * np.sin(full_angles),
+            full_z,
+        ],
+        axis=1,
+    ).astype(np.float32)
+    full_support_sha256 = render_saved_material._array_sha256(full_support)
+    full_replay = SimpleNamespace(
+        acquisition=full_acquisition,
+        acquisition_path=full_acquisition_path,
+        model_path=full_acquisition_path.with_name("disney_brdf.pt"),
+        light_directions=full_directions,
+        hash_checks={
+            "fit_support_indices": {
+                "actual_sha256": full_support_sha256,
+                "expected_sha256": full_support_sha256,
+                "passed": True,
+            }
+        },
+    )
+    full_lighting = render_saved_material.RecordedLighting(
+        manifest={},
+        conditions=(),
+        condition_ids=np.asarray([]),
+        splits=np.asarray([]),
+        weights=np.zeros((0, 164, 3), dtype=np.float32),
+        fit_support_indices=full_support,
+        evaluation_support_indices=np.asarray([0], dtype=np.int64),
+    )
+    strict_preset = render_saved_material.prepare_sd_renderings_preset(
+        torch=torch,
+        replay=full_replay,
+        lighting=full_lighting,
+        hdri_root=root,
+        c04_lights_path=c04_path,
+        device="synthetic",
+        projection_height=2,
+        lighting_preset=render_saved_material.SD_RENDERINGS_PRESET,
+    )
+    assert strict_preset.provenance["schema"] == (
+        render_saved_material.SD_RENDERINGS_SCHEMA
+    )
+    assert strict_preset.provenance["projection"]["support_count"] == 164
+    assert "historical_lighting_exact" not in strict_preset.provenance
 
 
 def test_historical_probe_parameters_match_exact_sd_constraints():
@@ -662,6 +773,10 @@ def test_cli_lighting_source_is_mutually_exclusive():
     preset = parser.parse_args([*common, "--lighting-preset", "sd-renderings"])
     assert preset.lighting_preset == "sd-renderings"
     assert preset.condition_indices is None
+    fit_support = parser.parse_args(
+        [*common, "--lighting-preset", "sd-renderings-fit-support"]
+    )
+    assert fit_support.lighting_preset == "sd-renderings-fit-support"
     with pytest.raises(SystemExit):
         parser.parse_args(
             [

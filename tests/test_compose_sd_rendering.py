@@ -43,7 +43,12 @@ def _orientation() -> dict:
     }
 
 
-def _preset_condition(position: int) -> dict:
+def _preset_condition(
+    position: int,
+    *,
+    support_count: int = 164,
+    fit_support_mode: bool = False,
+) -> dict:
     if position < 4:
         color_names = ("w", "r", "g", "b")
         source = f"calibration_{color_names[position]}"
@@ -57,7 +62,7 @@ def _preset_condition(position: int) -> dict:
         condition_id = f"sd_c04_rank_{source_rank:02d}_sd_c04_rot090"
         source_kind = "environment_map"
         variance_score = float(1000 - source_rank)
-    return {
+    record = {
         "absolute_index": None,
         "condition_id": condition_id,
         "safe_condition_id": condition_id,
@@ -70,10 +75,19 @@ def _preset_condition(position: int) -> dict:
         "source_rank": source_rank,
         "source_sha256": _digest(source),
         "split": "fit",
-        "support_count": 164,
+        "support_count": support_count,
         "variance_score": variance_score,
         "weight_sha256": _digest(f"weights:{condition_id}"),
     }
+    if fit_support_mode:
+        record.update(
+            support_policy=compositor.AVAILABLE_FIT_SUPPORT_POLICY,
+            support_indices_sha256=compositor._array_sha256(
+                np.arange(support_count, dtype=np.int64)
+            ),
+            historical_lighting_exact=False,
+        )
+    return record
 
 
 def _camera_relative(camera_dir: Path, path: Path) -> str:
@@ -86,7 +100,15 @@ def _write_rgb(path: Path, color: tuple[int, int, int], *, mode: str = "RGB") ->
     Image.new(mode, NATIVE_SIZE, value).save(path)
 
 
-def _write_renderer_fixture(camera_dir: Path) -> dict[str, tuple[int, int, int]]:
+def _write_renderer_fixture(
+    camera_dir: Path,
+    *,
+    lighting_preset: str = compositor.SD_RENDERINGS_PRESET,
+    support_count: int = 164,
+) -> dict[str, tuple[int, int, int]]:
+    fit_support_mode = lighting_preset == compositor.SD_RENDERINGS_FIT_SUPPORT_PRESET
+    fit_support = np.arange(support_count, dtype=np.int64)
+    support_sha256 = compositor._array_sha256(fit_support)
     material_dir = camera_dir / "material" / "olat"
     stage_dir = camera_dir / ".rendering_stage"
     maps_dir = stage_dir / "material_maps"
@@ -112,7 +134,11 @@ def _write_renderer_fixture(camera_dir: Path) -> dict[str, tuple[int, int, int]]
     rendered_conditions = []
     color_index = len(compositor.MATERIAL_MAP_ORDER)
     for position in range(compositor.EXPECTED_CONDITION_COUNT):
-        record = _preset_condition(position)
+        record = _preset_condition(
+            position,
+            support_count=support_count,
+            fit_support_mode=fit_support_mode,
+        )
         panel_dir = conditions_dir / record["safe_condition_id"]
         panels = {}
         for panel_name in compositor.PANEL_ORDER:
@@ -132,6 +158,30 @@ def _write_renderer_fixture(camera_dir: Path) -> dict[str, tuple[int, int, int]]
     material_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = material_dir / "disney_brdf.pt"
     checkpoint_path.write_bytes(b"synthetic fixed-post-fit Disney state")
+    selection_mode = (
+        "available_50_light_holdout_split"
+        if fit_support_mode
+        else "lsx_visible_hemisphere_164"
+    )
+    acquisition_path = material_dir / "acquisition.json"
+    acquisition_path.write_text(
+        json.dumps(
+            {
+                "fit_conditions": {"olat": support_count},
+                "lighting_profile": "olat",
+                "light_split": {
+                    "fit_stack_indices": fit_support.tolist(),
+                    "selection": {
+                        "fit_count": support_count,
+                        "mode": selection_mode,
+                    },
+                },
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
     validation_dir = stage_dir / "validation"
     validation_dir.mkdir(exist_ok=True)
@@ -157,8 +207,13 @@ def _write_renderer_fixture(camera_dir: Path) -> dict[str, tuple[int, int, int]]
         "hdri_root": "/datasets/HDR/hdr_maps_1k",
         "orientation": _orientation(),
         "projection": {
-            "support": "ICTPolarReal OLAT fit support",
-            "support_count": 164,
+            "support": (
+                "ICTPolarReal available OLAT fit support"
+                if fit_support_mode
+                else "ICTPolarReal OLAT fit support"
+            ),
+            "support_count": support_count,
+            "support_indices_sha256": support_sha256,
         },
         "ranking": {
             "camera": "C04",
@@ -177,12 +232,32 @@ def _write_renderer_fixture(camera_dir: Path) -> dict[str, tuple[int, int, int]]
             "path": "/imaginaire/CookTorrance_IBL/CookTorrance.py",
             "sha256": _digest("sampler source"),
         },
-        "schema": "ictpolarreal.sd-renderings-preset.v1",
+        "schema": (
+            compositor.SD_RENDERINGS_FIT_SUPPORT_SCHEMA
+            if fit_support_mode
+            else compositor.SD_RENDERINGS_PRESET_SCHEMA
+        ),
         "trainer_source": {
             "path": "/imaginaire/trainers/relighting_switchlight_pretrain.py",
             "sha256": _digest("trainer source"),
         },
     }
+    if fit_support_mode:
+        preset_provenance["historical_lighting_exact"] = False
+        preset_provenance["projection"].update(
+            support_policy=compositor.AVAILABLE_FIT_SUPPORT_POLICY,
+            historical_lighting_exact=False,
+        )
+        preset_provenance["available_fit_support"] = {
+            "schema": compositor.AVAILABLE_FIT_SUPPORT_SCHEMA,
+            "source": "acquisition.light_split.fit_stack_indices",
+            "support_policy": compositor.AVAILABLE_FIT_SUPPORT_POLICY,
+            "fit_count": support_count,
+            "fit_stack_indices_sha256": support_sha256,
+            "selection_mode": selection_mode,
+            "acquisition_path": str(acquisition_path.resolve()),
+            "acquisition_sha256": _sha256(acquisition_path),
+        }
 
     raw_targets_digest = _digest("raw measured parallel OLAT targets")
     raw_parallel_check = {
@@ -215,6 +290,11 @@ def _write_renderer_fixture(camera_dir: Path) -> dict[str, tuple[int, int, int]]
                 "expected_sha256": _digest("condition weights"),
                 "passed": True,
             },
+            "fit_support_indices": {
+                "actual_sha256": support_sha256,
+                "expected_sha256": support_sha256,
+                "passed": True,
+            },
             "material_state": {
                 "actual_sha256": _sha256(checkpoint_path),
                 "expected_sha256": _sha256(checkpoint_path),
@@ -243,7 +323,7 @@ def _write_renderer_fixture(camera_dir: Path) -> dict[str, tuple[int, int, int]]
                 )
             },
         },
-        "lighting_preset": "sd-renderings",
+        "lighting_preset": lighting_preset,
         "material": {
             "path": "material/olat/disney_brdf.pt",
             "sha256": _sha256(checkpoint_path),
@@ -310,6 +390,23 @@ def _write_renderer_fixture(camera_dir: Path) -> dict[str, tuple[int, int, int]]
         json.dumps(manifest, indent=2, sort_keys=False) + "\n",
         encoding="utf-8",
     )
+    (camera_dir / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema": "ictpolarreal.material-profiles.v3",
+                "profiles": ["olat", "hdri", "mix"],
+                "primary_material_dir": "material/olat/maps",
+                "evaluation": {"status": "complete"},
+                "olat_selection": {
+                    "fit_count": support_count,
+                    "mode": selection_mode,
+                },
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     return expected_colors
 
 
@@ -337,6 +434,10 @@ def test_production_contract_is_the_identified_reference():
     assert compositor.RENDER_MANIFEST_SCHEMA == "ictpolarreal.saved-disney-render.v4"
     assert compositor.PRESENTATION_MASK_SCHEMA == (
         "ictpolarreal.saved-render-presentation-mask.v2"
+    )
+    assert compositor.SD_RENDERINGS_PRESET == "sd-renderings"
+    assert compositor.SD_RENDERINGS_FIT_SUPPORT_PRESET == (
+        "sd-renderings-fit-support"
     )
     assert compositor.SHEET_COLUMNS == 12
     assert compositor.SHEET_ROWS == 13
@@ -458,6 +559,13 @@ def test_compose_writes_full_gapless_sheet_in_exact_order(
     assert not (material_root / "rendering.json").exists()
     assert not (olat_dir / "rendering.png").exists()
     assert not (olat_dir / "rendering.json").exists()
+    camera_manifest = json.loads(
+        (camera_dir / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert camera_manifest["rendering"]["lighting_preset"] == "sd-renderings"
+    assert camera_manifest["rendering"]["fit_support_count"] == 164
+    assert camera_manifest["rendering"]["historical_lighting_exact"] is True
+    assert camera_manifest["rendering"]["sha256"] == _sha256(rendering_path)
 
     with Image.open(rendering_path) as sheet:
         assert sheet.format == "PNG"
@@ -480,6 +588,155 @@ def test_compose_writes_full_gapless_sheet_in_exact_order(
     calls.clear()
     compositor.compose_sd_rendering(camera_dir)
     assert rendering_path.read_bytes() == first_rendering
+
+
+def test_fit_support_preset_composes_and_persists_honest_provenance(
+    tmp_path, small_sheet
+):
+    camera_dir = tmp_path / "candle" / "cam07"
+    _write_renderer_fixture(
+        camera_dir,
+        lighting_preset=compositor.SD_RENDERINGS_FIT_SUPPORT_PRESET,
+        support_count=34,
+    )
+
+    rendering_path = compositor.compose_sd_rendering(camera_dir)
+
+    assert rendering_path.is_file()
+    assert not (camera_dir / ".rendering_stage").exists()
+    camera_manifest = json.loads(
+        (camera_dir / "manifest.json").read_text(encoding="utf-8")
+    )
+    provenance = camera_manifest["rendering"]
+    assert provenance["schema"] == compositor.PICKUP_PROVENANCE_SCHEMA
+    assert provenance["lighting_preset"] == "sd-renderings-fit-support"
+    assert provenance["preset_provenance_schema"] == (
+        compositor.SD_RENDERINGS_FIT_SUPPORT_SCHEMA
+    )
+    assert provenance["fit_support_count"] == 34
+    assert provenance["support_policy"] == (
+        compositor.AVAILABLE_FIT_SUPPORT_POLICY
+    )
+    assert provenance["historical_lighting_exact"] is False
+    assert provenance["sha256"] == _sha256(rendering_path)
+
+
+def test_strict_preset_rejects_reduced_fit_support(tmp_path, small_sheet):
+    camera_dir = tmp_path / "candle" / "cam07"
+    _write_renderer_fixture(camera_dir, support_count=34)
+
+    with pytest.raises(ValueError, match="164-light fit support"):
+        compositor.compose_sd_rendering(camera_dir)
+
+
+@pytest.mark.parametrize("support_count", [0, -1, True])
+def test_fit_support_preset_rejects_nonpositive_or_boolean_count(
+    tmp_path, small_sheet, support_count
+):
+    camera_dir = tmp_path / "candle" / "cam07"
+    _write_renderer_fixture(
+        camera_dir,
+        lighting_preset=compositor.SD_RENDERINGS_FIT_SUPPORT_PRESET,
+        support_count=34,
+    )
+    manifest = _load_manifest(camera_dir)
+    manifest["preset_provenance"]["projection"]["support_count"] = support_count
+    _save_manifest(camera_dir, manifest)
+
+    with pytest.raises(ValueError, match="invalid fit-support count"):
+        compositor.compose_sd_rendering(camera_dir)
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value", "message"),
+    [
+        ("support_policy", "historical_fixed_164", "wrong support policy"),
+        ("historical_lighting_exact", True, "wrong support policy"),
+        ("support_indices_sha256", "f" * 64, "differs from OLAT acquisition"),
+    ],
+)
+def test_fit_support_preset_rejects_projection_provenance_drift(
+    tmp_path, small_sheet, field, bad_value, message
+):
+    camera_dir = tmp_path / "candle" / "cam07"
+    _write_renderer_fixture(
+        camera_dir,
+        lighting_preset=compositor.SD_RENDERINGS_FIT_SUPPORT_PRESET,
+        support_count=34,
+    )
+    manifest = _load_manifest(camera_dir)
+    manifest["preset_provenance"]["projection"][field] = bad_value
+    _save_manifest(camera_dir, manifest)
+
+    with pytest.raises(ValueError, match=message):
+        compositor.compose_sd_rendering(camera_dir)
+
+
+def test_fit_support_preset_rejects_condition_and_schema_mismatch(
+    tmp_path, small_sheet
+):
+    camera_dir = tmp_path / "candle" / "cam07"
+    _write_renderer_fixture(
+        camera_dir,
+        lighting_preset=compositor.SD_RENDERINGS_FIT_SUPPORT_PRESET,
+        support_count=34,
+    )
+    manifest = _load_manifest(camera_dir)
+    manifest["conditions"][7]["support_count"] = 33
+    _save_manifest(camera_dir, manifest)
+    with pytest.raises(ValueError, match="condition support counts differ"):
+        compositor.compose_sd_rendering(camera_dir)
+
+    manifest = _load_manifest(camera_dir)
+    manifest["conditions"][7]["support_count"] = 34
+    manifest["preset_provenance"]["schema"] = compositor.SD_RENDERINGS_PRESET_SCHEMA
+    _save_manifest(camera_dir, manifest)
+    with pytest.raises(ValueError, match="unsupported provenance schema"):
+        compositor.compose_sd_rendering(camera_dir)
+
+
+def test_fit_support_preset_rejects_acquisition_support_mismatch(
+    tmp_path, small_sheet
+):
+    camera_dir = tmp_path / "candle" / "cam07"
+    _write_renderer_fixture(
+        camera_dir,
+        lighting_preset=compositor.SD_RENDERINGS_FIT_SUPPORT_PRESET,
+        support_count=34,
+    )
+    acquisition_path = camera_dir / "material" / "olat" / "acquisition.json"
+    acquisition = json.loads(acquisition_path.read_text(encoding="utf-8"))
+    acquisition["light_split"]["fit_stack_indices"][-1] = 99
+    acquisition_path.write_text(json.dumps(acquisition), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="differs from OLAT acquisition"):
+        compositor.compose_sd_rendering(camera_dir)
+
+
+def test_camera_manifest_failure_restores_previous_rendering(
+    tmp_path, monkeypatch, small_sheet
+):
+    camera_dir = tmp_path / "candle" / "cam07"
+    _write_renderer_fixture(
+        camera_dir,
+        lighting_preset=compositor.SD_RENDERINGS_FIT_SUPPORT_PRESET,
+        support_count=34,
+    )
+    old_rendering = b"previous validated rendering"
+    (camera_dir / "rendering.png").write_bytes(old_rendering)
+    camera_manifest_path = camera_dir / "manifest.json"
+    original_camera_manifest = camera_manifest_path.read_bytes()
+
+    def reject_manifest(*args, **kwargs):
+        raise RuntimeError("synthetic camera manifest failure")
+
+    monkeypatch.setattr(compositor, "_replace_camera_manifest", reject_manifest)
+    with pytest.raises(RuntimeError, match="camera manifest failure"):
+        compositor.compose_sd_rendering(camera_dir)
+
+    assert (camera_dir / "rendering.png").read_bytes() == old_rendering
+    assert camera_manifest_path.read_bytes() == original_camera_manifest
+    assert (camera_dir / ".rendering_stage").is_dir()
 
 
 def test_keep_stage_retains_only_private_inputs(tmp_path, small_sheet):
@@ -713,4 +970,4 @@ def test_cli_names_full_sheet_and_keep_stage():
     args = parser.parse_args(["--camera-dir", "/camera", "--keep-stage"])
 
     assert args.keep_stage is True
-    assert "full historical SD material-rendering sheet" in parser.description
+    assert "full SD-layout material-rendering sheet" in parser.description

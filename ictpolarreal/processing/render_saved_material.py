@@ -76,6 +76,16 @@ SUPPORTED_ORIENTED_REPLAY_ADAPTERS = {
 }
 SD_RENDERINGS_PRESET = "sd-renderings"
 SD_RENDERINGS_SCHEMA = "ictpolarreal.sd-renderings-preset.v1"
+SD_RENDERINGS_FIT_SUPPORT_PRESET = "sd-renderings-fit-support"
+SD_RENDERINGS_FIT_SUPPORT_SCHEMA = (
+    "ictpolarreal.sd-renderings-fit-support-preset.v1"
+)
+SD_RENDERINGS_PRESETS = (
+    SD_RENDERINGS_PRESET,
+    SD_RENDERINGS_FIT_SUPPORT_PRESET,
+)
+AVAILABLE_FIT_SUPPORT_SCHEMA = "ictpolarreal.available-fit-support.v1"
+AVAILABLE_FIT_SUPPORT_POLICY = "recorded_available_fit_support"
 SD_RENDERINGS_ROTATION_LABEL = 90
 SD_RENDERINGS_CUMULATIVE_ROLLS = 2
 SD_C04_LIGHTS_SHA256 = (
@@ -153,6 +163,7 @@ class RecordedLighting:
 @dataclass(frozen=True)
 class ReplayInputs:
     acquisition: dict[str, Any]
+    acquisition_path: Path
     model_path: Path
     height: int
     width: int
@@ -314,6 +325,56 @@ def support_for_condition(lighting: RecordedLighting, index: int) -> np.ndarray:
     if split in {"heldout", "evaluation"}:
         return lighting.evaluation_support_indices
     raise ValueError(f"unsupported recorded condition split {split!r} at row {index}")
+
+
+def acquisition_fit_support(
+    acquisition: Mapping[str, Any], n_lights: int
+) -> tuple[np.ndarray, str]:
+    """Return the acquisition's exact fit rows and recorded selection mode."""
+    light_split = acquisition.get("light_split")
+    if not isinstance(light_split, Mapping):
+        raise ValueError("acquisition.json is missing light_split provenance")
+    raw_indices = light_split.get("fit_stack_indices")
+    if (
+        not isinstance(raw_indices, list)
+        or not raw_indices
+        or any(
+            isinstance(value, bool) or not isinstance(value, int)
+            for value in raw_indices
+        )
+    ):
+        raise ValueError(
+            "acquisition fit_stack_indices must be a non-empty integer list"
+        )
+    indices = np.asarray(raw_indices, dtype=np.int64)
+    _validate_support(indices, n_lights, "acquisition fit")
+
+    selection = light_split.get("selection")
+    if not isinstance(selection, Mapping):
+        raise ValueError("acquisition light split is missing selection provenance")
+    fit_count = selection.get("fit_count")
+    if (
+        isinstance(fit_count, bool)
+        or not isinstance(fit_count, int)
+        or fit_count <= 0
+        or fit_count != len(indices)
+    ):
+        raise ValueError(
+            "acquisition selection fit_count must match fit_stack_indices"
+        )
+    selection_mode = selection.get("mode")
+    if not isinstance(selection_mode, str) or not selection_mode:
+        raise ValueError("acquisition selection mode must be a non-empty string")
+
+    fit_conditions = acquisition.get("fit_conditions")
+    if (
+        not isinstance(fit_conditions, Mapping)
+        or fit_conditions.get("olat") != fit_count
+    ):
+        raise ValueError(
+            "acquisition fit_conditions.olat must match the recorded fit support"
+        )
+    return indices, selection_mode
 
 
 def reconstruct_light_ids(
@@ -500,6 +561,15 @@ def prepare_replay_inputs(
     )
 
     n_lights = int(lighting.weights.shape[1])
+    recorded_fit_support, _selection_mode = acquisition_fit_support(
+        acquisition, n_lights
+    )
+    _record_hash_check(
+        checks,
+        "fit_support_indices",
+        _array_sha256(lighting.fit_support_indices),
+        _array_sha256(recorded_fit_support),
+    )
     light_ids = reconstruct_light_ids(acquisition, n_lights)
     frame_ids = reconstruct_frame_ids(acquisition, n_lights)
     _record_hash_check(
@@ -579,6 +649,7 @@ def prepare_replay_inputs(
         )
     return ReplayInputs(
         acquisition=acquisition,
+        acquisition_path=acquisition_path.resolve(),
         model_path=model_path,
         height=height,
         width=width,
@@ -719,18 +790,50 @@ def prepare_sd_renderings_preset(
     c04_lights_path: str | Path,
     device,
     projection_height: int = DEFAULT_PROJECTION_HEIGHT,
+    lighting_preset: str = SD_RENDERINGS_PRESET,
 ) -> PreparedPreset:
-    """Build the 36-condition lighting sequence used by SD-OLAT rendering.
+    """Build the 36-condition SD layout under one explicit support contract.
 
     The source ranking deliberately follows the trainer's C04 nearest-pixel
-    sampler. Rendering still uses ICTPolarReal's calibrated 164-light fit basis:
-    each selected environment is normalized and integrated over that basis's
-    spherical Voronoi cells.
+    sampler. ``sd-renderings`` retains the exact 164-light fit basis.  The
+    separately provenanced ``sd-renderings-fit-support`` mode projects over all
+    fit rows actually recorded by a reduced acquisition.
     """
     root = Path(hdri_root).expanduser().resolve()
     c04_path = Path(c04_lights_path).expanduser().resolve()
+    if lighting_preset not in SD_RENDERINGS_PRESETS:
+        raise ValueError(f"unsupported SD lighting preset {lighting_preset!r}")
     if projection_height <= 0:
         raise ValueError("preset projection height must be positive")
+    support = np.asarray(lighting.fit_support_indices, dtype=np.int64)
+    n_lights = len(replay.light_directions)
+    _validate_support(support, n_lights, "preset fit")
+    acquisition_support, selection_mode = acquisition_fit_support(
+        replay.acquisition, n_lights
+    )
+    if not np.array_equal(support, acquisition_support):
+        raise ValueError(
+            "recorded lighting fit support differs from acquisition "
+            "light_split.fit_stack_indices"
+        )
+    support_sha256 = _array_sha256(support)
+    fit_support_check = replay.hash_checks.get("fit_support_indices")
+    if (
+        not isinstance(fit_support_check, Mapping)
+        or fit_support_check.get("passed") is not True
+        or fit_support_check.get("actual_sha256") != support_sha256
+        or fit_support_check.get("expected_sha256") != support_sha256
+    ):
+        raise ValueError(
+            "saved-material preset requires a passing fit-support hash check"
+        )
+    if lighting_preset == SD_RENDERINGS_PRESET and len(support) != 164:
+        raise ValueError(
+            "sd-renderings requires the historical 164-light fit support; "
+            f"this acquisition has {len(support)} rows. Use "
+            f"{SD_RENDERINGS_FIT_SUPPORT_PRESET!r} for an explicitly "
+            "reduced-support rendering."
+        )
     paths = discover_environment_maps(root)
     c04_hash = _file_sha256(c04_path)
     if c04_hash != SD_C04_LIGHTS_SHA256:
@@ -775,8 +878,6 @@ def prepare_sd_renderings_preset(
             f"actual={actual_names[:8]}, expected={SD_OLAT_EXPECTED_TOP32[:8]}"
         )
 
-    support = np.asarray(lighting.fit_support_indices, dtype=np.int64)
-    n_lights = len(replay.light_directions)
     projection_width = projection_height * 2
     assignment, solid_angles = build_voronoi_projection(
         replay.light_directions[support], projection_height, projection_width
@@ -793,15 +894,30 @@ def prepare_sd_renderings_preset(
             "rot90 entry is the second cumulative quarter-roll"
         ),
     }
-    projection = {
+    projection: dict[str, Any] = {
         "type": "nearest-light spherical Voronoi with solid-angle integration",
         "height": int(projection_height),
         "width": int(projection_width),
-        "support": "ICTPolarReal OLAT fit support",
+        "support": (
+            "ICTPolarReal OLAT fit support"
+            if lighting_preset == SD_RENDERINGS_PRESET
+            else "ICTPolarReal available OLAT fit support"
+        ),
         "support_count": int(len(support)),
-        "support_indices_sha256": _array_sha256(support),
+        "support_indices_sha256": support_sha256,
         "normalization": "scalar whole-environment p99.5 before projection",
     }
+    condition_support_provenance: dict[str, Any] = {}
+    if lighting_preset == SD_RENDERINGS_FIT_SUPPORT_PRESET:
+        projection.update(
+            support_policy=AVAILABLE_FIT_SUPPORT_POLICY,
+            historical_lighting_exact=False,
+        )
+        condition_support_provenance = {
+            "support_policy": AVAILABLE_FIT_SUPPORT_POLICY,
+            "support_indices_sha256": support_sha256,
+            "historical_lighting_exact": False,
+        }
 
     calibration_colors = (
         ("w", np.asarray([1.0, 1.0, 1.0], dtype=np.float32)),
@@ -841,6 +957,7 @@ def prepare_sd_renderings_preset(
                     "support_count": int(len(support)),
                     "weight_sha256": _array_sha256(weights),
                     "orientation": orientation,
+                    **condition_support_provenance,
                 },
             )
         )
@@ -887,6 +1004,7 @@ def prepare_sd_renderings_preset(
                     "support_count": int(len(support)),
                     "weight_sha256": _array_sha256(weights),
                     "orientation": orientation,
+                    **condition_support_provenance,
                 },
             )
         )
@@ -904,8 +1022,12 @@ def prepare_sd_renderings_preset(
         / "relighting_switchlight_pretrain.py"
     )
     sampler_path = imaginaire_root / "CookTorrance_IBL" / "CookTorrance.py"
-    provenance = {
-        "schema": SD_RENDERINGS_SCHEMA,
+    provenance: dict[str, Any] = {
+        "schema": (
+            SD_RENDERINGS_SCHEMA
+            if lighting_preset == SD_RENDERINGS_PRESET
+            else SD_RENDERINGS_FIT_SUPPORT_SCHEMA
+        ),
         "hdri_root": str(root),
         "candidate_count": len(paths),
         "calibration_count": 4,
@@ -937,6 +1059,20 @@ def prepare_sd_renderings_preset(
             "sha256": _file_sha256(sampler_path),
         },
     }
+    if lighting_preset == SD_RENDERINGS_FIT_SUPPORT_PRESET:
+        provenance.update(
+            historical_lighting_exact=False,
+            available_fit_support={
+                "schema": AVAILABLE_FIT_SUPPORT_SCHEMA,
+                "source": "acquisition.light_split.fit_stack_indices",
+                "support_policy": AVAILABLE_FIT_SUPPORT_POLICY,
+                "fit_count": int(len(support)),
+                "fit_stack_indices_sha256": support_sha256,
+                "selection_mode": selection_mode,
+                "acquisition_path": str(replay.acquisition_path.resolve()),
+                "acquisition_sha256": _file_sha256(replay.acquisition_path),
+            },
+        )
     return PreparedPreset(tuple(conditions), provenance)
 
 
@@ -1418,16 +1554,16 @@ def render_saved_material(
         raise ValueError(
             "choose exactly one of condition_indices or lighting_preset"
         )
-    if lighting_preset is not None and lighting_preset != SD_RENDERINGS_PRESET:
+    if lighting_preset is not None and lighting_preset not in SD_RENDERINGS_PRESETS:
         raise ValueError(f"unsupported lighting preset {lighting_preset!r}")
-    if lighting_preset == SD_RENDERINGS_PRESET:
+    if lighting_preset in SD_RENDERINGS_PRESETS:
         if hdri_root is None or sd_c04_lights_path is None:
             raise ValueError(
-                "sd-renderings requires hdri_root and sd_c04_lights_path"
+                f"{lighting_preset} requires hdri_root and sd_c04_lights_path"
             )
         if validation_condition_index is None:
             raise ValueError(
-                "sd-renderings requires a recorded validation condition index"
+                f"{lighting_preset} requires a recorded validation condition index"
             )
     gpu = require_slurm_cuda(torch)
     lighting = load_recorded_lighting(camera_dir)
@@ -1446,7 +1582,7 @@ def render_saved_material(
     )
     device = torch.device("cuda")
     preset: PreparedPreset | None = None
-    if lighting_preset == SD_RENDERINGS_PRESET:
+    if lighting_preset in SD_RENDERINGS_PRESETS:
         preset = prepare_sd_renderings_preset(
             torch=torch,
             replay=replay,
@@ -1454,6 +1590,7 @@ def render_saved_material(
             hdri_root=hdri_root,
             c04_lights_path=sd_c04_lights_path,
             device=device,
+            lighting_preset=lighting_preset,
         )
         render_conditions = preset.conditions
         selected_absolute_indices = None
@@ -1909,7 +2046,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     lighting.add_argument(
         "--lighting-preset",
-        choices=(SD_RENDERINGS_PRESET,),
+        choices=SD_RENDERINGS_PRESETS,
     )
     parser.add_argument("--hdri-root", type=Path)
     parser.add_argument("--sd-c04-lights", type=Path)
@@ -1943,7 +2080,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             args.condition_indices, count=len(lighting.conditions)
         )
     c04_lights = args.sd_c04_lights
-    if args.lighting_preset == SD_RENDERINGS_PRESET and c04_lights is None:
+    if args.lighting_preset in SD_RENDERINGS_PRESETS and c04_lights is None:
         c04_lights = (
             args.imaginaire_root
             / "OLATPipeClean"
