@@ -30,6 +30,7 @@ from ictpolarreal.processing.end2end_acquisition import (
 from ictpolarreal.processing.material_decomposition import (
     load_end2end_view_directions,
     load_light_directions,
+    load_view_directions,
 )
 from ictpolarreal.processing.lighting_profiles import (
     DEFAULT_PROJECTION_HEIGHT,
@@ -176,6 +177,16 @@ class ReplayInputs:
     presentation_alpha: np.ndarray
     presentation_mask_path: Path
     hash_checks: dict[str, dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class AcquisitionOrderedCapture:
+    """Keep production's polarized EXR buffers live through guide decoding."""
+
+    cross_images: list[np.ndarray]
+    parallel_images: list[np.ndarray]
+    cross_stack: np.ndarray
+    parallel_stack: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -483,6 +494,29 @@ def load_parallel_targets_in_acquisition_order(
     each cross image, then each parallel image, before stacking both lists.
     Repeating that exact order makes the checkpointed raw-target hash stable.
     """
+    capture = _load_polarized_capture_in_acquisition_order(
+        sample, frame_ids, height=height, width=width
+    )
+    parallel_stack = np.nan_to_num(
+        capture.parallel_stack, copy=False, nan=0.0, posinf=0.0, neginf=0.0
+    )
+    return np.maximum(parallel_stack, 0.0).astype(np.float32, copy=False)
+
+
+def _load_polarized_capture_in_acquisition_order(
+    sample: CameraSample,
+    frame_ids: Sequence[int] | np.ndarray,
+    *,
+    height: int,
+    width: int,
+) -> AcquisitionOrderedCapture:
+    """Retain the same image lists and stacks as production acquisition.
+
+    PIZ decoding can depend on the decoder's allocation history at a handful
+    of boundary samples.  Production keeps both polarization image lists and
+    both stacked arrays alive while it decodes mask, albedo, and normal guides.
+    Exact saved-material replay must retain that allocation lifetime too.
+    """
     cross_images: list[np.ndarray] = []
     parallel_images: list[np.ndarray] = []
     for frame_id in np.asarray(frame_ids, dtype=np.int64):
@@ -508,17 +542,16 @@ def load_parallel_targets_in_acquisition_order(
             else:
                 parallel_images.append(target)
 
-    # Preserve both production stack allocations before releasing the unused
-    # polarization branch.  This ordering is part of decoded-pixel replay.
     cross_stack = np.stack(cross_images, axis=0).astype(np.float32, copy=False)
     parallel_stack = np.stack(parallel_images, axis=0).astype(
         np.float32, copy=False
     )
-    del cross_stack, cross_images, parallel_images
-    parallel_stack = np.nan_to_num(
-        parallel_stack, copy=False, nan=0.0, posinf=0.0, neginf=0.0
+    return AcquisitionOrderedCapture(
+        cross_images=cross_images,
+        parallel_images=parallel_images,
+        cross_stack=cross_stack,
+        parallel_stack=parallel_stack,
     )
-    return np.maximum(parallel_stack, 0.0).astype(np.float32, copy=False)
 
 
 def _presentation_alpha(mask: np.ndarray, height: int, width: int) -> np.ndarray:
@@ -636,6 +669,12 @@ def prepare_replay_inputs(
         _array_sha256(light_ids),
         signature.get("light_ids_sha256"),
     )
+    sample = CameraSample(object_name, camera, data_root / object_name / camera)
+    if not sample.camera_dir.is_dir():
+        raise FileNotFoundError(f"camera sample does not exist: {sample.camera_dir}")
+    capture = _load_polarized_capture_in_acquisition_order(
+        sample, frame_ids, height=height, width=width
+    )
     light_directions = load_light_directions(
         data_root, light_ids, light_root=light_root
     )
@@ -645,13 +684,33 @@ def prepare_replay_inputs(
         _array_sha256(light_directions),
         signature.get("light_directions_sha256"),
     )
-
-    sample = CameraSample(object_name, camera, data_root / object_name / camera)
-    if not sample.camera_dir.is_dir():
-        raise FileNotFoundError(f"camera sample does not exist: {sample.camera_dir}")
-    parallel_targets_hwc = load_parallel_targets_in_acquisition_order(
-        sample, frame_ids, height=height, width=width
+    mask_path = sample.image_path("mask")
+    albedo_path = sample.image_path("albedo")
+    normal_path = sample.image_path("normal")
+    if mask_path is None or normal_path is None:
+        raise FileNotFoundError(
+            "exact saved-material replay requires the acquisition mask and normal"
+        )
+    mask_image = read_image(mask_path, channels=1)
+    # Production loads the legacy per-pixel view field and dataset albedo before
+    # decoding the photometric normal.  Keep those allocations alive until the
+    # PIZ normal has been read, even though saved-material rendering uses the
+    # constant end-to-end view field and the checkpointed baseColor.
+    legacy_view_directions = load_view_directions(
+        data_root, sample, (height, width)
     )
+    source_albedo = read_image(albedo_path) if albedo_path is not None else None
+    source_normal = _normalize_vectors(read_image(normal_path))
+    view_directions = _normalize_vectors(
+        load_end2end_view_directions(data_root, sample, (height, width))
+    )
+
+    parallel_targets_hwc = np.nan_to_num(
+        capture.parallel_stack, copy=False, nan=0.0, posinf=0.0, neginf=0.0
+    )
+    parallel_targets_hwc = np.maximum(
+        parallel_targets_hwc, 0.0
+    ).astype(np.float32, copy=False)
     input_hashes = acquisition.get("input_hashes", {})
     _record_hash_check(
         checks,
@@ -662,19 +721,9 @@ def prepare_replay_inputs(
     parallel_targets = np.ascontiguousarray(
         parallel_targets_hwc.transpose(0, 3, 1, 2)
     )
-    mask_path = sample.image_path("mask")
-    normal_path = sample.image_path("normal")
-    if mask_path is None or normal_path is None:
-        raise FileNotFoundError(
-            "exact saved-material replay requires the acquisition mask and normal"
-        )
-    mask_image = read_image(mask_path, channels=1)
     presentation_alpha = _presentation_alpha(mask_image, height, width)
     capture_foreground = _foreground_mask(mask_image, height, width)
-    source_normal = _normalize_vectors(read_image(normal_path))
-    view_directions = _normalize_vectors(
-        load_end2end_view_directions(data_root, sample, (height, width))
-    )
+    del capture, legacy_view_directions, source_albedo
     if source_normal.shape != (height, width, 3):
         raise ValueError(
             f"acquisition normal has shape {source_normal.shape}, expected "

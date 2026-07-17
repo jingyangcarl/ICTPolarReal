@@ -258,6 +258,23 @@ def test_replay_target_loader_matches_acquisition_polarization_order(
 
     monkeypatch.setattr(render_saved_material, "read_image", fake_read)
 
+    capture = (
+        render_saved_material._load_polarized_capture_in_acquisition_order(
+            sample, frame_ids, height=2, width=1
+        )
+    )
+
+    assert calls == ["cross_12", "parallel_12", "cross_4", "parallel_4"]
+    assert len(capture.cross_images) == 2
+    assert len(capture.parallel_images) == 2
+    np.testing.assert_array_equal(
+        capture.cross_stack[:, 0, 0, 0], [112.0, 104.0]
+    )
+    np.testing.assert_array_equal(
+        capture.parallel_stack[:, 0, 0, 0], [12.0, 4.0]
+    )
+
+    calls.clear()
     targets = render_saved_material.load_parallel_targets_in_acquisition_order(
         sample, frame_ids, height=2, width=1
     )
