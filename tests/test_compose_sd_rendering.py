@@ -199,8 +199,7 @@ def _write_renderer_fixture(camera_dir: Path) -> dict[str, tuple[int, int, int]]
     capture_foreground = np.ascontiguousarray(
         (presentation_alpha > 0.5).astype(np.float32)
     )
-    fit_foreground = np.zeros_like(capture_foreground)
-    fit_foreground[1, 1, 0] = 1.0
+    fit_foreground = capture_foreground.copy()
     capture_digest = compositor._array_sha256(capture_foreground)
     fit_digest = compositor._array_sha256(fit_foreground)
     manifest = {
@@ -227,6 +226,22 @@ def _write_renderer_fixture(camera_dir: Path) -> dict[str, tuple[int, int, int]]
                 "passed": True,
             },
             "raw_parallel_targets": raw_parallel_check,
+            **{
+                name: {
+                    "actual_sha256": _digest(name),
+                    "expected_sha256": _digest(name),
+                    "passed": True,
+                }
+                for name in (
+                    "disney_source",
+                    "frame_ids",
+                    "light_ids",
+                    "light_directions",
+                    "source_normal",
+                    "normal",
+                    "view_directions",
+                )
+            },
         },
         "lighting_preset": "sd-renderings",
         "material": {
@@ -249,8 +264,8 @@ def _write_renderer_fixture(camera_dir: Path) -> dict[str, tuple[int, int, int]]
             ),
             "capture_foreground_sha256": capture_digest,
             "capture_foreground_pixels": 2,
-            "fit_foreground_pixels": 1,
-            "restored_foreground_pixels": 1,
+            "fit_foreground_pixels": 2,
+            "restored_foreground_pixels": 0,
             "fractional_alpha_pixels": 2,
             "faceforwarded_foreground_pixels": 1,
         },
@@ -319,7 +334,10 @@ def small_sheet(monkeypatch):
 
 
 def test_production_contract_is_the_identified_reference():
-    assert compositor.RENDER_MANIFEST_SCHEMA == "ictpolarreal.saved-disney-render.v3"
+    assert compositor.RENDER_MANIFEST_SCHEMA == "ictpolarreal.saved-disney-render.v4"
+    assert compositor.PRESENTATION_MASK_SCHEMA == (
+        "ictpolarreal.saved-render-presentation-mask.v2"
+    )
     assert compositor.SHEET_COLUMNS == 12
     assert compositor.SHEET_ROWS == 13
     assert compositor.SHEET_TILE_SIZE == 768

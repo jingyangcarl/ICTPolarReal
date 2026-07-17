@@ -313,6 +313,33 @@ def test_train_contract_accepts_only_explicit_v13_to_v14_transition(strategy_tre
         strategies._validate_train_comparison_contract(acquisitions, PROFILES)
 
 
+def test_strategy_report_uses_one_recorded_fit_mask_rule(strategy_trees):
+    roots, _ = strategy_trees
+    acquisitions = {
+        role: pair._load_acquisitions(root, PROFILES)
+        for role, root in roots.items()
+    }
+    for role in strategies.VARIANT_ROLES:
+        for profile in PROFILES:
+            acquisition = acquisitions[role][profile]
+            acquisition["surface_validity"] = {
+                "fit_mask_rule": end2end_acquisition.FIT_MASK_RULE,
+            }
+            acquisition["adapter"] = {
+                "fit_mask_rule": end2end_acquisition.FIT_MASK_RULE,
+            }
+
+    assert strategies._common_fit_mask_rule(acquisitions, PROFILES) == (
+        end2end_acquisition.FIT_MASK_RULE
+    )
+
+    acquisitions["train_time_regularizer"]["mix"]["adapter"][
+        "fit_mask_rule"
+    ] = "legacy-different-rule"
+    with pytest.raises(ValueError, match="different fitting-mask rules"):
+        strategies._common_fit_mask_rule(acquisitions, PROFILES)
+
+
 def test_strategy_contract_rejects_train_arm_with_cleanup(strategy_trees):
     roots, _ = strategy_trees
     loaded = {

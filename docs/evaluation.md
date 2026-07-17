@@ -145,9 +145,10 @@ profile acquisitions. There is no `evaluation/report/` directory and no
 training-profile-first `evaluation/<profile>/<lighting>/` hierarchy.
 
 These are validity-masked, scale-normalized LDR metrics. The capture mask is
-intersected with the `n dot v > 0` front-facing gate; invalid pixels are zeroed
-before the renderer-native whole-image 99.5th-percentile linear scaling and
-clipping to `[0,1]`. This exposure normalization makes the evaluation useful
+used in full after the fixed normal field is continuously oriented toward the
+camera; background pixels are zeroed before the renderer-native whole-image
+99.5th-percentile linear scaling and clipping to `[0,1]`. This exposure
+normalization makes the evaluation useful
 for spatial and reflectance-appearance agreement, but it removes absolute
 intensity scale. Do not interpret the reported MSE, MAE, PSNR, or
 `ssim_global` as radiometric HDR accuracy or as a claim of numerical parity

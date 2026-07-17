@@ -81,9 +81,11 @@ All requested profiles start from the same ICTPolarReal inputs: the dataset
 optical-axis view direction transformed into world space. Ward decomposition is
 only a fallback when either dataset initialization is absent.
 Base color and normal remain fixed during each Disney fit. Pixels that are
-inside the capture mask but fail `n dot v > 0` are excluded and counted in the
-acquisition provenance, which makes a coordinate-convention error visible
-instead of silently optimizing invalid shading.
+inside the clean capture mask are all fitted. Before fitting, a negative normal
+view component is reflected while its tangent component is preserved; the very
+small near-tangent set is lifted to `n dot v >= 1e-3`. The acquisition
+provenance records the source-facing, reflected, and near-tangent counts. This
+keeps the normal field continuous and prevents an unfitted internal boundary.
 
 The Disney scalar maps keep Imaginaire's raw unconstrained constructor values.
 The adapter records both raw and sigmoid-constrained values but does not apply
@@ -95,7 +97,7 @@ End-to-end optimization defaults to 33,000 steps and a learning rate of
 `--end2end-learning-rate`. Scalar maps default to `impulse-median` cleanup with
 weight `1.25e-3`. It first completes the same data-only Adam fit, then detects
 isolated 5x5 median/MAD score peaks inside the exact
-`capture mask × n dot v` fitting region and away from albedo/normal edges. A
+clean capture-mask fitting region and away from albedo/normal edges. A
 post-fit proximal update changes only those frozen entries; all unflagged
 entries keep the data-fit values. The exact targets and masks are retained in a
 hashed `impulse_median_frozen.npz` artifact. Use `--end2end-tv-kind` to select

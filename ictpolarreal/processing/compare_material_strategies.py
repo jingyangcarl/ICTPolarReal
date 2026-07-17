@@ -144,6 +144,7 @@ def compose_material_strategy_comparison(
         sample_size,
         mask_path=mask_path,
         data_root=data_root,
+        fit_mask_rule=_common_fit_mask_rule(acquisitions, profiles),
     )
     pair._validate_fit_mask_hash(mask, cleanup_pair, profiles)
     pair._validate_fit_mask_hash(mask, train_pair, profiles)
@@ -401,6 +402,7 @@ def _comparison_mask(
     *,
     mask_path: str | Path | None,
     data_root: str | Path | None,
+    fit_mask_rule: str | None,
 ) -> tuple[np.ndarray, str]:
     if mask_path is not None and data_root is not None:
         raise ValueError("pass either --data-root or --mask, not both")
@@ -411,6 +413,7 @@ def _comparison_mask(
             data_only_camera.parent.name,
             data_only_camera.name,
             sample_size,
+            fit_mask_rule=fit_mask_rule,
         )
         return mask, f"reconstructed acquisition fit mask from {root}"
     if mask_path is not None:
@@ -421,6 +424,30 @@ def _comparison_mask(
         profile = next((data_only_camera / "material").iterdir()).name
         path = data_only_camera / "material" / profile / "maps" / "baseColor.png"
     return pair._infer_foreground_mask(path), "fallback inferred from data-only baseColor"
+
+
+def _common_fit_mask_rule(
+    acquisitions: dict[str, dict[str, dict[str, Any]]],
+    profiles: Sequence[str],
+) -> str | None:
+    rules = {
+        rule
+        for role in VARIANT_ROLES
+        for profile in profiles
+        for rule in (
+            acquisitions[role][profile]
+            .get("surface_validity", {})
+            .get("fit_mask_rule"),
+            acquisitions[role][profile].get("adapter", {}).get("fit_mask_rule"),
+        )
+        if isinstance(rule, str) and rule
+    }
+    if len(rules) > 1:
+        raise ValueError(
+            "material strategy acquisitions use different fitting-mask rules: "
+            f"{sorted(rules)}"
+        )
+    return next(iter(rules), None)
 
 
 def _validate_strategy_contracts(
@@ -643,16 +670,32 @@ def _validate_train_comparison_contract(
     if baseline_parameters != train_parameters:
         raise ValueError("data-only and train-time arms target different scalar maps")
 
-    expected_baseline_identity = (
-        "ictpolarreal.end2end-checkpoint.v13",
-        "ictpolarreal.profile-acquisition-adapter.v7",
-        "ictpolarreal-frequency-consensus-v1",
-    )
-    expected_train_identity = (
-        "ictpolarreal.end2end-checkpoint.v14",
-        "ictpolarreal.profile-acquisition-adapter.v8",
-        "ictpolarreal-frequency-consensus-regularizer-v1",
-    )
+    supported_identity_pairs = {
+        (
+            (
+                "ictpolarreal.end2end-checkpoint.v13",
+                "ictpolarreal.profile-acquisition-adapter.v7",
+                "ictpolarreal-frequency-consensus-v1",
+            ),
+            (
+                "ictpolarreal.end2end-checkpoint.v14",
+                "ictpolarreal.profile-acquisition-adapter.v8",
+                "ictpolarreal-frequency-consensus-regularizer-v1",
+            ),
+        ): "v13-frequency-v1-to-v14-frequency-regularizer-v1",
+        (
+            (
+                "ictpolarreal.end2end-checkpoint.v13",
+                "ictpolarreal.profile-acquisition-adapter.v7",
+                "ictpolarreal-frequency-consensus-v2",
+            ),
+            (
+                "ictpolarreal.end2end-checkpoint.v14",
+                "ictpolarreal.profile-acquisition-adapter.v8",
+                "ictpolarreal-frequency-consensus-regularizer-v2",
+            ),
+        ): "v13-frequency-v2-to-v14-frequency-regularizer-v2",
+    }
 
     def identity(signature: dict[str, Any]) -> tuple[Any, Any, Any]:
         adapter = signature.get("adapter")
@@ -680,6 +723,7 @@ def _validate_train_comparison_contract(
         adapter.pop("end2end_acquisition_sha256", None)
         return result
 
+    transition_labels: set[str] = set()
     for profile in profiles:
         baseline = acquisitions["baseline"][profile]
         regularized = acquisitions["regularized"][profile]
@@ -696,10 +740,17 @@ def _validate_train_comparison_contract(
             train_signature, dict
         ):
             raise ValueError("train comparison is missing checkpoint signatures")
-        if identity(baseline_signature) != expected_baseline_identity:
-            raise ValueError("data-only arm is not the supported v13/v7 identity")
-        if identity(train_signature) != expected_train_identity:
-            raise ValueError("train-time arm is not the supported v14/v8 identity")
+        identity_pair = (
+            identity(baseline_signature),
+            identity(train_signature),
+        )
+        transition_label = supported_identity_pairs.get(identity_pair)
+        if transition_label is None:
+            raise ValueError(
+                "data-only/train-time arms are not a matched supported v13/v14 "
+                f"identity pair: {identity_pair}"
+            )
+        transition_labels.add(transition_label)
         if normalized(baseline_signature) != normalized(train_signature):
             raise ValueError(
                 f"{profile} train comparison differs beyond regularizer provenance"
@@ -709,10 +760,12 @@ def _validate_train_comparison_contract(
             regularized.get("base_color_source"),
         } != {"dataset_albedo"}:
             raise ValueError("train comparison must use dataset_albedo in both arms")
+    if len(transition_labels) != 1:
+        raise ValueError("train comparison adapter transition differs across profiles")
     return {
         "controlled": True,
         "comparison_mode": "v13-data-only-to-v14-train-time-regularizer",
-        "signature_compatibility": ["v13-frequency-v1-to-v14-frequency-regularizer-v1"],
+        "signature_compatibility": sorted(transition_labels),
         "only_intended_difference": (
             "frequency-consensus target participates in the final training stage "
             "instead of being inactive"

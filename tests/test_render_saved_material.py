@@ -11,6 +11,66 @@ from ictpolarreal.processing import render_saved_material
 from ictpolarreal.utils.io import write_image
 
 
+def _oriented_replay_contract():
+    adapter = {
+        "schema": "ictpolarreal.profile-acquisition-adapter.v7",
+        "algorithm_version": "ictpolarreal-frequency-consensus-v2",
+        "fit_mask_rule": render_saved_material.FIT_MASK_RULE,
+        "normal_orientation_rule": render_saved_material.NORMAL_ORIENTATION_RULE,
+        "minimum_oriented_n_dot_v": (
+            render_saved_material.MIN_ORIENTED_N_DOT_V
+        ),
+    }
+    surface = {
+        "fit_mask_rule": render_saved_material.FIT_MASK_RULE,
+        "normal_orientation_rule": render_saved_material.NORMAL_ORIENTATION_RULE,
+        "minimum_n_dot_v": render_saved_material.MIN_ORIENTED_N_DOT_V,
+        "capture_foreground_pixels": 12,
+        "front_facing_pixels": 12,
+        "excluded_back_facing_pixels": 0,
+        "excluded_fraction": 0.0,
+    }
+    acquisition = {
+        "schema": "ictpolarreal.end2end-disney.v13",
+        "adapter": dict(adapter),
+        "surface_validity": dict(surface),
+        "input_hashes": {
+            "capture_foreground_sha256": "a" * 64,
+            "foreground_sha256": "a" * 64,
+            "source_normal_sha256": "b" * 64,
+        },
+    }
+    signature = {
+        "schema": "ictpolarreal.end2end-checkpoint.v13",
+        "adapter": dict(adapter),
+        "surface_validity": dict(surface),
+    }
+    return acquisition, signature
+
+
+def test_oriented_replay_contract_rejects_stale_or_partial_fit_provenance():
+    acquisition, signature = _oriented_replay_contract()
+    render_saved_material._validate_oriented_replay_contract(
+        acquisition, signature
+    )
+
+    signature["adapter"]["algorithm_version"] = (
+        "ictpolarreal-frequency-consensus-v1"
+    )
+    with pytest.raises(ValueError, match="adapter provenance differ"):
+        render_saved_material._validate_oriented_replay_contract(
+            acquisition, signature
+        )
+
+    acquisition, signature = _oriented_replay_contract()
+    acquisition["surface_validity"]["front_facing_pixels"] = 11
+    signature["surface_validity"]["front_facing_pixels"] = 11
+    with pytest.raises(ValueError, match="every clean foreground pixel"):
+        render_saved_material._validate_oriented_replay_contract(
+            acquisition, signature
+        )
+
+
 def test_parse_condition_indices_preserves_batch_order_and_deduplicates():
     indices = render_saved_material.parse_condition_indices(
         "1:14:4, 9, 20", count=32
@@ -438,7 +498,7 @@ def test_historical_probe_parameters_match_exact_sd_constraints():
 def test_presentation_parameters_face_forward_only_negative_visible_normals():
     torch = pytest.importorskip("torch")
     normal = torch.tensor(
-        [[[0.0, 0.0, -1.0], [0.0, 0.0, 1.0]]], dtype=torch.float32
+        [[[0.6, 0.0, -0.8], [0.0, 0.0, 1.0]]], dtype=torch.float32
     )
     model = SimpleNamespace(_param_maps=lambda: {"normal": normal})
     views = torch.tensor(
@@ -455,7 +515,7 @@ def test_presentation_parameters_face_forward_only_negative_visible_normals():
     torch.testing.assert_close(
         parameters["normal"],
         torch.tensor(
-            [[[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]]], dtype=torch.float32
+            [[[0.6, 0.0, 0.8], [0.0, 0.0, 1.0]]], dtype=torch.float32
         ),
     )
     assert count == 1

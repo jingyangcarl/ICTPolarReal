@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import importlib
 import json
+import math
 import os
 import shutil
 from dataclasses import dataclass
@@ -14,13 +15,16 @@ import numpy as np
 
 from ictpolarreal.data.dataset import CameraSample
 from ictpolarreal.processing.end2end_acquisition import (
-    MIN_N_DOT_V,
+    FIT_MASK_RULE,
+    MIN_ORIENTED_N_DOT_V,
+    NORMAL_ORIENTATION_RULE,
     PERCENTILE,
     _array_sha256,
     _file_sha256,
     _foreground_mask,
     _load_imaginaire_disney,
     _normalize_vectors,
+    _orient_normals_to_view,
     _safe_torch_quantile,
 )
 from ictpolarreal.processing.material_decomposition import (
@@ -40,14 +44,36 @@ from ictpolarreal.processing.lighting_profiles import (
 from ictpolarreal.utils.io import read_image, write_image
 
 
-RENDER_MANIFEST_SCHEMA = "ictpolarreal.saved-disney-render.v3"
+RENDER_MANIFEST_SCHEMA = "ictpolarreal.saved-disney-render.v4"
 EXPECTED_CONDITIONS_SCHEMA = "ictpolarreal.hdri-conditions.v1"
 EXPECTED_MODEL_SCHEMA = "ictpolarreal.disney-state-artifact.v1"
-PRESENTATION_MASK_SCHEMA = "ictpolarreal.saved-render-presentation-mask.v1"
-FIT_MASK_RULE = "binary_capture_mask_times_front_facing_n_dot_v"
+PRESENTATION_MASK_SCHEMA = "ictpolarreal.saved-render-presentation-mask.v2"
 PRESENTATION_MASK_RULE = "soft_clean_dataset_mask_applied_once_without_n_dot_v_culling"
-PRESENTATION_NORMAL_RULE = "flip_negative_n_dot_v_normals_for_rendering_only"
+PRESENTATION_NORMAL_RULE = NORMAL_ORIENTATION_RULE
 DEFAULT_VALIDATION_TOLERANCE = 0.0
+SUPPORTED_ORIENTED_REPLAY_ADAPTERS = {
+    (
+        "ictpolarreal.profile-acquisition-adapter.v7",
+        "ictpolarreal-frequency-consensus-v2",
+    ): (
+        "ictpolarreal.end2end-disney.v13",
+        "ictpolarreal.end2end-checkpoint.v13",
+    ),
+    (
+        "ictpolarreal.profile-acquisition-adapter.v7",
+        "ictpolarreal-frequency-consensus-adaptive-v2",
+    ): (
+        "ictpolarreal.end2end-disney.v13",
+        "ictpolarreal.end2end-checkpoint.v13",
+    ),
+    (
+        "ictpolarreal.profile-acquisition-adapter.v8",
+        "ictpolarreal-frequency-consensus-regularizer-v2",
+    ): (
+        "ictpolarreal.end2end-disney.v14",
+        "ictpolarreal.end2end-checkpoint.v14",
+    ),
+}
 SD_RENDERINGS_PRESET = "sd-renderings"
 SD_RENDERINGS_SCHEMA = "ictpolarreal.sd-renderings-preset.v1"
 SD_RENDERINGS_ROTATION_LABEL = 90
@@ -424,6 +450,7 @@ def prepare_replay_inputs(
     signature = acquisition.get("checkpoint_signature")
     if not isinstance(signature, Mapping):
         raise ValueError(f"{acquisition_path} has no checkpoint signature")
+    _validate_oriented_replay_contract(acquisition, signature)
     height = _positive_dimension(signature.get("height"), "height")
     width = _positive_dimension(signature.get("width"), "width")
 
@@ -522,20 +549,24 @@ def prepare_replay_inputs(
     mask_image = read_image(mask_path, channels=1)
     presentation_alpha = _presentation_alpha(mask_image, height, width)
     capture_foreground = _foreground_mask(mask_image, height, width)
-    normal = _normalize_vectors(read_image(normal_path))
+    source_normal = _normalize_vectors(read_image(normal_path))
     view_directions = _normalize_vectors(
         load_end2end_view_directions(data_root, sample, (height, width))
     )
-    if normal.shape != (height, width, 3):
+    if source_normal.shape != (height, width, 3):
         raise ValueError(
-            f"acquisition normal has shape {normal.shape}, expected "
+            f"acquisition normal has shape {source_normal.shape}, expected "
             f"{(height, width, 3)}"
         )
-    foreground = capture_foreground * (
-        np.sum(normal * view_directions, axis=-1, keepdims=True) > MIN_N_DOT_V
-    ).astype(np.float32)
+    normal, _normal_orientation = _orient_normals_to_view(
+        source_normal,
+        view_directions,
+        foreground=capture_foreground,
+    )
+    foreground = capture_foreground.copy()
     for name, array in (
         ("capture_foreground", capture_foreground),
+        ("source_normal", source_normal),
         ("normal", normal),
         ("view_directions", view_directions),
         ("foreground", foreground),
@@ -561,6 +592,122 @@ def prepare_replay_inputs(
         presentation_mask_path=mask_path.resolve(),
         hash_checks=checks,
     )
+
+
+def _validate_oriented_replay_contract(
+    acquisition: Mapping[str, Any],
+    signature: Mapping[str, Any],
+) -> None:
+    """Reject stale or ambiguous records before reconstructing v2 fit inputs."""
+    adapter = acquisition.get("adapter")
+    signature_adapter = signature.get("adapter")
+    if not isinstance(adapter, Mapping) or not isinstance(
+        signature_adapter, Mapping
+    ):
+        raise ValueError("saved-material replay requires recorded adapter provenance")
+    if dict(adapter) != dict(signature_adapter):
+        raise ValueError(
+            "acquisition and checkpoint adapter provenance differ"
+        )
+    identity = (adapter.get("schema"), adapter.get("algorithm_version"))
+    expected_schemas = SUPPORTED_ORIENTED_REPLAY_ADAPTERS.get(identity)
+    if expected_schemas is None:
+        raise ValueError(
+            "saved-material replay requires a supported view-oriented v2 adapter; "
+            f"found {identity}"
+        )
+    if (acquisition.get("schema"), signature.get("schema")) != expected_schemas:
+        raise ValueError(
+            "saved-material replay acquisition/checkpoint schemas do not match "
+            f"adapter {identity}"
+        )
+    if adapter.get("fit_mask_rule") != FIT_MASK_RULE:
+        raise ValueError("saved-material replay adapter has the wrong fit-mask rule")
+    if adapter.get("normal_orientation_rule") != NORMAL_ORIENTATION_RULE:
+        raise ValueError(
+            "saved-material replay adapter has the wrong normal-orientation rule"
+        )
+    try:
+        adapter_threshold = float(adapter["minimum_oriented_n_dot_v"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "saved-material replay adapter has no valid orientation threshold"
+        ) from exc
+    if not math.isclose(
+        adapter_threshold,
+        MIN_ORIENTED_N_DOT_V,
+        rel_tol=0.0,
+        abs_tol=0.0,
+    ):
+        raise ValueError(
+            "saved-material replay adapter orientation threshold differs"
+        )
+
+    surface = acquisition.get("surface_validity")
+    signature_surface = signature.get("surface_validity")
+    if not isinstance(surface, Mapping) or not isinstance(
+        signature_surface, Mapping
+    ):
+        raise ValueError(
+            "saved-material replay requires recorded surface-validity provenance"
+        )
+    if dict(surface) != dict(signature_surface):
+        raise ValueError(
+            "acquisition and checkpoint surface-validity provenance differ"
+        )
+    if surface.get("fit_mask_rule") != FIT_MASK_RULE:
+        raise ValueError("saved-material replay surface has the wrong fit-mask rule")
+    if surface.get("normal_orientation_rule") != NORMAL_ORIENTATION_RULE:
+        raise ValueError(
+            "saved-material replay surface has the wrong normal-orientation rule"
+        )
+    try:
+        surface_threshold = float(surface["minimum_n_dot_v"])
+        capture_pixels = int(surface["capture_foreground_pixels"])
+        fit_pixels = int(surface["front_facing_pixels"])
+        excluded_pixels = int(surface["excluded_back_facing_pixels"])
+        excluded_fraction = float(surface["excluded_fraction"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "saved-material replay surface-validity fields are invalid"
+        ) from exc
+    if not math.isclose(
+        surface_threshold,
+        MIN_ORIENTED_N_DOT_V,
+        rel_tol=0.0,
+        abs_tol=0.0,
+    ):
+        raise ValueError(
+            "saved-material replay surface orientation threshold differs"
+        )
+    if (
+        capture_pixels <= 0
+        or fit_pixels != capture_pixels
+        or excluded_pixels != 0
+        or excluded_fraction != 0.0
+    ):
+        raise ValueError(
+            "saved-material replay requires every clean foreground pixel to be fitted"
+        )
+
+    input_hashes = acquisition.get("input_hashes")
+    if not isinstance(input_hashes, Mapping):
+        raise ValueError("saved-material replay requires recorded input hashes")
+    capture_hash = input_hashes.get("capture_foreground_sha256")
+    fit_hash = input_hashes.get("foreground_sha256")
+    source_normal_hash = input_hashes.get("source_normal_sha256")
+    if (
+        not isinstance(capture_hash, str)
+        or len(capture_hash) != 64
+        or fit_hash != capture_hash
+    ):
+        raise ValueError(
+            "saved-material replay fit foreground must equal the clean capture mask"
+        )
+    if not isinstance(source_normal_hash, str) or len(source_normal_hash) != 64:
+        raise ValueError(
+            "saved-material replay requires the source-normal hash"
+        )
 
 
 def prepare_sd_renderings_preset(
@@ -1025,14 +1172,45 @@ def _write_material_maps(
 def _face_forward_presentation_parameters(
     torch, model, views, presentation_alpha
 ) -> tuple[dict[str, Any], int]:
-    """Face-forward invalid visible normals without changing the saved model."""
+    """Apply the acquisition's continuous view-orientation guard idempotently."""
     parameters = dict(model._param_maps())
     normal = parameters["normal"]
-    n_dot_v = (normal * views).sum(dim=-1, keepdim=True)
-    flip = n_dot_v < 0.0
-    parameters["normal"] = torch.where(flip, -normal, normal)
-    visible_flip = flip & (presentation_alpha > 0.0)
-    return parameters, int(visible_flip.count_nonzero().item())
+    view_norm = views.norm(dim=-1, keepdim=True)
+    if not bool(torch.isfinite(views).all()) or bool((view_norm <= 1e-8).any()):
+        raise ValueError("presentation view directions must be finite and non-zero")
+    unit_view = views / view_norm.clamp_min(1e-8)
+
+    normal_norm = normal.norm(dim=-1, keepdim=True)
+    normal_valid = torch.isfinite(normal).all(dim=-1, keepdim=True) & (
+        normal_norm > 1e-8
+    )
+    unit_normal = torch.nan_to_num(normal) / torch.nan_to_num(
+        normal_norm, nan=0.0, posinf=0.0, neginf=0.0
+    ).clamp_min(1e-8)
+    unit_normal = torch.where(normal_valid, unit_normal, unit_view)
+
+    source_dot = (unit_normal * unit_view).sum(dim=-1, keepdim=True)
+    reflected = normal_valid & (source_dot < 0.0)
+    oriented = unit_normal - 2.0 * source_dot.clamp_max(0.0) * unit_view
+    oriented = oriented / oriented.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+
+    oriented_dot = (oriented * unit_view).sum(dim=-1, keepdim=True)
+    near_tangent = oriented_dot < MIN_ORIENTED_N_DOT_V
+    tangent = oriented - oriented_dot * unit_view
+    tangent_direction = tangent / tangent.norm(
+        dim=-1, keepdim=True
+    ).clamp_min(1e-8)
+    lifted = (
+        tangent_direction * math.sqrt(1.0 - MIN_ORIENTED_N_DOT_V**2)
+        + MIN_ORIENTED_N_DOT_V * unit_view
+    )
+    oriented = torch.where(near_tangent, lifted, oriented)
+    oriented = oriented / oriented.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+    parameters["normal"] = oriented
+
+    changed = (~normal_valid) | reflected | near_tangent
+    visible_changed = changed & (presentation_alpha > 0.0)
+    return parameters, int(visible_changed.count_nonzero().item())
 
 
 def _historical_probe_parameters(
@@ -1131,14 +1309,16 @@ def _presentation_mask_provenance(
             "clean presentation mask no longer reconstructs the recorded capture "
             "foreground"
         )
-    if fit_pixels > capture_pixels:
-        raise RuntimeError("fit foreground cannot exceed the clean capture mask")
+    fit_sha256 = replay.hash_checks["foreground"]["actual_sha256"]
+    if fit_pixels != capture_pixels or fit_sha256 != capture_sha256:
+        raise RuntimeError(
+            "view-oriented replay requires fit foreground to equal the clean "
+            "capture mask"
+        )
     return {
         "schema": PRESENTATION_MASK_SCHEMA,
         "fit_rule": FIT_MASK_RULE,
-        "fit_foreground_sha256": replay.hash_checks["foreground"][
-            "actual_sha256"
-        ],
+        "fit_foreground_sha256": fit_sha256,
         "presentation_rule": PRESENTATION_MASK_RULE,
         "presentation_normal_rule": PRESENTATION_NORMAL_RULE,
         "presentation_mask_path": str(replay.presentation_mask_path),
@@ -1149,7 +1329,7 @@ def _presentation_mask_provenance(
         "capture_foreground_sha256": capture_sha256,
         "capture_foreground_pixels": capture_pixels,
         "fit_foreground_pixels": fit_pixels,
-        "restored_foreground_pixels": capture_pixels - fit_pixels,
+        "restored_foreground_pixels": 0,
         "fractional_alpha_pixels": int(
             np.count_nonzero((alpha > 0.0) & (alpha < 1.0))
         ),

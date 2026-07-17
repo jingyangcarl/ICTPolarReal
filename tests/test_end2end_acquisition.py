@@ -37,6 +37,35 @@ def test_report_font_preserves_requested_scale():
     assert end2end_acquisition._report_camera_label(Path("cam07")) == "Camera 07"
 
 
+def test_normal_orientation_reflects_view_component_without_reversing_tangent():
+    epsilon = end2end_acquisition.MIN_ORIENTED_N_DOT_V
+    tangent = np.sqrt(1.0 - epsilon**2)
+    normal = np.asarray(
+        [[[0.6, 0.0, -0.8], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0]]],
+        dtype=np.float32,
+    )
+    view = np.zeros_like(normal)
+    view[..., 2] = 1.0
+    foreground = np.ones((1, 3, 1), dtype=np.float32)
+
+    oriented, audit = end2end_acquisition._orient_normals_to_view(
+        normal,
+        view,
+        foreground=foreground,
+    )
+
+    np.testing.assert_allclose(oriented[0, 0], [0.6, 0.0, 0.8], atol=1e-6)
+    np.testing.assert_allclose(
+        oriented[0, 1], [tangent, 0.0, epsilon], atol=1e-6
+    )
+    np.testing.assert_allclose(oriented[0, 2], [0.0, 0.0, 1.0], atol=1e-6)
+    assert audit["reflected_foreground_pixels"] == 1
+    assert audit["near_tangent_foreground_pixels"] == 1
+    assert audit["source_invalid_foreground_pixels"] == 1
+    assert audit["source_nonfront_facing_foreground_pixels"] == 2
+    assert audit["minimum_oriented_n_dot_v_observed"] == pytest.approx(epsilon)
+
+
 def test_split_light_indices_reserves_sphere_spread_holdout():
     train, heldout = end2end_acquisition.split_light_indices(346, 16)
 
@@ -891,7 +920,12 @@ def test_impulse_median_settings_record_frozen_detector_and_schedule():
     assert settings["unflagged_parameter_update"].startswith("none_bit_identical")
     assert settings["local_maximum_tie_policy"] == "retain_all_equal_maxima"
     assert adapter["schema"] == "ictpolarreal.profile-acquisition-adapter.v7"
-    assert adapter["algorithm_version"] == "ictpolarreal-frequency-consensus-v1"
+    assert adapter["algorithm_version"] == "ictpolarreal-frequency-consensus-v2"
+    assert adapter["fit_mask_rule"] == end2end_acquisition.FIT_MASK_RULE
+    assert (
+        adapter["normal_orientation_rule"]
+        == end2end_acquisition.NORMAL_ORIENTATION_RULE
+    )
 
 
 def test_zero_weight_final_regularization_does_not_require_impulse_bundle():
@@ -1261,7 +1295,7 @@ def test_frequency_consensus_adaptive_settings_record_swept_policy():
         "strong_policy_eligible_and_final_target_differs_from_source"
     )
     assert adapter["algorithm_version"] == (
-        "ictpolarreal-frequency-consensus-adaptive-v1"
+        "ictpolarreal-frequency-consensus-adaptive-v2"
     )
 
 
@@ -1317,7 +1351,7 @@ def test_frequency_consensus_regularizer_settings_stage_and_adapter_are_isolated
         )
     assert adapter["schema"] == "ictpolarreal.profile-acquisition-adapter.v8"
     assert adapter["algorithm_version"] == (
-        "ictpolarreal-frequency-consensus-regularizer-v1"
+        "ictpolarreal-frequency-consensus-regularizer-v2"
     )
     assert end2end_acquisition._adapter_provenance("frequency-consensus")[
         "schema"

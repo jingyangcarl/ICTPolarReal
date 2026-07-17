@@ -201,8 +201,9 @@ the selected root.
 ICTPolarReal end-to-end acquisition uses the measured parallel-polarized OLAT
 image as its target and initializes frozen base color from the dataset
 `albedo.exr`, together with the photometric normal and a constant optical-axis
-view. Pixels failing the `n dot v > 0` validity gate are excluded. By default,
-the data-only fit completes before the impulse detector freezes local
+view. Negative normal view components are reflected without reversing their
+tangent components, and the full clean capture mask is fitted. By default, the
+data-only fit completes before the impulse detector freezes local
 median/MAD targets inside that fitting mask and away from measured albedo or
 normal edges. The post-fit proximal step updates only isolated score peaks;
 all unflagged scalar entries remain bit-identical to the data fit. The broader

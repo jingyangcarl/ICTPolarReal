@@ -120,6 +120,12 @@ _STAGED_IMPULSE_CHECKPOINT_SCHEMA = "ictpolarreal.end2end-checkpoint.v10"
 _PROXIMAL_V11_CHECKPOINT_SCHEMA = "ictpolarreal.end2end-checkpoint.v11"
 _PROXIMAL_V12_CHECKPOINT_SCHEMA = "ictpolarreal.end2end-checkpoint.v12"
 _FREQUENCY_CHECKPOINT_SCHEMA = "ictpolarreal.end2end-checkpoint.v13"
+_CLEAN_CAPTURE_FIT_MASK_RULE = (
+    "binary_clean_capture_mask_after_view_facing_normal_orientation"
+)
+_LEGACY_FRONT_FACING_FIT_MASK_RULE = (
+    "binary_capture_mask_times_front_facing_n_dot_v"
+)
 _LEGACY_ADAPTER = (
     "ictpolarreal.profile-acquisition-adapter.v2",
     "ictpolarreal-masked-tv-v1",
@@ -148,6 +154,14 @@ _FREQUENCY_ADAPTIVE_ADAPTER = (
     "ictpolarreal.profile-acquisition-adapter.v7",
     "ictpolarreal-frequency-consensus-adaptive-v1",
 )
+_FREQUENCY_V2_ADAPTER = (
+    "ictpolarreal.profile-acquisition-adapter.v7",
+    "ictpolarreal-frequency-consensus-v2",
+)
+_FREQUENCY_ADAPTIVE_V2_ADAPTER = (
+    "ictpolarreal.profile-acquisition-adapter.v7",
+    "ictpolarreal-frequency-consensus-adaptive-v2",
+)
 _LEGACY_IDENTITY = (_LEGACY_CHECKPOINT_SCHEMA, _LEGACY_ADAPTER)
 _EDGE_IDENTITY = (_EDGE_CHECKPOINT_SCHEMA, _EDGE_ADAPTER)
 _STAGED_IMPULSE_IDENTITY = (
@@ -170,6 +184,14 @@ _FREQUENCY_ADAPTIVE_IDENTITY = (
     _FREQUENCY_CHECKPOINT_SCHEMA,
     _FREQUENCY_ADAPTIVE_ADAPTER,
 )
+_FREQUENCY_V2_IDENTITY = (
+    _FREQUENCY_CHECKPOINT_SCHEMA,
+    _FREQUENCY_V2_ADAPTER,
+)
+_FREQUENCY_ADAPTIVE_V2_IDENTITY = (
+    _FREQUENCY_CHECKPOINT_SCHEMA,
+    _FREQUENCY_ADAPTIVE_V2_ADAPTER,
+)
 _SUPPORTED_REGULARIZERS_BY_IDENTITY = {
     _LEGACY_IDENTITY: frozenset({"l1"}),
     _EDGE_IDENTITY: frozenset({"l1", "edge-charbonnier"}),
@@ -188,10 +210,19 @@ _SUPPORTED_REGULARIZERS_BY_IDENTITY = {
     _FREQUENCY_ADAPTIVE_IDENTITY: frozenset(
         {"frequency-consensus-adaptive"}
     ),
+    _FREQUENCY_V2_IDENTITY: frozenset(
+        {"l1", "edge-charbonnier", "impulse-median", "frequency-consensus"}
+    ),
+    _FREQUENCY_ADAPTIVE_V2_IDENTITY: frozenset(
+        {"frequency-consensus-adaptive"}
+    ),
 }
 _ACTIVE_REGULARIZER_TRANSITIONS = {
     (_FREQUENCY_IDENTITY, _FREQUENCY_ADAPTIVE_IDENTITY): (
         "active-frequency-v1-to-adaptive-v1"
+    ),
+    (_FREQUENCY_V2_IDENTITY, _FREQUENCY_ADAPTIVE_V2_IDENTITY): (
+        "active-frequency-v2-to-adaptive-v2"
     ),
 }
 _ZERO_WEIGHT_TRANSITIONS = {
@@ -243,8 +274,8 @@ def main() -> None:
         "--data-root",
         default=None,
         help=(
-            "Dataset root used to reconstruct the acquisition's capture × n-dot-v "
-            "fit mask. Preferred over --mask."
+            "Dataset root used to reconstruct the fit mask rule recorded by the "
+            "acquisition. Preferred over --mask."
         ),
     )
     parser.add_argument(
@@ -333,11 +364,32 @@ def compose_regularization_comparison(
         raise ValueError("pass either --data-root or --mask, not both")
     if data_root is not None:
         data_root_path = Path(data_root).expanduser().resolve()
+        fit_mask_rules = {
+            rule
+            for variant in ("baseline", "regularized")
+            for profile in profiles
+            for rule in (
+                acquisitions[variant][profile]
+                .get("surface_validity", {})
+                .get("fit_mask_rule"),
+                acquisitions[variant][profile]
+                .get("adapter", {})
+                .get("fit_mask_rule"),
+            )
+            if isinstance(rule, str) and rule
+        }
+        if len(fit_mask_rules) > 1:
+            raise ValueError(
+                "comparison acquisitions use different fitting-mask rules: "
+                f"{sorted(fit_mask_rules)}"
+            )
+        fit_mask_rule = next(iter(fit_mask_rules), None)
         mask = _fit_mask_from_data_root(
             data_root_path,
             baseline_camera.parent.name,
             baseline_camera.name,
             sample_size,
+            fit_mask_rule=fit_mask_rule,
         )
         mask_source = f"reconstructed acquisition fit mask from {data_root_path}"
     elif mask_path is None:
@@ -388,6 +440,7 @@ def compose_regularization_comparison(
                 interior_mask,
                 guide_diagnostic,
                 map_metrics,
+                contract,
             )
         )
     evaluation_metrics = _collect_evaluation_metrics(acquisitions, profiles)
@@ -698,12 +751,13 @@ def _validate_comparison_contract(
             allow_active_frequency_transition=active_frequency_upgrade,
         )
         transition_modes.add(transition)
-        if active_frequency_upgrade and transition != (
-            "active-frequency-v1-to-adaptive-v1"
-        ):
+        if active_frequency_upgrade and transition not in {
+            "active-frequency-v1-to-adaptive-v1",
+            "active-frequency-v2-to-adaptive-v2",
+        }:
             raise ValueError(
                 "active frequency-consensus comparison requires the known "
-                "v1-to-adaptive-v1 adapter transition"
+                "matched fixed-to-adaptive adapter transition"
             )
         if baseline_regularizer_inactive and regularizer_configuration_variable:
             _validate_variable_regularizer_transition(
@@ -740,6 +794,17 @@ def _validate_comparison_contract(
             "regularization comparison must use dataset_albedo in both runs; "
             f"found {sorted(str(source) for source in sources)}"
         )
+    if len(transition_modes) != 1:
+        raise ValueError("comparison adapter transition differs across profiles")
+    transition_mode = next(iter(transition_modes))
+    active_comparison_modes = {
+        "active-frequency-v1-to-adaptive-v1": (
+            "frequency-consensus-v1-to-adaptive-v1"
+        ),
+        "active-frequency-v2-to-adaptive-v2": (
+            "frequency-consensus-v2-to-adaptive-v2"
+        ),
+    }
     return {
         "controlled": True,
         "matched_fields": [
@@ -767,7 +832,7 @@ def _validate_comparison_contract(
         "baseline_regularizer_inactive": baseline_regularizer_inactive,
         "active_frequency_upgrade": active_frequency_upgrade,
         "comparison_mode": (
-            "frequency-consensus-v1-to-adaptive-v1"
+            active_comparison_modes[transition_mode]
             if active_frequency_upgrade
             else "zero-weight-to-active"
             if baseline_regularizer_inactive
@@ -944,7 +1009,10 @@ def _validate_variable_regularizer_transition(
             _PROXIMAL_V12_IDENTITY,
         }:
             target_kind_supported = regularized_kind == "impulse-median"
-        elif regularized_identity == _FREQUENCY_IDENTITY:
+        elif regularized_identity in {
+            _FREQUENCY_IDENTITY,
+            _FREQUENCY_V2_IDENTITY,
+        }:
             target_kind_supported = regularized_kind == "frequency-consensus"
         if (
             transition == expected_transition
@@ -1072,6 +1140,8 @@ def _fit_mask_from_data_root(
     object_name: str,
     camera_name: str,
     expected_size: tuple[int, int],
+    *,
+    fit_mask_rule: str | None = None,
 ) -> np.ndarray:
     camera_dir = data_root / object_name / camera_name
     sample = CameraSample(object_name, camera_name, camera_dir)
@@ -1090,11 +1160,16 @@ def _fit_mask_from_data_root(
             f"normal={normal.shape[:2]}, mask={capture_mask.shape[:2]}, "
             f"expected={expected_shape}"
         )
+    capture = capture_mask[..., 0] > 0.5
+    if fit_mask_rule == _CLEAN_CAPTURE_FIT_MASK_RULE:
+        return capture
+    if fit_mask_rule not in {None, _LEGACY_FRONT_FACING_FIT_MASK_RULE}:
+        raise ValueError(f"unsupported fitting-mask rule: {fit_mask_rule!r}")
     view = load_end2end_view_directions(data_root, sample, expected_shape)
     normal = _normalize_vectors(normal)
     view = _normalize_vectors(view)
     front_facing = np.sum(normal * view, axis=-1) > 1e-4
-    return (capture_mask[..., 0] > 0.5) & front_facing
+    return capture & front_facing
 
 
 def _normalize_vectors(values: np.ndarray) -> np.ndarray:
@@ -2542,9 +2617,10 @@ def _measure_impulse_cleanup(
             "available": False,
             "reason": "v10 staged cleanup did not export a frozen NPZ artifact",
         }
-    proximal_acquisition_schemas = {
+    supported_acquisition_schemas = {
         _PROXIMAL_V11_IDENTITY: "ictpolarreal.end2end-disney.v11",
         _PROXIMAL_V12_IDENTITY: "ictpolarreal.end2end-disney.v12",
+        _FREQUENCY_V2_IDENTITY: "ictpolarreal.end2end-disney.v13",
     }
     if len(candidate_identities) != 1:
         raise ValueError(
@@ -2552,7 +2628,7 @@ def _measure_impulse_cleanup(
             f"found {candidate_identities}"
         )
     candidate_identity = next(iter(candidate_identities))
-    expected_acquisition_schema = proximal_acquisition_schemas.get(
+    expected_acquisition_schema = supported_acquisition_schemas.get(
         candidate_identity
     )
     if expected_acquisition_schema is None:
@@ -3251,10 +3327,16 @@ def _measure_frequency_cleanup(
             "adaptive frequency cleanup requires an active frequency-consensus "
             "baseline and the controlled adapter transition"
         )
-    expected_candidate_identity = (
-        _FREQUENCY_ADAPTIVE_IDENTITY
+    expected_candidate_identities = (
+        {
+            _FREQUENCY_ADAPTIVE_IDENTITY,
+            _FREQUENCY_ADAPTIVE_V2_IDENTITY,
+        }
         if adaptive_comparison
-        else _FREQUENCY_IDENTITY
+        else {
+            _FREQUENCY_IDENTITY,
+            _FREQUENCY_V2_IDENTITY,
+        }
     )
     candidate_identities = {
         (
@@ -3267,11 +3349,21 @@ def _measure_frequency_cleanup(
         )
         for profile in profiles
     }
-    if candidate_identities != {expected_candidate_identity}:
+    if (
+        len(candidate_identities) != 1
+        or not candidate_identities.issubset(expected_candidate_identities)
+    ):
         raise ValueError(
             "frequency cleanup report requires the expected v13 adapter "
             f"identity; found {candidate_identities}"
         )
+    candidate_identity = next(iter(candidate_identities))
+    adapter_version = (
+        "v2"
+        if candidate_identity
+        in {_FREQUENCY_V2_IDENTITY, _FREQUENCY_ADAPTIVE_V2_IDENTITY}
+        else "v1"
+    )
     if fit_mask.ndim != 2 or not np.any(fit_mask):
         raise ValueError("frequency cleanup report requires a nonempty 2D fit mask")
 
@@ -3883,18 +3975,24 @@ def _measure_frequency_cleanup(
         "schema": "ictpolarreal.frequency-cleanup-comparison.v1",
         "available": True,
         "comparison_mode": (
-            "frequency-consensus-v1-to-adaptive-v1"
+            f"frequency-consensus-{adapter_version}-to-adaptive-{adapter_version}"
             if adaptive_comparison
-            else "data-fit-source-to-frequency-consensus-v1"
+            else f"data-fit-source-to-frequency-consensus-{adapter_version}"
+        ),
+        "adapter_version": adapter_version,
+        "target_policy_schema": (
+            FREQUENCY_ADAPTIVE_BUNDLE_SCHEMA
+            if adaptive_comparison
+            else FREQUENCY_BUNDLE_SCHEMA
         ),
         "regularizer_label": _display_regularizer(regularization_kind),
         "update_count_semantics": (
-            "map entries whose adaptive target differs from the frozen v1 target"
+            "map entries whose adaptive target differs from the frozen fixed-policy target"
             if adaptive_comparison
-            else "map entries whose v1 target differs from the data-fit source"
+            else "map entries whose fixed post-fit target differs from the data-fit source"
         ),
         "consensus_count_semantics": (
-            "entries whose adaptive target differs from frozen v1 and whose "
+            "entries whose adaptive target differs from the frozen fixed-policy target and whose "
             "strong-policy target also differs from the data-fit source"
             if adaptive_comparison
             else "cross-map consensus entries"
@@ -6548,9 +6646,22 @@ def _measure_adaptive_cleanup_evidence(
     interior_mask: np.ndarray,
     guide_diagnostic: dict[str, Any],
     map_metrics: dict[str, Any],
+    contract: dict[str, Any],
 ) -> dict[str, Any]:
     if not profiles:
         raise ValueError("adaptive cleanup evidence requires lighting profiles")
+    comparison_mode = contract.get("comparison_mode")
+    versions_by_mode = {
+        "frequency-consensus-v1-to-adaptive-v1": "v1",
+        "frequency-consensus-v2-to-adaptive-v2": "v2",
+    }
+    adapter_version = versions_by_mode.get(comparison_mode)
+    if adapter_version is None:
+        raise ValueError(
+            "adaptive cleanup evidence requires a supported active comparison mode"
+        )
+    fixed_label = f"Fixed {adapter_version}"
+    adaptive_label = f"Adaptive {adapter_version}"
     profile_masks = {
         profile: _adaptive_cleanup_profile_masks(
             baseline_camera,
@@ -6659,8 +6770,14 @@ def _measure_adaptive_cleanup_evidence(
     return {
         "schema": FREQUENCY_ADAPTIVE_EVIDENCE_SCHEMA,
         "available": True,
-        "comparison": "frequency-consensus-v1-fixed-target-to-adaptive-v1",
-        "variant_labels": {"baseline": "Fixed v1", "regularized": "Adaptive v1"},
+        "comparison": (
+            f"frequency-consensus-{adapter_version}-fixed-target-to-"
+            f"adaptive-{adapter_version}"
+        ),
+        "variant_labels": {
+            "baseline": fixed_label,
+            "regularized": adaptive_label,
+        },
         "definition": {
             "source": "exact exported scalar-map PNGs",
             "outlier": "abs(map - own median5_nearest) > 0.05",
@@ -6675,8 +6792,10 @@ def _measure_adaptive_cleanup_evidence(
                 "quiet_percentile": QUIET_GUIDE_PERCENTILE,
             },
             "transitions": {
-                "removed": "Fixed v1 outlier and not Adaptive v1 outlier",
-                "introduced": "Adaptive v1 outlier and not Fixed v1 outlier",
+                "removed": f"{fixed_label} outlier and not {adaptive_label} outlier",
+                "introduced": (
+                    f"{adaptive_label} outlier and not {fixed_label} outlier"
+                ),
                 "persistent": "outlier in both variants",
             },
         },
@@ -7030,6 +7149,16 @@ def _write_adaptive_cleanup_evidence(
         raise ValueError("adaptive cleanup evidence has an invalid schema")
     if evidence.get("focused_maps") != list(FREQUENCY_ADAPTIVE_FOCUSED_MAPS):
         raise ValueError("adaptive cleanup evidence focused maps are invalid")
+    variant_labels = evidence.get("variant_labels")
+    if not isinstance(variant_labels, dict) or set(variant_labels) != {
+        "baseline",
+        "regularized",
+    }:
+        raise ValueError("adaptive cleanup evidence variant labels are invalid")
+    fixed_label = variant_labels["baseline"]
+    adaptive_label = variant_labels["regularized"]
+    if not all(isinstance(label, str) and label for label in variant_labels.values()):
+        raise ValueError("adaptive cleanup evidence variant labels are invalid")
     profile_masks = {
         profile: _adaptive_cleanup_profile_masks(
             baseline_camera,
@@ -7045,10 +7174,10 @@ def _write_adaptive_cleanup_evidence(
     tile_size = source_size * scale
     gutter = 350
     columns = (
-        "Fixed v1 raw",
-        "Adaptive v1 raw",
-        "Fixed v1 outliers",
-        "Adaptive v1 outliers",
+        f"{fixed_label} raw",
+        f"{adaptive_label} raw",
+        f"{fixed_label} outliers",
+        f"{adaptive_label} outliers",
         "Transition",
     )
     width = gutter + len(columns) * tile_size + 40
@@ -7074,14 +7203,14 @@ def _write_adaptive_cleanup_evidence(
     contract = summary["comparison_contract"]
     draw.text(
         (36, 22),
-        "Fixed frequency consensus v1 → Adaptive v1 · cleanup evidence",
+        f"{fixed_label} frequency consensus → {adaptive_label} · cleanup evidence",
         font=_font(43, bold=True),
         fill="white",
     )
     header_lines = (
         (
-            "Controlled A/B · fixed frequency consensus v1 "
-            f"λ={contract['baseline_tv_weight']:g} → Adaptive v1 "
+            f"Controlled A/B · {fixed_label} frequency consensus "
+            f"λ={contract['baseline_tv_weight']:g} → {adaptive_label} "
             f"λ={contract['regularized_tv_weight']:g} · exact exported scalar-map PNGs",
             (151, 205, 255),
             True,
@@ -7646,8 +7775,22 @@ def _write_overview(
         else None
     )
     if isinstance(adaptive_evidence, dict):
+        adaptive_variant_labels = adaptive_evidence.get("variant_labels")
+        if not isinstance(adaptive_variant_labels, dict) or set(
+            adaptive_variant_labels
+        ) != {"baseline", "regularized"}:
+            raise ValueError("adaptive overview variant labels are invalid")
+        fixed_variant_label = adaptive_variant_labels["baseline"]
+        adaptive_variant_label = adaptive_variant_labels["regularized"]
+        if not all(
+            isinstance(label, str) and label
+            for label in (fixed_variant_label, adaptive_variant_label)
+        ):
+            raise ValueError("adaptive overview variant labels are invalid")
         hero_maps = ("anisotropic", "subsurface", "roughness", "specular")
     else:
+        fixed_variant_label = "Baseline"
+        adaptive_variant_label = "Regularized"
         hero_maps = ("roughness", "specular", "subsurface", "anisotropic")
     material_left = OVERVIEW_MATERIAL_LEFT
     material_tile_width = 170
@@ -7829,7 +7972,8 @@ def _write_overview(
             else f"λ={baseline_weight:g} → {regularized_weight:g}"
         )
         contract_text = (
-            "Controlled A/B · fixed frequency consensus v1 → Adaptive v1 · "
+            f"Controlled A/B · {fixed_variant_label} frequency consensus → "
+            f"{adaptive_variant_label} · "
             f"{weight_text}"
         )
     else:
@@ -7990,7 +8134,8 @@ def _write_overview(
     draw.text(
         (36, material_top + 10),
         (
-            "Material maps · Fixed v1 and Adaptive v1 side by side"
+            f"Material maps · {fixed_variant_label} and "
+            f"{adaptive_variant_label} side by side"
             if isinstance(adaptive_evidence, dict)
             else "Material maps · baseline and regularized side by side"
         ),
@@ -8007,7 +8152,7 @@ def _write_overview(
             "white",
         )
         variant_labels = (
-            ("Fixed v1", "Adaptive v1")
+            (fixed_variant_label, adaptive_variant_label)
             if isinstance(adaptive_evidence, dict)
             else ("Baseline", "Regularized")
         )
@@ -8232,7 +8377,10 @@ def _write_overview(
         )
         for variant_index, (variant_label, camera) in enumerate(
             (
-                (("Fixed v1", baseline_camera), ("Adaptive v1", regularized_camera))
+                (
+                    (fixed_variant_label, baseline_camera),
+                    (adaptive_variant_label, regularized_camera),
+                )
                 if isinstance(adaptive_evidence, dict)
                 else (("Baseline", baseline_camera), ("Regularized", regularized_camera))
             )

@@ -397,7 +397,13 @@ def _file_sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _make_proximal_impulse_pair(baseline, candidate, *, profile="olat"):
+def _make_proximal_impulse_pair(
+    baseline,
+    candidate,
+    *,
+    profile="olat",
+    frequency_v2_adapter=False,
+):
     baseline_path = baseline / "material" / profile / "acquisition.json"
     candidate_path = candidate / "material" / profile / "acquisition.json"
     baseline_acquisition = json.loads(baseline_path.read_text(encoding="utf-8"))
@@ -432,6 +438,19 @@ def _make_proximal_impulse_pair(baseline, candidate, *, profile="olat"):
             },
         }
     )
+    if frequency_v2_adapter:
+        baseline_signature.update(
+            {
+                "schema": "ictpolarreal.end2end-checkpoint.v13",
+                "adapter": {
+                    "schema": "ictpolarreal.profile-acquisition-adapter.v7",
+                    "algorithm_version": "ictpolarreal-frequency-consensus-v2",
+                    "lighting_profiles_sha256": "lighting",
+                    "optimizer": "Adam with cosine decay",
+                },
+            }
+        )
+        baseline_acquisition["schema"] = "ictpolarreal.end2end-disney.v13"
     baseline_acquisition["regularization"] = baseline_regularization
     baseline_acquisition["checkpoint_signature"] = baseline_signature
 
@@ -534,17 +553,33 @@ def _make_proximal_impulse_pair(baseline, candidate, *, profile="olat"):
     candidate_signature = copy.deepcopy(baseline_signature)
     candidate_signature.update(
         {
-            "schema": "ictpolarreal.end2end-checkpoint.v12",
+            "schema": (
+                "ictpolarreal.end2end-checkpoint.v13"
+                if frequency_v2_adapter
+                else "ictpolarreal.end2end-checkpoint.v12"
+            ),
             "regularization": copy.deepcopy(impulse_signature_regularization),
         }
     )
     candidate_signature["adapter"].update(
         {
-            "schema": "ictpolarreal.profile-acquisition-adapter.v6",
-            "algorithm_version": "ictpolarreal-impulse-proximal-v5",
+            "schema": (
+                "ictpolarreal.profile-acquisition-adapter.v7"
+                if frequency_v2_adapter
+                else "ictpolarreal.profile-acquisition-adapter.v6"
+            ),
+            "algorithm_version": (
+                "ictpolarreal-frequency-consensus-v2"
+                if frequency_v2_adapter
+                else "ictpolarreal-impulse-proximal-v5"
+            ),
         }
     )
-    candidate_acquisition["schema"] = "ictpolarreal.end2end-disney.v12"
+    candidate_acquisition["schema"] = (
+        "ictpolarreal.end2end-disney.v13"
+        if frequency_v2_adapter
+        else "ictpolarreal.end2end-disney.v12"
+    )
     candidate_acquisition["regularization"] = {
         **impulse_signature_regularization,
         "weight_semantics": "constrained_shrink_per_cleanup_iteration",
@@ -1598,6 +1633,37 @@ def test_active_frequency_to_adaptive_contract_requires_equal_fit_and_weight():
         "frequency-consensus-adaptive"
     ) == "adaptive frequency consensus"
 
+    baseline_v2 = acquisition(
+        "frequency-consensus",
+        "ictpolarreal-frequency-consensus-v2",
+    )
+    adaptive_v2 = acquisition(
+        "frequency-consensus-adaptive",
+        "ictpolarreal-frequency-consensus-adaptive-v2",
+    )
+    contract_v2 = compare_regularization._validate_comparison_contract(
+        {
+            "baseline": {"olat": baseline_v2},
+            "regularized": {"olat": adaptive_v2},
+        },
+        ("olat",),
+    )
+    assert contract_v2["comparison_mode"] == (
+        "frequency-consensus-v2-to-adaptive-v2"
+    )
+    assert contract_v2["signature_compatibility"] == [
+        "active-frequency-v2-to-adaptive-v2"
+    ]
+
+    with pytest.raises(ValueError, match="unsupported schema/algorithm transition"):
+        compare_regularization._validate_comparison_contract(
+            {
+                "baseline": {"olat": baseline_v2},
+                "regularized": {"olat": adaptive},
+            },
+            ("olat",),
+        )
+
     unequal_weight = copy.deepcopy(adaptive)
     unequal_weight["regularization"]["weight"] = 0.001
     unequal_weight["checkpoint_signature"]["regularization"]["weight"] = 0.001
@@ -1620,6 +1686,55 @@ def test_active_frequency_to_adaptive_contract_requires_equal_fit_and_weight():
             },
             ("olat",),
         )
+
+
+def test_data_root_fit_mask_reconstructs_recorded_legacy_or_clean_rule(
+    tmp_path,
+    monkeypatch,
+):
+    class Sample:
+        def __init__(self, object_name, camera_name, camera_dir):
+            self.camera_dir = camera_dir
+
+        def image_path(self, kind):
+            return self.camera_dir / f"{kind}.png"
+
+    normal = np.asarray(
+        [[[0.0, 0.0, 1.0], [0.0, 0.0, -1.0]]],
+        dtype=np.float32,
+    )
+    capture = np.ones((1, 2, 1), dtype=np.float32)
+    view = np.zeros_like(normal)
+    view[..., 2] = 1.0
+    monkeypatch.setattr(compare_regularization, "CameraSample", Sample)
+    monkeypatch.setattr(
+        compare_regularization,
+        "read_image",
+        lambda path, channels=None: capture if channels == 1 else normal,
+    )
+    monkeypatch.setattr(
+        compare_regularization,
+        "load_end2end_view_directions",
+        lambda data_root, sample, expected_shape: view,
+    )
+
+    clean = compare_regularization._fit_mask_from_data_root(
+        tmp_path,
+        "object",
+        "cam07",
+        (2, 1),
+        fit_mask_rule=compare_regularization._CLEAN_CAPTURE_FIT_MASK_RULE,
+    )
+    legacy = compare_regularization._fit_mask_from_data_root(
+        tmp_path,
+        "object",
+        "cam07",
+        (2, 1),
+        fit_mask_rule=compare_regularization._LEGACY_FRONT_FACING_FIT_MASK_RULE,
+    )
+
+    np.testing.assert_array_equal(clean, [[True, True]])
+    np.testing.assert_array_equal(legacy, [[True, False]])
 
 
 def _frequency_guard_acquisition(pre_cleanup, post_cleanup):
@@ -2235,6 +2350,43 @@ def test_compose_proximal_impulse_report_accepts_model_map_order_and_metrics(
             tmp_path / "corrupt-comparison",
             mask_path=mask_path,
         )
+
+
+def test_impulse_cleanup_accepts_current_v13_frequency_v2_adapter(tmp_path):
+    baseline = tmp_path / "baseline" / "object" / "cam07"
+    candidate = tmp_path / "candidate" / "object" / "cam07"
+    _write_synthetic_camera(baseline, tv_weight=0.0, noisy=False)
+    _write_synthetic_camera(candidate, tv_weight=0.0, noisy=False)
+    _make_proximal_impulse_pair(
+        baseline,
+        candidate,
+        frequency_v2_adapter=True,
+    )
+    acquisitions = {
+        variant: compare_regularization._load_acquisitions(camera, ("olat",))
+        for variant, camera in (
+            ("baseline", baseline),
+            ("regularized", candidate),
+        )
+    }
+    contract = compare_regularization._validate_comparison_contract(
+        acquisitions,
+        ("olat",),
+    )
+
+    cleanup = compare_regularization._measure_impulse_cleanup(
+        baseline,
+        candidate,
+        ("olat",),
+        np.ones((32, 24), dtype=bool),
+        acquisitions,
+        contract,
+    )
+
+    assert contract["signature_compatibility"] == ["exact-schema"]
+    assert cleanup is not None
+    assert cleanup["available"] is True
+    assert cleanup["profiles"]["olat"]["artifact"]["validated"] is True
 
 
 def test_compose_frequency_report_validates_writer_artifact_gates_and_native_panels(

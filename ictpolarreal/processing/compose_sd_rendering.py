@@ -2,7 +2,7 @@
 
 The CUDA renderer stages the twelve Disney material maps and four panels for
 each of the 36 source-exact SD lighting conditions.  This CPU-only compositor
-validates that private renderer-v2 transaction and writes the single public
+validates that private renderer-v4 transaction and writes the single public
 camera-level pickup, ``rendering.png``.  Its 12-column by 13-row layout matches
 the identified SuperDimension ``renderings.jpg`` contract exactly.
 """
@@ -18,11 +18,13 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
-RENDER_MANIFEST_SCHEMA = "ictpolarreal.saved-disney-render.v3"
-PRESENTATION_MASK_SCHEMA = "ictpolarreal.saved-render-presentation-mask.v1"
-FIT_MASK_RULE = "binary_capture_mask_times_front_facing_n_dot_v"
+RENDER_MANIFEST_SCHEMA = "ictpolarreal.saved-disney-render.v4"
+PRESENTATION_MASK_SCHEMA = "ictpolarreal.saved-render-presentation-mask.v2"
+FIT_MASK_RULE = "binary_clean_capture_mask_after_view_facing_normal_orientation"
 PRESENTATION_MASK_RULE = "soft_clean_dataset_mask_applied_once_without_n_dot_v_culling"
-PRESENTATION_NORMAL_RULE = "flip_negative_n_dot_v_normals_for_rendering_only"
+PRESENTATION_NORMAL_RULE = (
+    "reflect_negative_view_component_and_lift_near_tangent_normals"
+)
 EXPECTED_CONDITION_COUNT = 36
 EXPECTED_SD_SOURCE_RANKS: tuple[int, ...] = tuple(range(1, 33))
 CONDITION_LABEL_NUMBERS: tuple[int, ...] = tuple(range(1, 142, 4))
@@ -169,6 +171,10 @@ def _validate_presentation_mask(
         "input_hash_checks.foreground.actual_sha256",
     ):
         raise ValueError("presentation fit mask differs from acquisition")
+    if fit_sha256 != capture_sha256:
+        raise ValueError(
+            "view-oriented renderer fit mask must equal the clean capture mask"
+        )
 
     path_value = value.get("presentation_mask_path")
     if not isinstance(path_value, str) or not Path(path_value).is_absolute():
@@ -219,12 +225,14 @@ def _validate_presentation_mask(
         np.count_nonzero((alpha > 0.0) & (alpha < 1.0))
     ):
         raise ValueError("renderer presentation fractional alpha count is wrong")
-    if counts["fit_foreground_pixels"] > counts["capture_foreground_pixels"]:
-        raise ValueError("renderer fit foreground exceeds the clean capture mask")
-    if counts["restored_foreground_pixels"] != (
-        counts["capture_foreground_pixels"] - counts["fit_foreground_pixels"]
-    ):
-        raise ValueError("renderer restored foreground pixel count is inconsistent")
+    if counts["fit_foreground_pixels"] != counts["capture_foreground_pixels"]:
+        raise ValueError(
+            "view-oriented renderer must fit every clean foreground pixel"
+        )
+    if counts["restored_foreground_pixels"] != 0:
+        raise ValueError(
+            "view-oriented renderer cannot restore pixels excluded from fitting"
+        )
 
 
 def _camera_relative_path(camera_dir: Path, value: Any, label: str) -> Path:
@@ -422,6 +430,26 @@ def _validate_replay_provenance(
     input_hash_checks = payload.get("input_hash_checks")
     _require_passing_hash_checks(input_hash_checks, "input_hash_checks")
     assert isinstance(input_hash_checks, dict)
+    required_input_hash_checks = {
+        "material_state",
+        "disney_source",
+        "condition_weights",
+        "frame_ids",
+        "light_ids",
+        "light_directions",
+        "raw_parallel_targets",
+        "capture_foreground",
+        "source_normal",
+        "normal",
+        "view_directions",
+        "foreground",
+    }
+    missing_hash_checks = required_input_hash_checks - set(input_hash_checks)
+    if missing_hash_checks:
+        raise ValueError(
+            "renderer manifest is missing required v2 input hash checks: "
+            f"{sorted(missing_hash_checks)}"
+        )
     _validate_raw_parallel_hash_check(input_hash_checks.get("raw_parallel_targets"))
     _validate_presentation_mask(
         payload.get("presentation_mask"), input_hash_checks

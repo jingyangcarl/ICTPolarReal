@@ -28,6 +28,11 @@ PERCENTILE = 99.5
 MIN_LR_RATIO = 0.01
 MIN_TRAIN_LIGHTS = 4
 MIN_N_DOT_V = 1e-4
+MIN_ORIENTED_N_DOT_V = 1e-3
+NORMAL_ORIENTATION_RULE = (
+    "reflect_negative_view_component_and_lift_near_tangent_normals"
+)
+FIT_MASK_RULE = "binary_clean_capture_mask_after_view_facing_normal_orientation"
 LSX_VISIBLE_HEMISPHERE_LIGHTS = 173
 SUPERDIMENSION_FIT_LIGHTS = 164
 MAX_QUANTILE_ELEMENTS = 1 << 23
@@ -433,29 +438,36 @@ def acquire_disney_material(
     # reflection observation (diffuse + specular).  Do not collapse the two
     # polarization branches into a synthetic target: that changes the fitting
     # objective and amplifies polarization noise where cross > parallel.
-    normal = _normalize_vectors(normal)
     view_dirs = _normalize_vectors(view_dirs)
-    n_dot_v = np.sum(normal * view_dirs, axis=-1, keepdims=True)
-    front_facing = (n_dot_v > MIN_N_DOT_V).astype(np.float32)
-    foreground = capture_foreground * front_facing
+    source_normal = _normalize_vectors(normal)
+    normal, normal_orientation = _orient_normals_to_view(
+        source_normal,
+        view_dirs,
+        foreground=capture_foreground,
+    )
+    # The photometric normal is fixed during optimization.  Orient it before
+    # fitting so the clean capture foreground and the material-fit foreground
+    # are identical.  Excluding negative n.v pixels here leaves their scalar
+    # BRDF maps at constructor defaults and creates a visible internal seam in
+    # prediction and probe renders.
+    foreground = capture_foreground.copy()
     capture_pixels = int(np.count_nonzero(capture_foreground > 0.5))
     valid_pixels = int(np.count_nonzero(foreground > 0.5))
-    if valid_pixels == 0:
-        raise ValueError(
-            "end2end acquisition has no front-facing foreground pixels; check "
-            "the normal/view coordinate convention"
-        )
     surface_validity = {
-        "minimum_n_dot_v": MIN_N_DOT_V,
+        "fit_mask_rule": FIT_MASK_RULE,
+        "normal_orientation_rule": NORMAL_ORIENTATION_RULE,
+        "minimum_n_dot_v": MIN_ORIENTED_N_DOT_V,
         "capture_foreground_pixels": capture_pixels,
         "front_facing_pixels": valid_pixels,
-        "excluded_back_facing_pixels": capture_pixels - valid_pixels,
-        "excluded_fraction": float((capture_pixels - valid_pixels) / capture_pixels),
+        "excluded_back_facing_pixels": 0,
+        "excluded_fraction": 0.0,
+        **normal_orientation,
     }
     print(
         "[end2end] surface validity: "
-        f"{valid_pixels}/{capture_pixels} foreground pixels are front-facing "
-        f"({100.0 * surface_validity['excluded_fraction']:.2f}% excluded)",
+        f"{valid_pixels}/{capture_pixels} clean foreground pixels fitted; "
+        f"reflected={normal_orientation['reflected_foreground_pixels']}, "
+        f"near_tangent={normal_orientation['near_tangent_foreground_pixels']}",
         flush=True,
     )
     raw_target_stack = np.maximum(parallel, 0.0).astype(np.float32)
@@ -466,6 +478,7 @@ def acquire_disney_material(
         "capture_foreground_sha256": _array_sha256(capture_foreground),
         "foreground_sha256": _array_sha256(foreground),
         "base_color_sha256": _array_sha256(base_color),
+        "source_normal_sha256": _array_sha256(source_normal),
         "normal_sha256": _array_sha256(normal),
         "view_directions_sha256": _array_sha256(view_dirs),
         "raw_parallel_targets_sha256": _array_sha256(raw_target_stack),
@@ -3005,13 +3018,13 @@ def _checkpoint_signatures_match(
 def _adapter_provenance(tv_kind: str = "frequency-consensus") -> dict[str, Any]:
     if _is_frequency_consensus_regularizer_kind(tv_kind):
         schema = "ictpolarreal.profile-acquisition-adapter.v8"
-        algorithm_version = "ictpolarreal-frequency-consensus-regularizer-v1"
+        algorithm_version = "ictpolarreal-frequency-consensus-regularizer-v2"
     else:
         schema = "ictpolarreal.profile-acquisition-adapter.v7"
         algorithm_version = (
-            "ictpolarreal-frequency-consensus-adaptive-v1"
+            "ictpolarreal-frequency-consensus-adaptive-v2"
             if tv_kind == "frequency-consensus-adaptive"
-            else "ictpolarreal-frequency-consensus-v1"
+            else "ictpolarreal-frequency-consensus-v2"
         )
     lighting_path = Path(__file__).resolve().with_name("lighting_profiles.py")
     return {
@@ -3025,6 +3038,9 @@ def _adapter_provenance(tv_kind: str = "frequency-consensus") -> dict[str, Any]:
         "maximum_quantile_elements": MAX_QUANTILE_ELEMENTS,
         "hdri_autograd_bytes_per_light_pixel": HDRI_AUTOGRAD_BYTES_PER_LIGHT_PIXEL,
         "minimum_hdri_gpu_memory_bytes": MIN_HDRI_GPU_MEMORY_BYTES,
+        "fit_mask_rule": FIT_MASK_RULE,
+        "normal_orientation_rule": NORMAL_ORIENTATION_RULE,
+        "minimum_oriented_n_dot_v": MIN_ORIENTED_N_DOT_V,
         "optimizer": "Adam with cosine decay",
         "hdri_integration": (
             "solid-angle-integrated Voronoi cell radiance with explicit unit "
@@ -6636,6 +6652,96 @@ def _normalize_vectors(vectors: np.ndarray) -> np.ndarray:
     values = np.asarray(vectors, dtype=np.float32)
     norm = np.linalg.norm(values, axis=-1, keepdims=True)
     return values / np.maximum(norm, 1e-8)
+
+
+def _orient_normals_to_view(
+    normal: np.ndarray,
+    view_dirs: np.ndarray,
+    *,
+    foreground: np.ndarray | None = None,
+    minimum_n_dot_v: float = MIN_ORIENTED_N_DOT_V,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Return a continuous, camera-facing normal field and audit counts.
+
+    Reflecting only the negative view component preserves the tangent component
+    and is continuous at ``n dot v == 0``.  Negating the entire vector is not:
+    neighboring normals on opposite sides of that boundary become nearly
+    opposite and produce the probe seam that motivated this guard.
+    """
+    values = np.asarray(normal, dtype=np.float32)
+    views = np.asarray(view_dirs, dtype=np.float32)
+    if values.shape != views.shape or values.ndim != 3 or values.shape[-1] != 3:
+        raise ValueError(
+            "normal and view directions must share finite shape (H,W,3)"
+        )
+    if (
+        not math.isfinite(minimum_n_dot_v)
+        or minimum_n_dot_v <= 0.0
+        or minimum_n_dot_v >= 1.0
+    ):
+        raise ValueError("minimum oriented n dot v must be finite within (0,1)")
+
+    view_norm = np.linalg.norm(views, axis=-1, keepdims=True)
+    if not np.isfinite(views).all() or np.any(view_norm <= 1e-8):
+        raise ValueError("view directions must be finite and non-zero")
+    views = views / view_norm
+
+    source_norm = np.linalg.norm(values, axis=-1, keepdims=True)
+    source_valid = np.isfinite(values).all(axis=-1, keepdims=True) & (
+        source_norm > 1e-8
+    )
+    normalized = np.divide(
+        np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0),
+        np.maximum(np.nan_to_num(source_norm, nan=0.0), 1e-8),
+    )
+    normalized = np.where(source_valid, normalized, views)
+    source_dot = np.sum(normalized * views, axis=-1, keepdims=True)
+
+    reflected = source_valid & (source_dot < 0.0)
+    oriented = normalized - 2.0 * np.minimum(source_dot, 0.0) * views
+    oriented = _normalize_vectors(oriented)
+    oriented_dot = np.sum(oriented * views, axis=-1, keepdims=True)
+
+    near_tangent = oriented_dot < minimum_n_dot_v
+    tangent = oriented - oriented_dot * views
+    tangent_norm = np.linalg.norm(tangent, axis=-1, keepdims=True)
+    tangent_direction = tangent / np.maximum(tangent_norm, 1e-8)
+    lifted = (
+        tangent_direction * math.sqrt(1.0 - minimum_n_dot_v**2)
+        + minimum_n_dot_v * views
+    )
+    oriented = np.where(near_tangent, lifted, oriented)
+    oriented = np.ascontiguousarray(_normalize_vectors(oriented).astype(np.float32))
+
+    if foreground is None:
+        selected = np.ones(values.shape[:2] + (1,), dtype=bool)
+    else:
+        selected = np.asarray(foreground)
+        if selected.ndim == 2:
+            selected = selected[..., None]
+        if selected.shape != values.shape[:2] + (1,):
+            raise ValueError("normal-orientation foreground must have shape (H,W,1)")
+        selected = selected > 0.5
+    final_dot = np.sum(oriented * views, axis=-1, keepdims=True)
+    selected_dot = final_dot[selected]
+    if selected_dot.size == 0:
+        raise ValueError("normal orientation requires a non-empty foreground")
+    if float(selected_dot.min()) < minimum_n_dot_v - 1e-6:
+        raise RuntimeError("normal orientation failed its minimum n dot v guard")
+
+    return oriented, {
+        "source_invalid_foreground_pixels": int(
+            np.count_nonzero(selected & ~source_valid)
+        ),
+        "source_nonfront_facing_foreground_pixels": int(
+            np.count_nonzero(selected & (source_dot <= MIN_N_DOT_V))
+        ),
+        "reflected_foreground_pixels": int(np.count_nonzero(selected & reflected)),
+        "near_tangent_foreground_pixels": int(
+            np.count_nonzero(selected & near_tangent)
+        ),
+        "minimum_oriented_n_dot_v_observed": float(selected_dot.min()),
+    }
 
 
 def _validate_spatial_inputs(
