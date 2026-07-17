@@ -176,6 +176,21 @@ def test_load_parallel_targets_reports_missing_recorded_frame():
         )
 
 
+def test_presentation_alpha_preserves_clean_soft_mask_values():
+    mask = np.asarray(
+        [[[0.0], [0.25]], [[0.75], [1.0]]], dtype=np.float32
+    )
+
+    alpha = render_saved_material._presentation_alpha(mask, 2, 2)
+
+    np.testing.assert_array_equal(alpha, mask)
+    assert alpha.flags.c_contiguous
+    np.testing.assert_array_equal(
+        render_saved_material._foreground_mask(mask, 2, 2)[..., 0],
+        [[0.0, 0.0], [1.0, 1.0]],
+    )
+
+
 def test_install_staged_directory_replaces_only_after_complete_stage(tmp_path):
     output_dir = tmp_path / ".rendering_stage"
     staging_dir = tmp_path / ".rendering_stage.tmp-123"
@@ -334,7 +349,9 @@ def test_prepare_sd_renderings_preset_is_calibration_then_exact_rank_order(monke
             dtype=np.float32,
         ),
         view_directions=np.zeros((2, 4, 3), dtype=np.float32),
-        foreground=np.ones((2, 4, 1), dtype=np.float32),
+        fit_foreground=np.ones((2, 4, 1), dtype=np.float32),
+        presentation_alpha=np.ones((2, 4, 1), dtype=np.float32),
+        presentation_mask_path=Path("mask.png"),
         hash_checks={},
     )
     lighting = render_saved_material.RecordedLighting(
@@ -418,7 +435,57 @@ def test_historical_probe_parameters_match_exact_sd_constraints():
         )
 
 
-def test_measured_gt_is_supported_weighted_sum_mask_then_global_p995():
+def test_presentation_parameters_face_forward_only_negative_visible_normals():
+    torch = pytest.importorskip("torch")
+    normal = torch.tensor(
+        [[[0.0, 0.0, -1.0], [0.0, 0.0, 1.0]]], dtype=torch.float32
+    )
+    model = SimpleNamespace(_param_maps=lambda: {"normal": normal})
+    views = torch.tensor(
+        [[[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]]], dtype=torch.float32
+    )
+    alpha = torch.tensor([[[1.0], [0.5]]], dtype=torch.float32)
+
+    parameters, count = (
+        render_saved_material._face_forward_presentation_parameters(
+            torch, model, views, alpha
+        )
+    )
+
+    torch.testing.assert_close(
+        parameters["normal"],
+        torch.tensor(
+            [[[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]]], dtype=torch.float32
+        ),
+    )
+    assert count == 1
+
+
+def test_render_condition_does_not_square_disney_soft_alpha():
+    torch = pytest.importorskip("torch")
+    alpha = torch.tensor([[[0.5], [1.0]]], dtype=torch.float32)
+
+    class AlreadyMaskedModel:
+        def __call__(self, **arguments):
+            masked = arguments["mask"].permute(2, 0, 1).repeat(3, 1, 1)
+            return masked, None, None
+
+    rendered = render_saved_material._render_condition(
+        torch=torch,
+        model=AlreadyMaskedModel(),
+        views=torch.zeros((1, 2, 3), dtype=torch.float32),
+        lights=torch.tensor([[0.0, 0.0, 1.0]], dtype=torch.float32),
+        foreground=alpha,
+        weights=np.ones((1, 3), dtype=np.float32),
+        support_indices=np.asarray([0], dtype=np.int64),
+        light_chunk=None,
+    )
+
+    np.testing.assert_array_equal(rendered[:, 0], np.full((1, 3), 0.5))
+    np.testing.assert_array_equal(rendered[:, 1], np.ones((1, 3)))
+
+
+def test_measured_gt_is_supported_weighted_sum_soft_mask_once_then_global_p995():
     torch = pytest.importorskip("torch")
     targets = torch.tensor(
         [
@@ -433,16 +500,31 @@ def test_measured_gt_is_supported_weighted_sum_mask_then_global_p995():
     actual = render_saved_material._render_measured_gt(
         torch=torch,
         parallel_targets=targets,
-        foreground=foreground,
+        presentation_alpha=foreground,
         weights=weights,
         support_indices=np.asarray([1], dtype=np.int64),
     )
 
     raw = targets[1] * torch.tensor([1.0, 0.5, 0.25]).reshape(3, 1, 1)
     mask = foreground.permute(2, 0, 1)
-    expected = render_saved_material._normalize_render_foreground(raw, mask)
+    expected = render_saved_material._normalize_presentation_render(raw, mask)
     expected = expected.permute(1, 2, 0)
     np.testing.assert_allclose(actual, expected.numpy(), rtol=0.0, atol=1e-7)
+
+
+def test_presentation_gt_normalizer_does_not_square_soft_alpha():
+    torch = pytest.importorskip("torch")
+    render = torch.ones((3, 1, 2), dtype=torch.float32)
+    alpha = torch.tensor([[[1.0, 0.5]]], dtype=torch.float32)
+
+    normalized = render_saved_material._normalize_presentation_render(
+        render, alpha
+    )
+
+    torch.testing.assert_close(normalized[:, :, 0], torch.ones((3, 1)))
+    torch.testing.assert_close(
+        normalized[:, :, 1], torch.full((3, 1), 0.5)
+    )
 
 
 def test_material_map_stage_has_exact_order_native_rgb_and_paths(tmp_path):

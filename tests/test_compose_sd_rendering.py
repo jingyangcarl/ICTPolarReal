@@ -190,9 +190,27 @@ def _write_renderer_fixture(camera_dir: Path) -> dict[str, tuple[int, int, int]]
         "expected_sha256": raw_targets_digest,
         "passed": True,
     }
+    mask_path = camera_dir / "clean_mask.png"
+    mask_u8 = np.asarray([[0, 64], [192, 255]], dtype=np.uint8)
+    Image.fromarray(mask_u8, mode="L").save(mask_path)
+    presentation_alpha = np.ascontiguousarray(
+        (mask_u8.astype(np.float32) / 255.0)[..., None]
+    )
+    capture_foreground = np.ascontiguousarray(
+        (presentation_alpha > 0.5).astype(np.float32)
+    )
+    fit_foreground = np.zeros_like(capture_foreground)
+    fit_foreground[1, 1, 0] = 1.0
+    capture_digest = compositor._array_sha256(capture_foreground)
+    fit_digest = compositor._array_sha256(fit_foreground)
     manifest = {
         "conditions": rendered_conditions,
         "input_hash_checks": {
+            "capture_foreground": {
+                "actual_sha256": capture_digest,
+                "expected_sha256": capture_digest,
+                "passed": True,
+            },
             "condition_weights": {
                 "actual_sha256": _digest("condition weights"),
                 "expected_sha256": _digest("condition weights"),
@@ -201,6 +219,11 @@ def _write_renderer_fixture(camera_dir: Path) -> dict[str, tuple[int, int, int]]
             "material_state": {
                 "actual_sha256": _sha256(checkpoint_path),
                 "expected_sha256": _sha256(checkpoint_path),
+                "passed": True,
+            },
+            "foreground": {
+                "actual_sha256": fit_digest,
+                "expected_sha256": fit_digest,
                 "passed": True,
             },
             "raw_parallel_targets": raw_parallel_check,
@@ -213,6 +236,24 @@ def _write_renderer_fixture(camera_dir: Path) -> dict[str, tuple[int, int, int]]
         "material_maps": material_maps,
         "preset_provenance": preset_provenance,
         "profile": "olat",
+        "presentation_mask": {
+            "schema": compositor.PRESENTATION_MASK_SCHEMA,
+            "fit_rule": compositor.FIT_MASK_RULE,
+            "fit_foreground_sha256": fit_digest,
+            "presentation_rule": compositor.PRESENTATION_MASK_RULE,
+            "presentation_normal_rule": compositor.PRESENTATION_NORMAL_RULE,
+            "presentation_mask_path": str(mask_path.resolve()),
+            "presentation_mask_file_sha256": _sha256(mask_path),
+            "presentation_alpha_sha256": compositor._array_sha256(
+                presentation_alpha
+            ),
+            "capture_foreground_sha256": capture_digest,
+            "capture_foreground_pixels": 2,
+            "fit_foreground_pixels": 1,
+            "restored_foreground_pixels": 1,
+            "fractional_alpha_pixels": 2,
+            "faceforwarded_foreground_pixels": 1,
+        },
         "renderer": {
             "device": "cuda",
             "exact_original_summation_order": True,
@@ -278,7 +319,7 @@ def small_sheet(monkeypatch):
 
 
 def test_production_contract_is_the_identified_reference():
-    assert compositor.RENDER_MANIFEST_SCHEMA == "ictpolarreal.saved-disney-render.v2"
+    assert compositor.RENDER_MANIFEST_SCHEMA == "ictpolarreal.saved-disney-render.v3"
     assert compositor.SHEET_COLUMNS == 12
     assert compositor.SHEET_ROWS == 13
     assert compositor.SHEET_TILE_SIZE == 768
@@ -561,6 +602,30 @@ def test_compose_rejects_hash_mismatch_even_when_marked_passing(
     _save_manifest(camera_dir, manifest)
 
     with pytest.raises(ValueError, match="input hash check failed"):
+        compositor.compose_sd_rendering(camera_dir)
+
+
+def test_compose_rejects_fit_mask_as_presentation_policy(tmp_path, small_sheet):
+    camera_dir = tmp_path / "dragondruit" / "cam07"
+    _write_renderer_fixture(camera_dir)
+    manifest = _load_manifest(camera_dir)
+    manifest["presentation_mask"]["presentation_rule"] = (
+        "incorrectly_reuse_fit_foreground"
+    )
+    _save_manifest(camera_dir, manifest)
+
+    with pytest.raises(ValueError, match="wrong presentation rule"):
+        compositor.compose_sd_rendering(camera_dir)
+
+
+def test_compose_rejects_changed_clean_mask_source(tmp_path, small_sheet):
+    camera_dir = tmp_path / "dragondruit" / "cam07"
+    _write_renderer_fixture(camera_dir)
+    manifest = _load_manifest(camera_dir)
+    mask_path = Path(manifest["presentation_mask"]["presentation_mask_path"])
+    Image.new("L", (2, 2), 255).save(mask_path)
+
+    with pytest.raises(ValueError, match="source does not match provenance"):
         compositor.compose_sd_rendering(camera_dir)
 
 

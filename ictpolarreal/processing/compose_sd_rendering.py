@@ -18,7 +18,11 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
-RENDER_MANIFEST_SCHEMA = "ictpolarreal.saved-disney-render.v2"
+RENDER_MANIFEST_SCHEMA = "ictpolarreal.saved-disney-render.v3"
+PRESENTATION_MASK_SCHEMA = "ictpolarreal.saved-render-presentation-mask.v1"
+FIT_MASK_RULE = "binary_capture_mask_times_front_facing_n_dot_v"
+PRESENTATION_MASK_RULE = "soft_clean_dataset_mask_applied_once_without_n_dot_v_culling"
+PRESENTATION_NORMAL_RULE = "flip_negative_n_dot_v_normals_for_rendering_only"
 EXPECTED_CONDITION_COUNT = 36
 EXPECTED_SD_SOURCE_RANKS: tuple[int, ...] = tuple(range(1, 33))
 CONDITION_LABEL_NUMBERS: tuple[int, ...] = tuple(range(1, 142, 4))
@@ -109,6 +113,118 @@ def _validate_raw_parallel_hash_check(value: Any) -> None:
     )
     if value.get("passed") is not True or actual != expected:
         raise ValueError("renderer raw parallel target hash check did not pass")
+
+
+def _validate_presentation_mask(
+    value: Any, input_hash_checks: dict[str, Any]
+) -> None:
+    expected_keys = {
+        "schema",
+        "fit_rule",
+        "fit_foreground_sha256",
+        "presentation_rule",
+        "presentation_normal_rule",
+        "presentation_mask_path",
+        "presentation_mask_file_sha256",
+        "presentation_alpha_sha256",
+        "capture_foreground_sha256",
+        "capture_foreground_pixels",
+        "fit_foreground_pixels",
+        "restored_foreground_pixels",
+        "fractional_alpha_pixels",
+        "faceforwarded_foreground_pixels",
+    }
+    if not isinstance(value, dict) or set(value) != expected_keys:
+        raise ValueError("renderer presentation_mask fields differ from the contract")
+    if value.get("schema") != PRESENTATION_MASK_SCHEMA:
+        raise ValueError("renderer presentation_mask has the wrong schema")
+    if value.get("fit_rule") != FIT_MASK_RULE:
+        raise ValueError("renderer presentation_mask has the wrong fit rule")
+    if value.get("presentation_rule") != PRESENTATION_MASK_RULE:
+        raise ValueError("renderer presentation_mask has the wrong presentation rule")
+    if value.get("presentation_normal_rule") != PRESENTATION_NORMAL_RULE:
+        raise ValueError("renderer presentation_mask has the wrong normal rule")
+
+    capture_check = input_hash_checks.get("capture_foreground")
+    fit_check = input_hash_checks.get("foreground")
+    if not isinstance(capture_check, dict) or not isinstance(fit_check, dict):
+        raise ValueError(
+            "renderer presentation_mask requires capture and fit hash checks"
+        )
+    capture_sha256 = _require_sha256(
+        value.get("capture_foreground_sha256"),
+        "renderer presentation_mask.capture_foreground_sha256",
+    )
+    fit_sha256 = _require_sha256(
+        value.get("fit_foreground_sha256"),
+        "renderer presentation_mask.fit_foreground_sha256",
+    )
+    if capture_sha256 != _require_sha256(
+        capture_check.get("actual_sha256"),
+        "input_hash_checks.capture_foreground.actual_sha256",
+    ):
+        raise ValueError("presentation capture mask differs from acquisition")
+    if fit_sha256 != _require_sha256(
+        fit_check.get("actual_sha256"),
+        "input_hash_checks.foreground.actual_sha256",
+    ):
+        raise ValueError("presentation fit mask differs from acquisition")
+
+    path_value = value.get("presentation_mask_path")
+    if not isinstance(path_value, str) or not Path(path_value).is_absolute():
+        raise ValueError("renderer presentation_mask_path must be absolute")
+    mask_path = Path(path_value).resolve()
+    file_sha256 = _require_sha256(
+        value.get("presentation_mask_file_sha256"),
+        "renderer presentation_mask.presentation_mask_file_sha256",
+    )
+    alpha_sha256 = _require_sha256(
+        value.get("presentation_alpha_sha256"),
+        "renderer presentation_mask.presentation_alpha_sha256",
+    )
+    if not mask_path.is_file() or _sha256(mask_path) != file_sha256:
+        raise ValueError("renderer presentation mask source does not match provenance")
+
+    import numpy as np
+
+    from ictpolarreal.utils.io import read_image
+
+    alpha = np.asarray(read_image(mask_path, channels=1), dtype=np.float32)
+    if alpha.ndim == 2:
+        alpha = alpha[..., None]
+    if alpha.ndim != 3 or alpha.shape[-1] != 1 or not np.isfinite(alpha).all():
+        raise ValueError("renderer presentation mask source is not a finite alpha")
+    alpha = np.ascontiguousarray(np.clip(alpha, 0.0, 1.0))
+    if _array_sha256(alpha) != alpha_sha256:
+        raise ValueError("renderer presentation alpha differs from its source mask")
+    thresholded = np.ascontiguousarray((alpha > 0.5).astype(np.float32))
+    if _array_sha256(thresholded) != capture_sha256:
+        raise ValueError("renderer presentation mask does not reproduce acquisition")
+
+    counts: dict[str, int] = {}
+    for key in (
+        "capture_foreground_pixels",
+        "fit_foreground_pixels",
+        "restored_foreground_pixels",
+        "fractional_alpha_pixels",
+        "faceforwarded_foreground_pixels",
+    ):
+        count = value.get(key)
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError(f"renderer presentation_mask.{key} must be non-negative")
+        counts[key] = count
+    if counts["capture_foreground_pixels"] != int(thresholded.sum()):
+        raise ValueError("renderer presentation capture pixel count is wrong")
+    if counts["fractional_alpha_pixels"] != int(
+        np.count_nonzero((alpha > 0.0) & (alpha < 1.0))
+    ):
+        raise ValueError("renderer presentation fractional alpha count is wrong")
+    if counts["fit_foreground_pixels"] > counts["capture_foreground_pixels"]:
+        raise ValueError("renderer fit foreground exceeds the clean capture mask")
+    if counts["restored_foreground_pixels"] != (
+        counts["capture_foreground_pixels"] - counts["fit_foreground_pixels"]
+    ):
+        raise ValueError("renderer restored foreground pixel count is inconsistent")
 
 
 def _camera_relative_path(camera_dir: Path, value: Any, label: str) -> Path:
@@ -307,6 +423,9 @@ def _validate_replay_provenance(
     _require_passing_hash_checks(input_hash_checks, "input_hash_checks")
     assert isinstance(input_hash_checks, dict)
     _validate_raw_parallel_hash_check(input_hash_checks.get("raw_parallel_targets"))
+    _validate_presentation_mask(
+        payload.get("presentation_mask"), input_hash_checks
+    )
 
     validation = payload.get("validation")
     if not isinstance(validation, dict) or validation.get("passed") is not True:

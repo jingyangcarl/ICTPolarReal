@@ -15,12 +15,13 @@ import numpy as np
 from ictpolarreal.data.dataset import CameraSample
 from ictpolarreal.processing.end2end_acquisition import (
     MIN_N_DOT_V,
+    PERCENTILE,
     _array_sha256,
     _file_sha256,
     _foreground_mask,
     _load_imaginaire_disney,
-    _normalize_render_foreground,
     _normalize_vectors,
+    _safe_torch_quantile,
 )
 from ictpolarreal.processing.material_decomposition import (
     load_end2end_view_directions,
@@ -39,9 +40,13 @@ from ictpolarreal.processing.lighting_profiles import (
 from ictpolarreal.utils.io import read_image, write_image
 
 
-RENDER_MANIFEST_SCHEMA = "ictpolarreal.saved-disney-render.v2"
+RENDER_MANIFEST_SCHEMA = "ictpolarreal.saved-disney-render.v3"
 EXPECTED_CONDITIONS_SCHEMA = "ictpolarreal.hdri-conditions.v1"
 EXPECTED_MODEL_SCHEMA = "ictpolarreal.disney-state-artifact.v1"
+PRESENTATION_MASK_SCHEMA = "ictpolarreal.saved-render-presentation-mask.v1"
+FIT_MASK_RULE = "binary_capture_mask_times_front_facing_n_dot_v"
+PRESENTATION_MASK_RULE = "soft_clean_dataset_mask_applied_once_without_n_dot_v_culling"
+PRESENTATION_NORMAL_RULE = "flip_negative_n_dot_v_normals_for_rendering_only"
 DEFAULT_VALIDATION_TOLERANCE = 0.0
 SD_RENDERINGS_PRESET = "sd-renderings"
 SD_RENDERINGS_SCHEMA = "ictpolarreal.sd-renderings-preset.v1"
@@ -130,7 +135,9 @@ class ReplayInputs:
     parallel_targets: np.ndarray
     light_directions: np.ndarray
     view_directions: np.ndarray
-    foreground: np.ndarray
+    fit_foreground: np.ndarray
+    presentation_alpha: np.ndarray
+    presentation_mask_path: Path
     hash_checks: dict[str, dict[str, Any]]
 
 
@@ -375,6 +382,24 @@ def load_parallel_targets(
     return np.maximum(stack, 0.0).astype(np.float32, copy=False)
 
 
+def _presentation_alpha(mask: np.ndarray, height: int, width: int) -> np.ndarray:
+    """Preserve the clean dataset mask's soft edge for report rendering."""
+    image = np.asarray(mask, dtype=np.float32)
+    if image.ndim == 2:
+        image = image[..., None]
+    if image.shape != (height, width, 1):
+        raise ValueError(
+            f"presentation mask has shape {image.shape}, expected "
+            f"{(height, width, 1)}"
+        )
+    if not np.isfinite(image).all():
+        raise ValueError("presentation mask contains non-finite values")
+    alpha = np.clip(image, 0.0, 1.0).astype(np.float32, copy=False)
+    if not np.any(alpha > 0.0):
+        raise ValueError("presentation mask has no foreground alpha")
+    return np.ascontiguousarray(alpha)
+
+
 def prepare_replay_inputs(
     *,
     camera_dir: str | Path,
@@ -494,9 +519,9 @@ def prepare_replay_inputs(
         raise FileNotFoundError(
             "exact saved-material replay requires the acquisition mask and normal"
         )
-    capture_foreground = _foreground_mask(
-        read_image(mask_path, channels=1), height, width
-    )
+    mask_image = read_image(mask_path, channels=1)
+    presentation_alpha = _presentation_alpha(mask_image, height, width)
+    capture_foreground = _foreground_mask(mask_image, height, width)
     normal = _normalize_vectors(read_image(normal_path))
     view_directions = _normalize_vectors(
         load_end2end_view_directions(data_root, sample, (height, width))
@@ -531,7 +556,9 @@ def prepare_replay_inputs(
         parallel_targets=parallel_targets,
         light_directions=light_directions,
         view_directions=view_directions,
-        foreground=foreground,
+        fit_foreground=foreground,
+        presentation_alpha=presentation_alpha,
+        presentation_mask_path=mask_path.resolve(),
         hash_checks=checks,
     )
 
@@ -995,11 +1022,32 @@ def _write_material_maps(
     return records
 
 
-def _historical_probe_parameters(torch, model, kind: str) -> dict[str, Any]:
+def _face_forward_presentation_parameters(
+    torch, model, views, presentation_alpha
+) -> tuple[dict[str, Any], int]:
+    """Face-forward invalid visible normals without changing the saved model."""
+    parameters = dict(model._param_maps())
+    normal = parameters["normal"]
+    n_dot_v = (normal * views).sum(dim=-1, keepdim=True)
+    flip = n_dot_v < 0.0
+    parameters["normal"] = torch.where(flip, -normal, normal)
+    visible_flip = flip & (presentation_alpha > 0.0)
+    return parameters, int(visible_flip.count_nonzero().item())
+
+
+def _historical_probe_parameters(
+    torch,
+    model,
+    kind: str,
+    *,
+    base_parameters: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """Use the exact material constraints from the historical SD renderer."""
     if kind not in {"greyball", "chromeball"}:
         raise ValueError(f"unknown historical probe kind {kind!r}")
-    parameters = dict(model._param_maps())
+    parameters = dict(
+        model._param_maps() if base_parameters is None else base_parameters
+    )
     base = parameters["baseColor"]
     scalar = parameters["metallic"]
     parameters["baseColor"] = (
@@ -1026,7 +1074,7 @@ def _render_measured_gt(
     *,
     torch,
     parallel_targets,
-    foreground,
+    presentation_alpha,
     weights: np.ndarray,
     support_indices: np.ndarray,
 ) -> np.ndarray:
@@ -1047,11 +1095,66 @@ def _render_measured_gt(
         device=parallel_targets.device,
     ).index_select(0, support_tensor)
     raw_support = parallel_targets.index_select(0, support_tensor)
-    mask_chw = foreground.permute(2, 0, 1).contiguous()
+    alpha_chw = presentation_alpha.permute(2, 0, 1).contiguous()
     with torch.inference_mode():
         synthesized = torch.einsum("nc,nchw->chw", weights_support, raw_support)
-        rendered = _normalize_render_foreground(synthesized, mask_chw)
+        rendered = _normalize_presentation_render(synthesized, alpha_chw)
     return rendered.detach().float().cpu().permute(1, 2, 0).numpy()
+
+
+def _normalize_presentation_render(render, alpha_chw):
+    """Apply the clean soft alpha once, then use historical p99.5 scaling."""
+    finite = (
+        render.nan_to_num(nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+        * alpha_chw
+    )
+    if not bool((alpha_chw > 0.0).any()):
+        raise ValueError("cannot normalize a presentation render without alpha")
+    scale = _safe_torch_quantile(
+        finite.reshape(-1), PERCENTILE / 100.0
+    ).clamp_min(1e-8)
+    return (finite / scale).clamp_max(1.0)
+
+
+def _presentation_mask_provenance(
+    replay: ReplayInputs, *, faceforwarded_foreground_pixels: int
+) -> dict[str, Any]:
+    alpha = replay.presentation_alpha
+    capture_pixels = int(np.count_nonzero(alpha[..., 0] > 0.5))
+    fit_pixels = int(np.count_nonzero(replay.fit_foreground[..., 0] > 0.5))
+    capture_sha256 = _array_sha256((alpha > 0.5).astype(np.float32))
+    expected_capture_sha256 = replay.hash_checks["capture_foreground"][
+        "actual_sha256"
+    ]
+    if capture_sha256 != expected_capture_sha256:
+        raise RuntimeError(
+            "clean presentation mask no longer reconstructs the recorded capture "
+            "foreground"
+        )
+    if fit_pixels > capture_pixels:
+        raise RuntimeError("fit foreground cannot exceed the clean capture mask")
+    return {
+        "schema": PRESENTATION_MASK_SCHEMA,
+        "fit_rule": FIT_MASK_RULE,
+        "fit_foreground_sha256": replay.hash_checks["foreground"][
+            "actual_sha256"
+        ],
+        "presentation_rule": PRESENTATION_MASK_RULE,
+        "presentation_normal_rule": PRESENTATION_NORMAL_RULE,
+        "presentation_mask_path": str(replay.presentation_mask_path),
+        "presentation_mask_file_sha256": _file_sha256(
+            replay.presentation_mask_path
+        ),
+        "presentation_alpha_sha256": _array_sha256(alpha),
+        "capture_foreground_sha256": capture_sha256,
+        "capture_foreground_pixels": capture_pixels,
+        "fit_foreground_pixels": fit_pixels,
+        "restored_foreground_pixels": capture_pixels - fit_pixels,
+        "fractional_alpha_pixels": int(
+            np.count_nonzero((alpha > 0.0) & (alpha < 1.0))
+        ),
+        "faceforwarded_foreground_pixels": faceforwarded_foreground_pixels,
+    }
 
 
 def _install_staged_directory(
@@ -1198,14 +1301,32 @@ def render_saved_material(
     views = torch.as_tensor(
         np.ascontiguousarray(replay.view_directions), device=device
     )
-    foreground = torch.as_tensor(
-        np.ascontiguousarray(replay.foreground), device=device
+    fit_foreground = torch.as_tensor(
+        np.ascontiguousarray(replay.fit_foreground), device=device
+    )
+    presentation_alpha = torch.as_tensor(
+        np.ascontiguousarray(replay.presentation_alpha), device=device
     )
     parallel_targets = torch.as_tensor(
         np.ascontiguousarray(replay.parallel_targets), device=device
     )
-    greyball_parameters = _historical_probe_parameters(torch, model, "greyball")
-    chromeball_parameters = _historical_probe_parameters(torch, model, "chromeball")
+    presentation_parameters, faceforwarded_foreground_pixels = (
+        _face_forward_presentation_parameters(
+            torch, model, views, presentation_alpha
+        )
+    )
+    greyball_parameters = _historical_probe_parameters(
+        torch,
+        model,
+        "greyball",
+        base_parameters=presentation_parameters,
+    )
+    chromeball_parameters = _historical_probe_parameters(
+        torch,
+        model,
+        "chromeball",
+        base_parameters=presentation_parameters,
+    )
 
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     staging_dir = output_dir.with_name(f"{output_dir.name}.tmp-{os.getpid()}")
@@ -1234,7 +1355,7 @@ def render_saved_material(
                 model=model,
                 views=views,
                 lights=lights,
-                foreground=foreground,
+                foreground=fit_foreground,
                 weights=lighting.weights[validation_condition_index],
                 support_indices=support_for_condition(
                     lighting, validation_condition_index
@@ -1294,7 +1415,7 @@ def render_saved_material(
             gt = _render_measured_gt(
                 torch=torch,
                 parallel_targets=parallel_targets,
-                foreground=foreground,
+                presentation_alpha=presentation_alpha,
                 weights=condition.weights,
                 support_indices=condition.support_indices,
             )
@@ -1303,17 +1424,18 @@ def render_saved_material(
                 model=model,
                 views=views,
                 lights=lights,
-                foreground=foreground,
+                foreground=presentation_alpha,
                 weights=condition.weights,
                 support_indices=condition.support_indices,
                 light_chunk=light_chunk,
+                parameters=presentation_parameters,
             )
             greyball = _render_condition(
                 torch=torch,
                 model=model,
                 views=views,
                 lights=lights,
-                foreground=foreground,
+                foreground=presentation_alpha,
                 weights=condition.weights,
                 support_indices=condition.support_indices,
                 light_chunk=light_chunk,
@@ -1324,7 +1446,7 @@ def render_saved_material(
                 model=model,
                 views=views,
                 lights=lights,
-                foreground=foreground,
+                foreground=presentation_alpha,
                 weights=condition.weights,
                 support_indices=condition.support_indices,
                 light_chunk=light_chunk,
@@ -1377,6 +1499,12 @@ def render_saved_material(
             ),
             "validation": validation,
             "input_hash_checks": replay.hash_checks,
+            "presentation_mask": _presentation_mask_provenance(
+                replay,
+                faceforwarded_foreground_pixels=(
+                    faceforwarded_foreground_pixels
+                ),
+            ),
             "renderer": {
                 "model": "DisneyBRDFSimplifiedMultiLayer",
                 "integration": (
@@ -1385,8 +1513,10 @@ def render_saved_material(
                 ),
                 "tone_map": (
                     "pred/probes: Imaginaire linear whole-image p99.5; GT: "
-                    "nonnegative measured-parallel weighted sum, acquisition "
-                    "foreground, whole-image p99.5; all clamp to [0,1]"
+                    "nonnegative measured-parallel weighted sum; sheet panels "
+                    "use the clean dataset alpha exactly once before whole-image "
+                    "p99.5; replay validation retains the recorded fit mask; all "
+                    "clamp to [0,1]"
                 ),
                 "light_chunk": light_chunk,
                 "exact_original_summation_order": light_chunk is None,
@@ -1477,7 +1607,9 @@ def _render_condition(
     with torch.inference_mode():
         prediction, _, _ = model(**render_arguments)
     rendered = prediction.detach().float().cpu().permute(1, 2, 0).numpy()
-    return np.clip(rendered, 0.0, 1.0) * foreground.detach().cpu().numpy()
+    # Disney applies ``foreground`` before its whole-image p99.5 tone map.
+    # Multiplying again would square soft antialias values at the clean boundary.
+    return np.clip(rendered, 0.0, 1.0)
 
 
 def _load_state_dict(torch, path: Path):
