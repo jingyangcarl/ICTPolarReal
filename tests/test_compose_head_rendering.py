@@ -90,7 +90,7 @@ def _write_renderer_fixture(
     non_rgb_position: int | None = None,
 ) -> list[dict]:
     material_dir = camera_dir / "material" / "olat"
-    stage_dir = material_dir / ".rendering_stage"
+    stage_dir = camera_dir / ".rendering_stage"
     conditions_dir = stage_dir / "conditions"
     conditions_dir.mkdir(parents=True, exist_ok=True)
 
@@ -104,7 +104,7 @@ def _write_renderer_fixture(
             color = 127 if mode == "L" else _color(position)
             Image.new(mode, size, color).save(render_path)
         record["render_path"] = (
-            f"material/olat/.rendering_stage/conditions/{record['condition_id']}.png"
+            f".rendering_stage/conditions/{record['condition_id']}.png"
         )
         record["render_sha256"] = (
             _sha256(render_path) if render_path.is_file() else "0" * 64
@@ -223,8 +223,7 @@ def _write_renderer_fixture(
             "mean_abs": 0.0,
             "passed": True,
             "render_path": (
-                "material/olat/.rendering_stage/validation/"
-                "recorded_validation_row_428.png"
+                ".rendering_stage/validation/recorded_validation_row_428.png"
             ),
             "render_sha256": validation_sha256,
             "tolerance": 0.0,
@@ -237,10 +236,11 @@ def _write_renderer_fixture(
     return rendered_conditions
 
 
-def test_compose_writes_only_native_gapless_12x3_sd_grid(tmp_path, monkeypatch):
+def test_compose_writes_only_native_gapless_3x12_sd_grid(tmp_path, monkeypatch):
     camera_dir = tmp_path / "dragondruit" / "cam07"
     _write_renderer_fixture(camera_dir)
     material_dir = camera_dir / "material" / "olat"
+    (material_dir / "rendering.png").write_bytes(b"obsolete OLAT pickup")
     (material_dir / "rendering.json").write_text("stale sidecar", encoding="utf-8")
 
     calls = []
@@ -256,10 +256,12 @@ def test_compose_writes_only_native_gapless_12x3_sd_grid(tmp_path, monkeypatch):
     rendering_path = compose_head_rendering(camera_dir)
     first_rendering = rendering_path.read_bytes()
 
-    assert rendering_path == material_dir / "rendering.png"
+    assert rendering_path == camera_dir / "rendering.png"
+    assert rendering_path.is_file()
+    assert not (material_dir / "rendering.png").exists()
     assert not (material_dir / "rendering.json").exists()
-    assert not (material_dir / ".rendering_stage").exists()
-    assert not (material_dir / ".rendering.png.pending").exists()
+    assert not (camera_dir / ".rendering_stage").exists()
+    assert not (camera_dir / ".rendering.png.pending").exists()
     assert [call[0] for call in calls] == [
         f"pred #{number}" for number in PREDICTION_LABEL_NUMBERS
     ]
@@ -303,9 +305,9 @@ def test_keep_heads_retains_only_private_stage_not_a_public_sidecar(tmp_path):
 
     compose_head_rendering(camera_dir, keep_heads=True)
 
-    assert (material_dir / "rendering.png").is_file()
+    assert (camera_dir / "rendering.png").is_file()
     assert not (material_dir / "rendering.json").exists()
-    assert (material_dir / ".rendering_stage" / "render_manifest.json").is_file()
+    assert (camera_dir / ".rendering_stage" / "render_manifest.json").is_file()
 
 
 def test_compose_rejects_partial_renderer_output(tmp_path):
@@ -316,9 +318,8 @@ def test_compose_rejects_partial_renderer_output(tmp_path):
         compose_head_rendering(camera_dir)
 
     assert "position 8" in str(error.value)
-    material_dir = camera_dir / "material" / "olat"
-    assert not (material_dir / "rendering.png").exists()
-    assert (material_dir / ".rendering_stage").is_dir()
+    assert not (camera_dir / "rendering.png").exists()
+    assert (camera_dir / ".rendering_stage").is_dir()
 
 
 @pytest.mark.parametrize(
@@ -338,9 +339,8 @@ def test_compose_rejects_unverifiable_renderer_provenance(
     with pytest.raises(ValueError, match=message):
         compose_head_rendering(camera_dir)
 
-    material_dir = camera_dir / "material" / "olat"
-    assert not (material_dir / "rendering.png").exists()
-    assert (material_dir / ".rendering_stage").is_dir()
+    assert not (camera_dir / "rendering.png").exists()
+    assert (camera_dir / ".rendering_stage").is_dir()
 
 
 @pytest.mark.parametrize(
@@ -359,9 +359,8 @@ def test_compose_rejects_nonuniform_or_non_rgb_native_tiles(
     with pytest.raises(ValueError, match=message):
         compose_head_rendering(camera_dir)
 
-    material_dir = camera_dir / "material" / "olat"
-    assert not (material_dir / "rendering.png").exists()
-    assert (material_dir / ".rendering_stage").is_dir()
+    assert not (camera_dir / "rendering.png").exists()
+    assert (camera_dir / ".rendering_stage").is_dir()
 
 
 def test_failed_pending_validation_preserves_previous_pickup_and_stage(
@@ -370,10 +369,12 @@ def test_failed_pending_validation_preserves_previous_pickup_and_stage(
     camera_dir = tmp_path / "dragondruit" / "cam07"
     _write_renderer_fixture(camera_dir)
     material_dir = camera_dir / "material" / "olat"
-    old_rendering = b"previous validated rendering"
-    old_sidecar = b"previous sidecar"
-    (material_dir / "rendering.png").write_bytes(old_rendering)
-    (material_dir / "rendering.json").write_bytes(old_sidecar)
+    old_rendering = b"previous validated camera-level rendering"
+    old_legacy_rendering = b"obsolete OLAT rendering"
+    old_legacy_sidecar = b"obsolete OLAT sidecar"
+    (camera_dir / "rendering.png").write_bytes(old_rendering)
+    (material_dir / "rendering.png").write_bytes(old_legacy_rendering)
+    (material_dir / "rendering.json").write_bytes(old_legacy_sidecar)
 
     def reject_pending(*args, **kwargs):
         raise RuntimeError("synthetic final validation failure")
@@ -383,7 +384,8 @@ def test_failed_pending_validation_preserves_previous_pickup_and_stage(
     with pytest.raises(RuntimeError, match="synthetic final validation failure"):
         compose_head_rendering(camera_dir)
 
-    assert (material_dir / "rendering.png").read_bytes() == old_rendering
-    assert (material_dir / "rendering.json").read_bytes() == old_sidecar
-    assert (material_dir / ".rendering_stage").is_dir()
-    assert not (material_dir / ".rendering.png.pending").exists()
+    assert (camera_dir / "rendering.png").read_bytes() == old_rendering
+    assert (material_dir / "rendering.png").read_bytes() == old_legacy_rendering
+    assert (material_dir / "rendering.json").read_bytes() == old_legacy_sidecar
+    assert (camera_dir / ".rendering_stage").is_dir()
+    assert not (camera_dir / ".rendering.png.pending").exists()

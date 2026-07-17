@@ -282,7 +282,7 @@ def test_cli_lighting_source_is_mutually_exclusive():
         "--imaginaire-root",
         "/imaginaire",
         "--output-dir",
-        "/camera/material/olat/.rendering_stage",
+        "/camera/.rendering_stage",
     ]
 
     preset = parser.parse_args([*common, "--lighting-preset", "sd-olat-heads"])

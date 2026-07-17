@@ -823,7 +823,7 @@ def render_saved_material(
 
     camera_dir = Path(camera_dir).expanduser().resolve()
     output_dir = Path(output_dir).expanduser().resolve()
-    expected_output_dir = camera_dir / "material" / "olat" / ".rendering_stage"
+    expected_output_dir = camera_dir / ".rendering_stage"
     if output_dir != expected_output_dir:
         raise ValueError(
             "saved OLAT head renders must use the private staging directory "

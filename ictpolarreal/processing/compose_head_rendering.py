@@ -1,9 +1,12 @@
-"""Compose the native-resolution SD-OLAT predicted-head grid.
+"""Compose the native-resolution SD-OLAT prediction-only head grid.
 
 The saved-material renderer writes 36 condition PNGs and a replay manifest to
-the private ``material/olat/.rendering_stage`` directory.  This CPU-only step
-validates that source contract, overlays the canonical small ``pred #N`` label,
-and writes one public artifact: ``material/olat/rendering.png``.
+the camera-private ``.rendering_stage`` directory.  This CPU-only step validates
+that source contract, overlays the canonical small ``pred #N`` label, and writes
+one camera-level public artifact: ``rendering.png``.  The 3-column by 12-row
+layout is the faithful prediction-only extraction of the SD source composite:
+each original row contains three lighting conditions, with each prediction
+beside its GT and ball references.
 """
 
 from __future__ import annotations
@@ -19,8 +22,8 @@ from typing import Any, Sequence
 EXPECTED_HEAD_COUNT = 36
 EXPECTED_SD_SOURCE_RANKS: tuple[int, ...] = tuple(range(1, 33))
 PREDICTION_LABEL_NUMBERS: tuple[int, ...] = tuple(range(1, 142, 4))
-SHEET_COLUMNS = 12
-SHEET_ROWS = 3
+SHEET_COLUMNS = 3
+SHEET_ROWS = 12
 
 
 def _sha256(path: Path) -> str:
@@ -452,13 +455,12 @@ def compose_head_rendering(
     render_dir: str | Path | None = None,
     keep_heads: bool = False,
 ) -> Path:
-    """Write the singular native-resolution ``material/olat/rendering.png``."""
+    """Write the singular native-resolution camera-level ``rendering.png``."""
 
     from PIL import Image
 
     camera_dir = Path(camera_dir)
-    material_dir = camera_dir / "material" / "olat"
-    default_render_dir = material_dir / ".rendering_stage"
+    default_render_dir = camera_dir / ".rendering_stage"
     render_dir = Path(render_dir) if render_dir is not None else default_render_dir
     renderer_manifest_path = render_dir / "render_manifest.json"
     selected, manifest_sha256 = _read_renderer_manifest(
@@ -468,11 +470,11 @@ def compose_head_rendering(
     )
     sheet, labeled_tiles, tile_size = _compose_native_grid(selected)
 
-    material_dir.mkdir(parents=True, exist_ok=True)
-    rendering_path = material_dir / "rendering.png"
-    pending_path = material_dir / ".rendering.png.pending"
+    camera_dir.mkdir(parents=True, exist_ok=True)
+    rendering_path = camera_dir / "rendering.png"
+    pending_path = camera_dir / ".rendering.png.pending"
     try:
-        Image.fromarray(sheet, mode="RGB").save(
+        Image.fromarray(sheet).save(
             pending_path, format="PNG", compress_level=6
         )
         pending_sha256 = _validate_rendering(
@@ -492,14 +494,21 @@ def compose_head_rendering(
     finally:
         pending_path.unlink(missing_ok=True)
 
-    # The compact pickup deliberately has no sidecar report.  Remove the old
-    # compositor's sidecar only after the replacement PNG has validated.
-    for stale_sidecar in (
-        material_dir / "rendering.json",
-        material_dir / ".rendering.json.pending",
-        material_dir / ".rendering.json.tmp",
+    # The compact pickup deliberately has no sidecar report.  Remove sidecars
+    # and the obsolete material/olat pickup only after the new camera-level PNG
+    # has been atomically installed and validated.
+    legacy_material_dir = camera_dir / "material" / "olat"
+    for stale_artifact in (
+        camera_dir / "rendering.json",
+        camera_dir / ".rendering.json.pending",
+        camera_dir / ".rendering.json.tmp",
+        legacy_material_dir / "rendering.png",
+        legacy_material_dir / "rendering.json",
+        legacy_material_dir / ".rendering.png.pending",
+        legacy_material_dir / ".rendering.json.pending",
+        legacy_material_dir / ".rendering.json.tmp",
     ):
-        stale_sidecar.unlink(missing_ok=True)
+        stale_artifact.unlink(missing_ok=True)
 
     if not keep_heads and render_dir.resolve() == default_render_dir.resolve():
         shutil.rmtree(render_dir)
@@ -510,7 +519,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Compose the source-exact 36-condition SD-OLAT heads as one gapless "
-            "12x3 native-resolution rendering.png."
+            "3x12 native-resolution camera-level rendering.png."
         )
     )
     parser.add_argument(
@@ -524,7 +533,7 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         help=(
             "private renderer staging directory (default: "
-            "<camera-dir>/material/olat/.rendering_stage)"
+            "<camera-dir>/.rendering_stage)"
         ),
     )
     parser.add_argument(
