@@ -1,17 +1,9 @@
-"""Compose the SD-OLAT-style, predicted-render-only contact sheet.
+"""Compose the native-resolution SD-OLAT predicted-head grid.
 
-The renderer writes one PNG per lighting condition into a private staging
-directory under ``material/olat``.  Its ordered manifest is the sole authority
-for the 36 displayed lights, including source-exact SuperDimension presets
-whose HDRIs do not appear in the ICT fit-condition manifest.  This module keeps
-the presentation step CPU-only and writes one deterministic public
-``material/olat/rendering.png`` plus ``material/olat/rendering.json``.  Staged
-condition tiles are removed after successful composition by default.
-
-Example::
-
-    python -m ictpolarreal.processing.compose_head_rendering \
-        --camera-dir outputs/.../dragondruit/cam07
+The saved-material renderer writes 36 condition PNGs and a replay manifest to
+the private ``material/olat/.rendering_stage`` directory.  This CPU-only step
+validates that source contract, overlays the canonical small ``pred #N`` label,
+and writes one public artifact: ``material/olat/rendering.png``.
 """
 
 from __future__ import annotations
@@ -19,7 +11,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import shutil
 from pathlib import Path
 from typing import Any, Sequence
@@ -27,13 +18,9 @@ from typing import Any, Sequence
 
 EXPECTED_HEAD_COUNT = 36
 EXPECTED_SD_SOURCE_RANKS: tuple[int, ...] = tuple(range(1, 33))
-
-SHEET_COLUMNS = 6
-TILE_WIDTH = 400
-IMAGE_HEIGHT = 726
-LABEL_HEIGHT = 104
-GAP = 12
-PADDING = 16
+PREDICTION_LABEL_NUMBERS: tuple[int, ...] = tuple(range(1, 142, 4))
+SHEET_COLUMNS = 12
+SHEET_ROWS = 3
 
 
 def _sha256(path: Path) -> str:
@@ -42,149 +29,6 @@ def _sha256(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
-
-
-def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    temporary.replace(path)
-
-
-def _load_font(size: int, *, bold: bool):
-    from PIL import ImageFont
-
-    candidates = (
-        (
-            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-            "LiberationSans-Bold.ttf",
-            "DejaVuSans-Bold.ttf",
-        )
-        if bold
-        else (
-            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "LiberationSans-Regular.ttf",
-            "DejaVuSans.ttf",
-        )
-    )
-    for candidate in candidates:
-        try:
-            return ImageFont.truetype(candidate, size=size), Path(candidate).name
-        except OSError:
-            pass
-    try:
-        return ImageFont.load_default(size=size), "Pillow-default-scalable"
-    except TypeError as exc:
-        raise RuntimeError(
-            "a scalable TrueType font is required for readable rendering labels; "
-            "install Liberation Sans or DejaVu Sans"
-        ) from exc
-
-
-def _display_source(condition: dict[str, Any]) -> str:
-    source = str(condition.get("source") or condition["condition_id"])
-    name = Path(source).name
-    lowered = name.lower()
-    if lowered in {"calibration_w", "calibration_white"}:
-        return "Calibration white"
-    if lowered in {"calibration_r", "calibration_red"}:
-        return "Calibration red"
-    if lowered in {"calibration_g", "calibration_green"}:
-        return "Calibration green"
-    if lowered in {"calibration_b", "calibration_blue"}:
-        return "Calibration blue"
-
-    for suffix in (".exr", ".hdr", ".png", ".jpg", ".jpeg"):
-        if name.lower().endswith(suffix):
-            name = name[: -len(suffix)]
-            break
-    hdrmaps_source = False
-    for prefix in (
-        "hdriheaven_original_",
-        "hdriheaven_flipped_",
-        "hdrihaven_original_",
-        "hdrihaven_flipped_",
-        "hdrmaps_original_",
-        "hdrmaps_flipped_",
-    ):
-        if name.lower().startswith(prefix):
-            name = name[len(prefix) :]
-            hdrmaps_source = prefix.startswith("hdrmaps_")
-            break
-    for suffix in ("_hdrmaps_com_free_1k", "_2k_1k", "_4k_2k", "_1k"):
-        if name.lower().endswith(suffix):
-            name = name[: -len(suffix)]
-            break
-    display = " ".join(name.replace("-", " ").replace("_", " ").split()).title()
-    return f"HDRMaps {display}" if hdrmaps_source else display
-
-
-def _display_detail(condition: dict[str, Any]) -> str:
-    source = str(condition.get("source") or "").lower()
-    rotation = int(condition.get("rotation_degrees", 0))
-    source_rank = condition.get("source_rank")
-    absolute_index = condition.get("absolute_index")
-    if source.startswith(("hdriheaven_flipped_", "hdrihaven_flipped_", "hdrmaps_flipped_")):
-        variant = "flipped"
-    elif source.startswith(("hdriheaven_original_", "hdrihaven_original_", "hdrmaps_original_")):
-        variant = "original"
-    else:
-        variant = None
-
-    if source_rank is not None:
-        parts = [f"SD rank {source_rank:02d}"]
-        if variant is not None:
-            parts.append(variant)
-        parts.append(f"rot{rotation:02d}")
-        return "  ·  ".join(parts)
-    if absolute_index is not None:
-        return f"recorded row {absolute_index:03d}  ·  rot{rotation:02d}"
-    return f"SD calibration  ·  rot{rotation:02d}"
-
-
-def _ellipsize(draw, text: str, font, max_width: int) -> str:
-    if draw.textlength(text, font=font) <= max_width:
-        return text
-    ellipsis = "…"
-    if draw.textlength(ellipsis, font=font) > max_width:
-        return ""
-    low, high = 0, len(text)
-    while low < high:
-        middle = (low + high + 1) // 2
-        candidate = text[:middle].rstrip() + ellipsis
-        if draw.textlength(candidate, font=font) <= max_width:
-            low = middle
-        else:
-            high = middle - 1
-    return text[:low].rstrip() + ellipsis
-
-
-def _fit_render(path: Path):
-    from PIL import Image, ImageOps
-
-    with Image.open(path) as source_file:
-        source = ImageOps.exif_transpose(source_file).convert("RGB")
-        scale = min(TILE_WIDTH / source.width, IMAGE_HEIGHT / source.height)
-        size = (
-            max(1, round(source.width * scale)),
-            max(1, round(source.height * scale)),
-        )
-        resized = source.resize(size, Image.Resampling.LANCZOS)
-    canvas = Image.new("RGB", (TILE_WIDTH, IMAGE_HEIGHT), (8, 8, 10))
-    canvas.paste(
-        resized,
-        ((TILE_WIDTH - resized.width) // 2, (IMAGE_HEIGHT - resized.height) // 2),
-    )
-    return canvas
-
-
-def _relative_path(path: Path, root: Path) -> str:
-    return Path(os.path.relpath(path, start=root)).as_posix()
 
 
 def _require_sha256(value: Any, label: str) -> str:
@@ -210,6 +54,20 @@ def _require_passing_hash_checks(value: Any, label: str) -> None:
             raise ValueError(f"renderer input hash check failed: {label}")
 
 
+def _camera_relative_path(camera_dir: Path, value: Any, label: str) -> Path:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{label} must be a non-empty path")
+    path = Path(value)
+    if not path.is_absolute():
+        path = camera_dir / path
+    path = path.resolve()
+    try:
+        path.relative_to(camera_dir.resolve())
+    except ValueError as exc:
+        raise ValueError(f"{label} must stay under the camera result: {path}") from exc
+    return path
+
+
 def _validate_sd_olat_preset(
     provenance: Any,
     conditions: list[dict[str, Any]],
@@ -222,6 +80,14 @@ def _validate_sd_olat_preset(
         raise ValueError("sd-olat-heads provenance must record four calibrations")
     if provenance.get("environment_count") != 32:
         raise ValueError("sd-olat-heads provenance must record 32 environments")
+    candidate_count = provenance.get("candidate_count")
+    if (
+        isinstance(candidate_count, bool)
+        or not isinstance(candidate_count, int)
+        or candidate_count < 32
+    ):
+        raise ValueError("sd-olat-heads provenance has an invalid candidate count")
+
     if [record.get("preset_index") for record in conditions] != list(
         range(EXPECTED_HEAD_COUNT)
     ):
@@ -237,6 +103,34 @@ def _validate_sd_olat_preset(
         raise ValueError("generated sd-olat-heads conditions cannot claim ICT row indices")
     if any(record.get("rotation_degrees") != 90 for record in conditions):
         raise ValueError("sd-olat-heads conditions must use the recovered rot090 view")
+    if any(
+        record.get("source_kind") != "generated_calibration"
+        for record in conditions[:4]
+    ):
+        raise ValueError("sd-olat-heads must begin with four generated calibrations")
+    if any(
+        record.get("source_kind") != "environment_map" for record in conditions[4:]
+    ):
+        raise ValueError("sd-olat-heads ranks must be environment-map conditions")
+    ranks = [record.get("source_rank") for record in conditions]
+    if ranks[:4] != [None] * 4 or ranks[4:] != list(EXPECTED_SD_SOURCE_RANKS):
+        raise ValueError(
+            "sd-olat-heads must order four calibrations followed by source ranks 1..32"
+        )
+
+    orientation = provenance.get("orientation")
+    if not isinstance(orientation, dict):
+        raise ValueError("sd-olat-heads provenance is missing orientation")
+    if any(record.get("orientation") != orientation for record in conditions):
+        raise ValueError("sd-olat-heads condition orientation differs from provenance")
+    projection = provenance.get("projection")
+    if not isinstance(projection, dict):
+        raise ValueError("sd-olat-heads provenance is missing projection")
+    support_count = projection.get("support_count")
+    if support_count != 164 or any(
+        record.get("support_count") != support_count for record in conditions
+    ):
+        raise ValueError("sd-olat-heads must use the recorded 164-light fit support")
 
     ranking = provenance.get("ranking")
     if not isinstance(ranking, dict) or ranking.get("camera") != "C04":
@@ -247,21 +141,99 @@ def _validate_sd_olat_preset(
     if [record.get("source") for record in conditions[4:]] != expected_sources:
         raise ValueError("sd-olat-heads condition order differs from its top-32 guard")
     _require_sha256(ranking.get("lights_sha256"), "preset ranking lights_sha256")
+    _require_sha256(
+        ranking.get("xyz_table_runtime_sha256"),
+        "preset ranking xyz_table_runtime_sha256",
+    )
+    _require_sha256(
+        ranking.get("xyz_table_trainer_cpu_audit_sha256"),
+        "preset ranking xyz_table_trainer_cpu_audit_sha256",
+    )
+    if ranking.get("recorded_direction_count") != 155:
+        raise ValueError("sd-olat-heads C04 provenance must contain 155 directions")
     for source_key in ("trainer_source", "sampler_source"):
         source = provenance.get(source_key)
         if not isinstance(source, dict):
             raise ValueError(f"sd-olat-heads provenance is missing {source_key}")
         _require_sha256(source.get("sha256"), f"preset {source_key}.sha256")
-    if not isinstance(provenance.get("orientation"), dict):
-        raise ValueError("sd-olat-heads provenance is missing orientation")
-    if not isinstance(provenance.get("projection"), dict):
-        raise ValueError("sd-olat-heads provenance is missing projection")
+
+
+def _validate_replay_provenance(
+    payload: dict[str, Any],
+    *,
+    camera_dir: Path,
+    render_dir: Path,
+) -> None:
+    material = payload.get("material")
+    if not isinstance(material, dict):
+        raise ValueError("renderer manifest is missing material provenance")
+    material_sha256 = _require_sha256(
+        material.get("sha256"), "renderer material.sha256"
+    )
+    material_path = _camera_relative_path(
+        camera_dir, material.get("path"), "renderer material.path"
+    )
+    if not material_path.is_file() or _sha256(material_path) != material_sha256:
+        raise ValueError("renderer material provenance does not match the saved state")
+
+    renderer = payload.get("renderer")
+    if not isinstance(renderer, dict) or not renderer:
+        raise ValueError("renderer manifest is missing renderer provenance")
+    if renderer.get("model") != "DisneyBRDFSimplifiedMultiLayer":
+        raise ValueError("renderer manifest has the wrong Disney model")
+    if renderer.get("device") != "cuda" or not renderer.get("slurm_job_id"):
+        raise ValueError("renderer provenance must identify its CUDA Slurm replay")
+    if renderer.get("exact_original_summation_order") is not True:
+        raise ValueError("renderer replay did not preserve the original summation order")
+
+    _require_passing_hash_checks(
+        payload.get("input_hash_checks"), "input_hash_checks"
+    )
+    validation = payload.get("validation")
+    if not isinstance(validation, dict) or validation.get("passed") is not True:
+        raise ValueError("renderer manifest does not contain a passing validation record")
+    if (
+        validation.get("byte_identical") is not True
+        or validation.get("different_channel_values") != 0
+        or validation.get("max_abs") != 0.0
+        or validation.get("mean_abs") != 0.0
+        or validation.get("tolerance") != 0.0
+    ):
+        raise ValueError("renderer replay validation is not decoded-pixel exact")
+    render_sha256 = _require_sha256(
+        validation.get("render_sha256"), "renderer validation.render_sha256"
+    )
+    canonical_sha256 = _require_sha256(
+        validation.get("canonical_sha256"), "renderer validation.canonical_sha256"
+    )
+    if render_sha256 != canonical_sha256:
+        raise ValueError("renderer validation hashes do not match")
+
+    canonical_path = _camera_relative_path(
+        camera_dir,
+        validation.get("canonical_path"),
+        "renderer validation.canonical_path",
+    )
+    if not canonical_path.is_file() or _sha256(canonical_path) != canonical_sha256:
+        raise ValueError("renderer canonical validation image does not match provenance")
+    validation_path_value = validation.get("render_path")
+    if not isinstance(validation_path_value, str):
+        raise ValueError("renderer validation is missing render_path")
+    validation_name = Path(validation_path_value).name
+    if Path(validation_path_value).parent.name != "validation":
+        raise ValueError("renderer validation render_path has the wrong directory")
+    validation_path = render_dir / "validation" / validation_name
+    if not validation_path.is_file() or _sha256(validation_path) != render_sha256:
+        raise ValueError("staged replay validation image does not match provenance")
 
 
 def _read_renderer_manifest(
     path: Path,
+    *,
     render_dir: Path,
-) -> tuple[dict[str, Any], list[tuple[dict[str, Any], Path]]]:
+    camera_dir: Path,
+) -> tuple[list[tuple[dict[str, Any], Path]], str]:
+    manifest_sha256 = _sha256(path) if path.is_file() else None
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
@@ -275,51 +247,33 @@ def _read_renderer_manifest(
         )
     if payload.get("profile") != "olat":
         raise ValueError(f"renderer manifest must use the acquired OLAT profile: {path}")
+    if payload.get("lighting_preset") != "sd-olat-heads":
+        raise ValueError("renderer manifest must use the sd-olat-heads preset")
+    if payload.get("selected_absolute_indices") is not None:
+        raise ValueError("sd-olat-heads cannot use recorded absolute condition indices")
 
-    rendered_conditions = payload.get("conditions")
-    if not isinstance(rendered_conditions, list) or len(rendered_conditions) != (
-        EXPECTED_HEAD_COUNT
-    ):
+    conditions = payload.get("conditions")
+    if not isinstance(conditions, list) or len(conditions) != EXPECTED_HEAD_COUNT:
         raise ValueError(
             f"renderer manifest must describe exactly {EXPECTED_HEAD_COUNT} "
             "ordered conditions"
         )
-
-    lighting_preset = payload.get("lighting_preset", payload.get("preset"))
-    if (
-        "lighting_preset" in payload
-        and "preset" in payload
-        and payload["lighting_preset"] != payload["preset"]
-    ):
-        raise ValueError("renderer manifest has conflicting lighting preset names")
-    if lighting_preset is not None and (
-        not isinstance(lighting_preset, str) or not lighting_preset
-    ):
-        raise ValueError("renderer lighting preset must be a non-empty string")
-    preset_provenance = payload.get("preset_provenance")
-    if lighting_preset is not None and (
-        not isinstance(preset_provenance, dict) or not preset_provenance
-    ):
-        raise ValueError("renderer lighting preset is missing preset_provenance")
-
-    selected_absolute_indices = payload.get("selected_absolute_indices")
-    if selected_absolute_indices is not None and (
-        not isinstance(selected_absolute_indices, list)
-        or len(selected_absolute_indices) != EXPECTED_HEAD_COUNT
-    ):
-        raise ValueError(
-            "selected_absolute_indices must be null or align with all 36 conditions"
-        )
+    _validate_sd_olat_preset(payload.get("preset_provenance"), conditions)
+    _validate_replay_provenance(
+        payload,
+        camera_dir=camera_dir,
+        render_dir=render_dir,
+    )
 
     selected: list[tuple[dict[str, Any], Path]] = []
     identifiers: set[str] = set()
     missing: list[str] = []
-    for position, rendered in enumerate(rendered_conditions):
-        if not isinstance(rendered, dict):
+    for position, record in enumerate(conditions):
+        if not isinstance(record, dict):
             raise ValueError(
                 f"renderer condition at ordered position {position} is not an object"
             )
-        condition_id = rendered.get("condition_id")
+        condition_id = record.get("condition_id")
         if not isinstance(condition_id, str) or not condition_id:
             raise ValueError(
                 f"renderer condition at ordered position {position} has no condition_id"
@@ -331,42 +285,18 @@ def _read_renderer_manifest(
         if condition_id in identifiers:
             raise ValueError(f"renderer condition_id is duplicated: {condition_id}")
         identifiers.add(condition_id)
-        if not isinstance(rendered.get("source"), str) or not rendered["source"]:
+        if not isinstance(record.get("source"), str) or not record["source"]:
             raise ValueError(f"renderer condition {condition_id} has no lighting source")
         _require_sha256(
-            rendered.get("source_sha256"), f"condition {condition_id} source_sha256"
+            record.get("source_sha256"), f"condition {condition_id} source_sha256"
         )
-        if not isinstance(rendered.get("source_kind"), str):
-            raise ValueError(f"renderer condition {condition_id} has no source_kind")
-        rotation = rendered.get("rotation_degrees")
-        if isinstance(rotation, bool) or not isinstance(rotation, (int, float)):
-            raise ValueError(f"renderer condition {condition_id} has invalid rotation")
-        support_count = rendered.get("support_count")
-        if (
-            isinstance(support_count, bool)
-            or not isinstance(support_count, int)
-            or support_count <= 0
-        ):
-            raise ValueError(
-                f"renderer condition {condition_id} has invalid support_count"
-            )
-        source_rank = rendered.get("source_rank")
-        if source_rank is not None and (
-            isinstance(source_rank, bool)
-            or not isinstance(source_rank, int)
-            or source_rank < 0
-        ):
-            raise ValueError(f"renderer condition {condition_id} has invalid source_rank")
-        if lighting_preset is not None:
-            _require_sha256(
-                rendered.get("weight_sha256"),
-                f"condition {condition_id} weight_sha256",
-            )
+        _require_sha256(
+            record.get("weight_sha256"), f"condition {condition_id} weight_sha256"
+        )
         expected_render_sha256 = _require_sha256(
-            rendered.get("render_sha256"),
-            f"condition {condition_id} render_sha256",
+            record.get("render_sha256"), f"condition {condition_id} render_sha256"
         )
-        recorded_render_path = rendered.get("render_path")
+        recorded_render_path = record.get("render_path")
         if not isinstance(recorded_render_path, str) or (
             Path(recorded_render_path).name != f"{condition_id}.png"
             or Path(recorded_render_path).parent.name != "conditions"
@@ -381,300 +311,206 @@ def _read_renderer_manifest(
             raise ValueError(
                 f"renderer hash does not match condition PNG for {condition_id}"
             )
-        if selected_absolute_indices is not None:
-            absolute_index = selected_absolute_indices[position]
-            if isinstance(absolute_index, bool) or not isinstance(absolute_index, int):
-                raise ValueError("selected_absolute_indices must contain integers")
-            if rendered.get("absolute_index") != absolute_index:
-                raise ValueError(
-                    f"absolute index diverges at ordered position {position}"
-                )
-        selected.append((rendered, render_path))
+        selected.append((record, render_path))
     if missing:
         detail = "\n  ".join(missing)
         raise FileNotFoundError(
-            "missing predicted condition render(s); the contact sheet is all-or-nothing:\n  "
+            "missing predicted condition render(s); the grid is all-or-nothing:\n  "
             + detail
         )
-
-    if lighting_preset == "sd-olat-heads":
-        ranks = [record.get("source_rank") for record in rendered_conditions]
-        if ranks[:4] != [None] * 4 or ranks[4:] != list(EXPECTED_SD_SOURCE_RANKS):
-            raise ValueError(
-                "sd-olat-heads must order four calibrations followed by source ranks 1..32"
-            )
-        if any(
-            record.get("source_kind") != "generated_calibration"
-            for record in rendered_conditions[:4]
-        ):
-            raise ValueError("sd-olat-heads must begin with four generated calibrations")
-        _validate_sd_olat_preset(preset_provenance, rendered_conditions)
-
-    validation = payload.get("validation")
-    if not isinstance(validation, dict) or validation.get("passed") is not True:
-        raise ValueError("renderer manifest does not contain a passing validation record")
-    for required in ("max_abs", "mean_abs", "render_sha256", "canonical_sha256"):
-        if required not in validation:
-            raise ValueError(f"renderer validation is missing {required!r}")
-
-    material = payload.get("material")
-    if not isinstance(material, dict):
-        raise ValueError("renderer manifest is missing material provenance")
-    _require_sha256(material.get("sha256"), "renderer material.sha256")
-    renderer = payload.get("renderer")
-    if not isinstance(renderer, dict) or not renderer:
-        raise ValueError("renderer manifest is missing renderer provenance")
-    input_hash_checks = payload.get("input_hash_checks")
-    _require_passing_hash_checks(input_hash_checks, "input_hash_checks")
-
-    # Copy durable provenance and validation statistics, not paths into the
-    # private stage that will be deleted after final-output validation.
-    durable_validation = {
-        key: value for key, value in validation.items() if key != "render_path"
-    }
-    provenance = {
-        "input_hash_checks": input_hash_checks,
-        "lighting_preset": lighting_preset,
-        "manifest_sha256": _sha256(path),
-        "material": material,
-        "preset_provenance": preset_provenance,
-        "profile": payload.get("profile"),
-        "renderer": renderer,
-        "selected_absolute_indices": selected_absolute_indices,
-        "source_schema": payload.get("schema"),
-        "validation": durable_validation,
-    }
-    return provenance, selected
+    assert manifest_sha256 is not None
+    return selected, manifest_sha256
 
 
-def _validate_final_outputs(
-    rendering_path: Path,
-    manifest_path: Path,
-    *,
-    expected_size: tuple[int, int],
-    expected_condition_ids: list[str],
-) -> None:
+def _read_native_rgb_png(path: Path):
+    import numpy as np
     from PIL import Image
 
-    with Image.open(rendering_path) as image:
+    with Image.open(path) as image:
         image.load()
-        if image.mode != "RGB" or image.size != expected_size:
-            raise RuntimeError(
-                f"invalid final rendering image: mode={image.mode}, size={image.size}"
+        if image.format != "PNG":
+            raise ValueError(f"condition render must be a PNG: {path}")
+        if image.mode != "RGB":
+            raise ValueError(
+                f"condition render must already be RGB, got {image.mode}: {path}"
             )
-    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if payload.get("schema") != "ictpolarreal.sd-olat-head-rendering.v1":
-        raise RuntimeError("invalid final rendering manifest schema")
-    if payload.get("rendering_sha256") != _sha256(rendering_path):
-        raise RuntimeError("final rendering hash does not match rendering.json")
-    conditions = payload.get("conditions", [])
-    if [record.get("condition_id") for record in conditions] != expected_condition_ids:
-        raise RuntimeError("final rendering manifest changed the authoritative order")
-    selection = payload.get("selection", {})
-    if selection.get("count") != EXPECTED_HEAD_COUNT:
-        raise RuntimeError("final rendering manifest has the wrong condition count")
-    if ".rendering_stage" in manifest_path.read_text(encoding="utf-8"):
-        raise RuntimeError("final rendering manifest contains a private staging path")
+        array = np.asarray(image, dtype=np.uint8).copy()
+    if array.ndim != 3 or array.shape[2] != 3:
+        raise ValueError(f"condition render has invalid RGB shape {array.shape}: {path}")
+    return array
+
+
+def _overlay_prediction_label(tile, number: int):
+    import cv2
+    import numpy as np
+
+    if tile.dtype != np.uint8 or tile.ndim != 3 or tile.shape[2] != 3:
+        raise ValueError("prediction label input must be an HxWx3 uint8 RGB image")
+    height, width = tile.shape[:2]
+    font_size = max(10, int(height * 0.07))
+    font_scale = font_size / 30.0
+    thickness = max(1, font_size // 15)
+    text = f"pred #{number}"
+    (text_width, _), _ = cv2.getTextSize(
+        text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness
+    )
+    if text_width > width - 8:
+        raise ValueError(
+            f"canonical prediction label {text!r} does not fit native tile width {width}"
+        )
+    labeled = np.ascontiguousarray(tile.copy())
+    cv2.putText(
+        labeled,
+        text,
+        (4, height - 4),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        font_scale,
+        (255, 255, 0),
+        thickness,
+        cv2.LINE_AA,
+    )
+    return labeled
+
+
+def _compose_native_grid(selected: list[tuple[dict[str, Any], Path]]):
+    import numpy as np
+
+    if len(selected) != EXPECTED_HEAD_COUNT:
+        raise ValueError(f"native grid requires exactly {EXPECTED_HEAD_COUNT} tiles")
+    if len(PREDICTION_LABEL_NUMBERS) != EXPECTED_HEAD_COUNT:
+        raise RuntimeError("canonical prediction label sequence has the wrong length")
+
+    expected_shape: tuple[int, int, int] | None = None
+    labeled_tiles = []
+    for position, ((_, render_path), label_number) in enumerate(
+        zip(selected, PREDICTION_LABEL_NUMBERS)
+    ):
+        tile = _read_native_rgb_png(render_path)
+        if expected_shape is None:
+            expected_shape = tile.shape
+        elif tile.shape != expected_shape:
+            raise ValueError(
+                "all condition renders must have identical native RGB dimensions; "
+                f"position {position + 1} has {tile.shape}, expected {expected_shape}"
+            )
+        labeled_tiles.append(_overlay_prediction_label(tile, label_number))
+
+    assert expected_shape is not None
+    height, width, _ = expected_shape
+    sheet = np.empty(
+        (SHEET_ROWS * height, SHEET_COLUMNS * width, 3), dtype=np.uint8
+    )
+    for position, tile in enumerate(labeled_tiles):
+        row, column = divmod(position, SHEET_COLUMNS)
+        sheet[
+            row * height : (row + 1) * height,
+            column * width : (column + 1) * width,
+        ] = tile
+    return sheet, labeled_tiles, (width, height)
+
+
+def _validate_rendering(
+    path: Path,
+    *,
+    expected_tiles: list[Any],
+    tile_size: tuple[int, int],
+    expected_sha256: str | None = None,
+) -> str:
+    import numpy as np
+    from PIL import Image
+
+    tile_width, tile_height = tile_size
+    expected_size = (SHEET_COLUMNS * tile_width, SHEET_ROWS * tile_height)
+    with Image.open(path) as image:
+        image.load()
+        if image.format != "PNG" or image.mode != "RGB" or image.size != expected_size:
+            raise RuntimeError(
+                "invalid rendering.png contract: "
+                f"format={image.format}, mode={image.mode}, size={image.size}, "
+                f"expected PNG/RGB/{expected_size}"
+            )
+        rendering = np.asarray(image, dtype=np.uint8)
+    for position, expected in enumerate(expected_tiles):
+        row, column = divmod(position, SHEET_COLUMNS)
+        actual = rendering[
+            row * tile_height : (row + 1) * tile_height,
+            column * tile_width : (column + 1) * tile_width,
+        ]
+        if not np.array_equal(actual, expected):
+            raise RuntimeError(
+                f"rendering.png tile order/content diverges at position {position + 1}"
+            )
+    digest = _sha256(path)
+    if expected_sha256 is not None and digest != expected_sha256:
+        raise RuntimeError("atomic rendering.png hash changed during replacement")
+    return digest
 
 
 def compose_head_rendering(
     camera_dir: str | Path,
     *,
     render_dir: str | Path | None = None,
-    output_dir: str | Path | None = None,
     keep_heads: bool = False,
-) -> tuple[Path, Path]:
-    """Write the singular ``rendering.png`` and its ``rendering.json`` record.
+) -> Path:
+    """Write the singular native-resolution ``material/olat/rendering.png``."""
 
-    ``render_dir/render_manifest.json`` defines the authoritative condition
-    order.  Only its predicted object renders are shown; no material maps,
-    references, error maps, or light-probe tiles are added to the sheet.
-    """
-
-    from PIL import Image, ImageDraw
+    from PIL import Image
 
     camera_dir = Path(camera_dir)
     material_dir = camera_dir / "material" / "olat"
-    render_dir = (
-        Path(render_dir)
-        if render_dir is not None
-        else material_dir / ".rendering_stage"
-    )
-    output_dir = Path(output_dir) if output_dir is not None else material_dir
-    conditions_path = camera_dir / "evaluation" / "assets" / "conditions.json"
-    if not keep_heads:
-        try:
-            output_dir.resolve().relative_to(render_dir.resolve())
-        except ValueError:
-            pass
-        else:
-            raise ValueError(
-                "output_dir cannot be inside the private render_dir when staged "
-                "condition tiles will be deleted"
-            )
+    default_render_dir = material_dir / ".rendering_stage"
+    render_dir = Path(render_dir) if render_dir is not None else default_render_dir
     renderer_manifest_path = render_dir / "render_manifest.json"
-    render_provenance, selected = _read_renderer_manifest(
-        renderer_manifest_path, render_dir
+    selected, manifest_sha256 = _read_renderer_manifest(
+        renderer_manifest_path,
+        render_dir=render_dir,
+        camera_dir=camera_dir,
     )
+    sheet, labeled_tiles, tile_size = _compose_native_grid(selected)
 
-    regular_font, regular_font_name = _load_font(22, bold=False)
-    label_font, label_font_name = _load_font(25, bold=True)
-    ordinal_font, ordinal_font_name = _load_font(30, bold=True)
-
-    rows = (len(selected) + SHEET_COLUMNS - 1) // SHEET_COLUMNS
-    tile_height = LABEL_HEIGHT + IMAGE_HEIGHT
-    sheet_width = 2 * PADDING + SHEET_COLUMNS * TILE_WIDTH + (SHEET_COLUMNS - 1) * GAP
-    sheet_height = 2 * PADDING + rows * tile_height + (rows - 1) * GAP
-    sheet = Image.new("RGB", (sheet_width, sheet_height), (5, 5, 7))
-
-    manifest_conditions: list[dict[str, Any]] = []
-    for ordinal, (condition, render_path) in enumerate(selected, start=1):
-        tile = Image.new("RGB", (TILE_WIDTH, tile_height), (17, 18, 22))
-        draw = ImageDraw.Draw(tile)
-        draw.text((14, 11), f"{ordinal:02d}", font=ordinal_font, fill=(255, 255, 255))
-        source_label = _ellipsize(
-            draw,
-            _display_source(condition),
-            label_font,
-            TILE_WIDTH - 80,
-        )
-        draw.text((72, 14), source_label, font=label_font, fill=(244, 244, 246))
-        rotation = int(condition.get("rotation_degrees", 0))
-        detail = _ellipsize(
-            draw,
-            _display_detail(condition),
-            regular_font,
-            TILE_WIDTH - 28,
-        )
-        draw.text((14, 61), detail, font=regular_font, fill=(185, 188, 196))
-        draw.line((0, LABEL_HEIGHT - 1, TILE_WIDTH, LABEL_HEIGHT - 1), fill=(55, 57, 64))
-        tile.paste(_fit_render(render_path), (0, LABEL_HEIGHT))
-
-        column = (ordinal - 1) % SHEET_COLUMNS
-        row = (ordinal - 1) // SHEET_COLUMNS
-        x = PADDING + column * (TILE_WIDTH + GAP)
-        y = PADDING + row * (tile_height + GAP)
-        sheet.paste(tile, (x, y))
-
-        output_condition = {
-            "condition_id": condition["condition_id"],
-            "display_label": source_label,
-            "ordinal": ordinal,
-            "render_sha256": condition["render_sha256"],
-            "rotation_degrees": rotation,
-            "source": condition.get("source"),
-            "source_kind": condition.get("source_kind"),
-            "source_sha256": condition.get("source_sha256"),
-            "split": condition.get("split"),
-            "support_count": condition.get("support_count"),
-        }
-        for optional_key in (
-            "absolute_index",
-            "normalization_scale",
-            "orientation",
-            "preset_index",
-            "projection",
-            "source_rank",
-            "variance_score",
-            "weight_sha256",
-        ):
-            if optional_key in condition:
-                output_condition[optional_key] = condition[optional_key]
-        manifest_conditions.append(output_condition)
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    rendering_path = output_dir / "rendering.png"
-    temporary_rendering = output_dir / ".rendering.png.pending"
-    sheet.save(temporary_rendering, format="PNG", compress_level=6)
-
-    manifest_path = output_dir / "rendering.json"
-    temporary_manifest = output_dir / ".rendering.json.pending"
-    input_record: dict[str, Any] = {
-        "selection_authority": "ordered conditions in saved renderer manifest",
-        "selected_condition_tiles_retained": bool(keep_heads),
-    }
-    if conditions_path.is_file():
-        input_record.update(
-            {
-                "recorded_conditions_manifest": _relative_path(
-                    conditions_path, output_dir
-                ),
-                "recorded_conditions_manifest_sha256": _sha256(conditions_path),
-            }
-        )
-    payload = {
-        "conditions": manifest_conditions,
-        "input": input_record,
-        "layout": {
-            "columns": SHEET_COLUMNS,
-            "gap_px": GAP,
-            "image_height_px": IMAGE_HEIGHT,
-            "label_height_px": LABEL_HEIGHT,
-            "padding_px": PADDING,
-            "rows": rows,
-            "sheet_height_px": sheet_height,
-            "sheet_width_px": sheet_width,
-            "tile_width_px": TILE_WIDTH,
-        },
-        "presentation": "predicted object renderings only",
-        "render_provenance": render_provenance,
-        "rendering": "rendering.png",
-        "rendering_sha256": _sha256(temporary_rendering),
-        "schema": "ictpolarreal.sd-olat-head-rendering.v1",
-        "selection": {
-            "authority": "render_manifest.conditions order",
-            "count": len(selected),
-            "lighting_preset": render_provenance.get("lighting_preset"),
-        },
-        "typography": {
-            "label_font": label_font_name,
-            "ordinal_font": ordinal_font_name,
-            "regular_font": regular_font_name,
-        },
-    }
-    expected_condition_ids = [condition["condition_id"] for condition, _ in selected]
+    material_dir.mkdir(parents=True, exist_ok=True)
+    rendering_path = material_dir / "rendering.png"
+    pending_path = material_dir / ".rendering.png.pending"
     try:
-        _write_json_atomic(temporary_manifest, payload)
-        _validate_final_outputs(
-            temporary_rendering,
-            temporary_manifest,
-            expected_size=(sheet_width, sheet_height),
-            expected_condition_ids=expected_condition_ids,
+        Image.fromarray(sheet, mode="RGB").save(
+            pending_path, format="PNG", compress_level=6
         )
-        temporary_rendering.replace(rendering_path)
-        temporary_manifest.replace(manifest_path)
-        _validate_final_outputs(
+        pending_sha256 = _validate_rendering(
+            pending_path,
+            expected_tiles=labeled_tiles,
+            tile_size=tile_size,
+        )
+        if _sha256(renderer_manifest_path) != manifest_sha256:
+            raise RuntimeError("renderer manifest changed during grid composition")
+        pending_path.replace(rendering_path)
+        _validate_rendering(
             rendering_path,
-            manifest_path,
-            expected_size=(sheet_width, sheet_height),
-            expected_condition_ids=expected_condition_ids,
+            expected_tiles=labeled_tiles,
+            tile_size=tile_size,
+            expected_sha256=pending_sha256,
         )
     finally:
-        temporary_rendering.unlink(missing_ok=True)
-        temporary_manifest.unlink(missing_ok=True)
-    if not keep_heads:
-        default_render_dir = material_dir / ".rendering_stage"
-        if render_dir.resolve() == default_render_dir.resolve():
-            # This exact hidden directory is owned by the render/composition
-            # handoff, including its validation images and renderer manifest.
-            shutil.rmtree(render_dir)
-        else:
-            for _, render_path in selected:
-                render_path.unlink()
-            # Never recursively delete a caller-supplied directory, since it may
-            # contain unrelated renderer logs or outputs.
-            try:
-                (render_dir / "conditions").rmdir()
-            except OSError:
-                pass
-    return rendering_path, manifest_path
+        pending_path.unlink(missing_ok=True)
+
+    # The compact pickup deliberately has no sidecar report.  Remove the old
+    # compositor's sidecar only after the replacement PNG has validated.
+    for stale_sidecar in (
+        material_dir / "rendering.json",
+        material_dir / ".rendering.json.pending",
+        material_dir / ".rendering.json.tmp",
+    ):
+        stale_sidecar.unlink(missing_ok=True)
+
+    if not keep_heads and render_dir.resolve() == default_render_dir.resolve():
+        shutil.rmtree(render_dir)
+    return rendering_path
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Compose the ordered 36-condition, predicted-render-only SD-OLAT-style "
-            "material acquisition view."
+            "Compose the source-exact 36-condition SD-OLAT heads as one gapless "
+            "12x3 native-resolution rendering.png."
         )
     )
     parser.add_argument(
@@ -692,28 +528,21 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--output-dir",
-        type=Path,
-        help="pickup output directory (default: <camera-dir>/material/olat)",
-    )
-    parser.add_argument(
         "--keep-heads",
         action="store_true",
-        help="retain the 36 private per-condition PNGs after composition",
+        help="retain the private renderer staging directory after composition",
     )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
-    rendering_path, manifest_path = compose_head_rendering(
+    rendering_path = compose_head_rendering(
         args.camera_dir,
         render_dir=args.render_dir,
-        output_dir=args.output_dir,
         keep_heads=args.keep_heads,
     )
     print(rendering_path)
-    print(manifest_path)
     return 0
 
 
