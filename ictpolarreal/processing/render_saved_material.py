@@ -19,6 +19,7 @@ from ictpolarreal.processing.end2end_acquisition import (
     _file_sha256,
     _foreground_mask,
     _load_imaginaire_disney,
+    _normalize_render_foreground,
     _normalize_vectors,
 )
 from ictpolarreal.processing.material_decomposition import (
@@ -38,14 +39,14 @@ from ictpolarreal.processing.lighting_profiles import (
 from ictpolarreal.utils.io import read_image, write_image
 
 
-RENDER_MANIFEST_SCHEMA = "ictpolarreal.saved-disney-render.v1"
+RENDER_MANIFEST_SCHEMA = "ictpolarreal.saved-disney-render.v2"
 EXPECTED_CONDITIONS_SCHEMA = "ictpolarreal.hdri-conditions.v1"
 EXPECTED_MODEL_SCHEMA = "ictpolarreal.disney-state-artifact.v1"
 DEFAULT_VALIDATION_TOLERANCE = 0.0
-SD_OLAT_HEADS_PRESET = "sd-olat-heads"
-SD_OLAT_HEADS_SCHEMA = "ictpolarreal.sd-olat-heads-preset.v1"
-SD_OLAT_HEADS_ROTATION_LABEL = 90
-SD_OLAT_HEADS_CUMULATIVE_ROLLS = 2
+SD_RENDERINGS_PRESET = "sd-renderings"
+SD_RENDERINGS_SCHEMA = "ictpolarreal.sd-renderings-preset.v1"
+SD_RENDERINGS_ROTATION_LABEL = 90
+SD_RENDERINGS_CUMULATIVE_ROLLS = 2
 SD_C04_LIGHTS_SHA256 = (
     "bf04ca41814c3ff04aeb71f0a6f7957fb22eb506c3e7e5aa39011f5e7b75afdd"
 )
@@ -86,6 +87,25 @@ SD_OLAT_EXPECTED_TOP32 = (
     "hdriheaven_flipped_yaris_interior_garage_2k_1k.hdr",
     "hdriheaven_original_cape_hill_2k_1k.hdr",
 )
+SD_SHEET_REFERENCE_SHA256 = (
+    "720a4e975be60f50629f72b106281b759a847c3d9b3b7b45326ce71e874a791d"
+)
+SD_SHEET_HISTORICAL_COMMIT = "877b6f0732cdadd55ed621771d327a574a077137"
+SD_SHEET_MAP_ORDER = (
+    "normal",
+    "baseColor",
+    "metallic",
+    "roughness",
+    "specular",
+    "specularTint",
+    "subsurface",
+    "anisotropic",
+    "sheen",
+    "sheenTint",
+    "clearcoat",
+    "clearcoatGloss",
+)
+SD_SHEET_PANEL_ORDER = ("gt", "pred", "greyball", "chromeball")
 
 
 @dataclass(frozen=True)
@@ -106,6 +126,8 @@ class ReplayInputs:
     height: int
     width: int
     light_ids: np.ndarray
+    frame_ids: np.ndarray
+    parallel_targets: np.ndarray
     light_directions: np.ndarray
     view_directions: np.ndarray
     foreground: np.ndarray
@@ -292,6 +314,67 @@ def reconstruct_light_ids(
     return light_ids
 
 
+def reconstruct_frame_ids(
+    acquisition: Mapping[str, Any], n_lights: int
+) -> np.ndarray:
+    """Reconstruct capture frame IDs in the acquisition stack's native order."""
+    light_split = acquisition.get("light_split")
+    if not isinstance(light_split, Mapping):
+        raise ValueError("acquisition.json is missing light_split provenance")
+    frame_ids = np.full(n_lights, -1, dtype=np.int64)
+    filled = np.zeros(n_lights, dtype=bool)
+    for group in ("fit", "heldout", "excluded"):
+        stack = np.asarray(
+            light_split.get(f"{group}_stack_indices", []), dtype=np.int64
+        )
+        ids = np.asarray(
+            light_split.get(f"{group}_frame_ids", []), dtype=np.int64
+        )
+        if stack.shape != ids.shape:
+            raise ValueError(f"{group} stack/frame provenance lengths differ")
+        if np.any(stack < 0) or np.any(stack >= n_lights):
+            raise ValueError(f"{group} stack indices fall outside 0..{n_lights - 1}")
+        if np.any(filled[stack]):
+            raise ValueError(f"{group} stack provenance overlaps an earlier split")
+        frame_ids[stack] = ids
+        filled[stack] = True
+    if not bool(filled.all()):
+        missing = np.flatnonzero(~filled).tolist()
+        raise ValueError(f"frame provenance does not cover stack rows: {missing}")
+    if len(np.unique(frame_ids)) != n_lights:
+        raise ValueError("reconstructed frame ids are not unique")
+    return frame_ids
+
+
+def load_parallel_targets(
+    sample: CameraSample,
+    frame_ids: Sequence[int] | np.ndarray,
+    *,
+    height: int,
+    width: int,
+) -> np.ndarray:
+    """Load measured parallel OLATs in the recorded acquisition stack order."""
+    images: list[np.ndarray] = []
+    for frame_id in np.asarray(frame_ids, dtype=np.int64):
+        path = sample.light_path("parallel", int(frame_id))
+        if path is None or not path.is_file():
+            raise FileNotFoundError(
+                f"missing parallel OLAT frame {int(frame_id)}: {path}"
+            )
+        image = read_image(path, channels=3)
+        if image.shape != (height, width, 3):
+            raise ValueError(
+                f"parallel OLAT frame {int(frame_id)} has shape {image.shape}, "
+                f"expected {(height, width, 3)}"
+            )
+        images.append(np.asarray(image, dtype=np.float32))
+    stack = np.stack(images, axis=0).astype(np.float32, copy=False)
+    stack = np.nan_to_num(
+        stack, copy=False, nan=0.0, posinf=0.0, neginf=0.0
+    )
+    return np.maximum(stack, 0.0).astype(np.float32, copy=False)
+
+
 def prepare_replay_inputs(
     *,
     camera_dir: str | Path,
@@ -366,6 +449,13 @@ def prepare_replay_inputs(
 
     n_lights = int(lighting.weights.shape[1])
     light_ids = reconstruct_light_ids(acquisition, n_lights)
+    frame_ids = reconstruct_frame_ids(acquisition, n_lights)
+    _record_hash_check(
+        checks,
+        "frame_ids",
+        _array_sha256(frame_ids),
+        signature.get("frame_ids_sha256"),
+    )
     _record_hash_check(
         checks,
         "light_ids",
@@ -385,6 +475,19 @@ def prepare_replay_inputs(
     sample = CameraSample(object_name, camera, data_root / object_name / camera)
     if not sample.camera_dir.is_dir():
         raise FileNotFoundError(f"camera sample does not exist: {sample.camera_dir}")
+    parallel_targets_hwc = load_parallel_targets(
+        sample, frame_ids, height=height, width=width
+    )
+    input_hashes = acquisition.get("input_hashes", {})
+    _record_hash_check(
+        checks,
+        "raw_parallel_targets",
+        _array_sha256(parallel_targets_hwc),
+        input_hashes.get("raw_parallel_targets_sha256"),
+    )
+    parallel_targets = np.ascontiguousarray(
+        parallel_targets_hwc.transpose(0, 3, 1, 2)
+    )
     mask_path = sample.image_path("mask")
     normal_path = sample.image_path("normal")
     if mask_path is None or normal_path is None:
@@ -406,7 +509,6 @@ def prepare_replay_inputs(
     foreground = capture_foreground * (
         np.sum(normal * view_directions, axis=-1, keepdims=True) > MIN_N_DOT_V
     ).astype(np.float32)
-    input_hashes = acquisition.get("input_hashes", {})
     for name, array in (
         ("capture_foreground", capture_foreground),
         ("normal", normal),
@@ -425,6 +527,8 @@ def prepare_replay_inputs(
         height=height,
         width=width,
         light_ids=light_ids,
+        frame_ids=frame_ids,
+        parallel_targets=parallel_targets,
         light_directions=light_directions,
         view_directions=view_directions,
         foreground=foreground,
@@ -432,7 +536,7 @@ def prepare_replay_inputs(
     )
 
 
-def prepare_sd_olat_heads_preset(
+def prepare_sd_renderings_preset(
     *,
     torch,
     replay: ReplayInputs,
@@ -505,9 +609,9 @@ def prepare_sd_olat_heads_preset(
     )
     conditions: list[RenderCondition] = []
     orientation = {
-        "label_rotation_degrees": SD_OLAT_HEADS_ROTATION_LABEL,
+        "label_rotation_degrees": SD_RENDERINGS_ROTATION_LABEL,
         "trainer_rotation_index": 1,
-        "cumulative_quarter_rolls": SD_OLAT_HEADS_CUMULATIVE_ROLLS,
+        "cumulative_quarter_rolls": SD_RENDERINGS_CUMULATIVE_ROLLS,
         "horizontal_shift_fraction": 0.5,
         "effective_raw_shift_degrees": 180,
         "reason": (
@@ -542,7 +646,7 @@ def prepare_sd_olat_heads_preset(
         descriptor = f"generated-calibration:{name}:linear-rgb"
         source_hash = hashlib.sha256(descriptor.encode("utf-8")).hexdigest()
         condition_id = (
-            f"calibration_{name}_sd_c04_rot{SD_OLAT_HEADS_ROTATION_LABEL:03d}"
+            f"calibration_{name}_sd_c04_rot{SD_RENDERINGS_ROTATION_LABEL:03d}"
         )
         conditions.append(
             RenderCondition(
@@ -557,7 +661,7 @@ def prepare_sd_olat_heads_preset(
                     "source_sha256": source_hash,
                     "source_kind": "generated_calibration",
                     "source_rank": None,
-                    "rotation_degrees": SD_OLAT_HEADS_ROTATION_LABEL,
+                    "rotation_degrees": SD_RENDERINGS_ROTATION_LABEL,
                     "split": "fit",
                     "variance_score": 0.0,
                     "support_count": int(len(support)),
@@ -574,7 +678,7 @@ def prepare_sd_olat_heads_preset(
             raw, projection_height, projection_width
         )
         shift = (
-            SD_OLAT_HEADS_CUMULATIVE_ROLLS
+            SD_RENDERINGS_CUMULATIVE_ROLLS
             * projection_width
             // 4
         )
@@ -587,7 +691,7 @@ def prepare_sd_olat_heads_preset(
         weights = _embed_support_weights(local_weights, support, n_lights)
         condition_id = (
             f"{_safe_stem(source_path.stem)}_{source_hash[:8]}_"
-            f"sd_c04_rot{SD_OLAT_HEADS_ROTATION_LABEL:03d}"
+            f"sd_c04_rot{SD_RENDERINGS_ROTATION_LABEL:03d}"
         )
         conditions.append(
             RenderCondition(
@@ -602,7 +706,7 @@ def prepare_sd_olat_heads_preset(
                     "source_sha256": source_hash,
                     "source_kind": "environment_map",
                     "source_rank": source_rank,
-                    "rotation_degrees": SD_OLAT_HEADS_ROTATION_LABEL,
+                    "rotation_degrees": SD_RENDERINGS_ROTATION_LABEL,
                     "split": "fit",
                     "variance_score": float(score),
                     "normalization_scale": scale,
@@ -614,7 +718,7 @@ def prepare_sd_olat_heads_preset(
         )
     if len(conditions) != 36:
         raise RuntimeError(
-            f"SD-OLAT heads preset produced {len(conditions)} conditions"
+            f"SD renderings preset produced {len(conditions)} conditions"
         )
 
     imaginaire_root = c04_path.parents[2]
@@ -627,7 +731,7 @@ def prepare_sd_olat_heads_preset(
     )
     sampler_path = imaginaire_root / "CookTorrance_IBL" / "CookTorrance.py"
     provenance = {
-        "schema": SD_OLAT_HEADS_SCHEMA,
+        "schema": SD_RENDERINGS_SCHEMA,
         "hdri_root": str(root),
         "candidate_count": len(paths),
         "calibration_count": 4,
@@ -801,6 +905,196 @@ def recorded_render_conditions(
     return tuple(conditions)
 
 
+def build_sheet_contract(
+    raw_parallel_targets_check: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Describe the immutable SuperDimension sheet contract for the compositor."""
+    return {
+        "reference_sha256": SD_SHEET_REFERENCE_SHA256,
+        "historical_commit": SD_SHEET_HISTORICAL_COMMIT,
+        "columns": 12,
+        "rows": 13,
+        "tile_size": 768,
+        "map_order": list(SD_SHEET_MAP_ORDER),
+        "panel_order": list(SD_SHEET_PANEL_ORDER),
+        "labels": {
+            "font": "cv2.FONT_HERSHEY_SIMPLEX",
+            "font_size_ratio": 0.08,
+            "color_rgb": [255, 255, 0],
+            "origin_x": 4,
+            "baseline_bottom_px": 4,
+            "line_type": "cv2.LINE_AA",
+            "templates": {
+                "gt": "gt #{label_number}",
+                "pred": "pred #{label_number}",
+                "greyball": "greyball #{label_number}",
+                "chromeball": "chromeball #{label_number}",
+            },
+        },
+        "raw_parallel_targets": dict(raw_parallel_targets_check),
+    }
+
+
+def _display_map_to_rgb_float(value: Any, *, height: int, width: int) -> np.ndarray:
+    if hasattr(value, "detach"):
+        value = value.detach().cpu().numpy()
+    image = np.asarray(value)
+    if image.ndim == 2:
+        image = np.repeat(image[..., None], 3, axis=-1)
+    elif image.ndim == 3 and image.shape[-1] not in {1, 3}:
+        if image.shape[0] in {1, 3}:
+            image = np.moveaxis(image, 0, -1)
+    if image.ndim != 3 or image.shape[-1] not in {1, 3}:
+        raise ValueError(f"display map must be HWC RGB-compatible; got {image.shape}")
+    if image.shape[-1] == 1:
+        image = np.repeat(image, 3, axis=-1)
+    if image.shape != (height, width, 3):
+        raise ValueError(
+            f"display map has shape {image.shape}, expected {(height, width, 3)}"
+        )
+    if np.issubdtype(image.dtype, np.integer):
+        image = image.astype(np.float32) / float(np.iinfo(image.dtype).max)
+    else:
+        image = image.astype(np.float32)
+    return np.clip(image, 0.0, 1.0)
+
+
+def _write_material_maps(
+    *,
+    model,
+    staging_dir: Path,
+    output_dir: Path,
+    camera_dir: Path,
+    height: int,
+    width: int,
+) -> list[dict[str, Any]]:
+    display_maps = model.to_display_maps(gamma=1.0)
+    missing = [name for name in SD_SHEET_MAP_ORDER if name not in display_maps]
+    if missing:
+        raise ValueError(f"saved Disney model is missing display maps: {missing}")
+    maps_dir = staging_dir / "material_maps"
+    maps_dir.mkdir(parents=True, exist_ok=False)
+    records: list[dict[str, Any]] = []
+    for name in SD_SHEET_MAP_ORDER:
+        path = maps_dir / f"{name}.png"
+        write_image(
+            path,
+            _display_map_to_rgb_float(
+                display_maps[name], height=height, width=width
+            ),
+        )
+        records.append(
+            {
+                "name": name,
+                "render_path": _relative_path(
+                    output_dir / "material_maps" / path.name, camera_dir
+                ),
+                "render_sha256": _file_sha256(path),
+            }
+        )
+    return records
+
+
+def _historical_probe_parameters(torch, model, kind: str) -> dict[str, Any]:
+    """Use the exact material constraints from the historical SD renderer."""
+    if kind not in {"greyball", "chromeball"}:
+        raise ValueError(f"unknown historical probe kind {kind!r}")
+    parameters = dict(model._param_maps())
+    base = parameters["baseColor"]
+    scalar = parameters["metallic"]
+    parameters["baseColor"] = (
+        torch.ones_like(base) if kind == "greyball" else torch.zeros_like(base)
+    )
+    values = {
+        "metallic": 0.0 if kind == "greyball" else 0.8,
+        "subsurface": 0.0,
+        "specular": 0.0 if kind == "greyball" else 1.0,
+        "roughness": 1.0 if kind == "greyball" else 0.2,
+        "specularTint": 0.0,
+        "anisotropic": 0.0,
+        "sheen": 0.0,
+        "sheenTint": 0.0,
+        "clearcoat": 0.0,
+        "clearcoatGloss": 0.0,
+    }
+    for name, value in values.items():
+        parameters[name] = torch.full_like(scalar, value)
+    return parameters
+
+
+def _render_measured_gt(
+    *,
+    torch,
+    parallel_targets,
+    foreground,
+    weights: np.ndarray,
+    support_indices: np.ndarray,
+) -> np.ndarray:
+    """Synthesize the historical GT panel from measured parallel OLATs."""
+    n_lights = int(parallel_targets.shape[0])
+    values = np.asarray(weights, dtype=np.float32)
+    if values.shape != (n_lights, 3):
+        raise ValueError(
+            f"condition weights must have shape {(n_lights, 3)}, got {values.shape}"
+        )
+    support = np.asarray(support_indices, dtype=np.int64)
+    _validate_support(support, n_lights, "condition")
+    support_tensor = torch.as_tensor(
+        support, dtype=torch.long, device=parallel_targets.device
+    )
+    weights_support = torch.as_tensor(
+        np.ascontiguousarray(values), dtype=parallel_targets.dtype,
+        device=parallel_targets.device,
+    ).index_select(0, support_tensor)
+    raw_support = parallel_targets.index_select(0, support_tensor)
+    mask_chw = foreground.permute(2, 0, 1).contiguous()
+    with torch.inference_mode():
+        synthesized = torch.einsum("nc,nchw->chw", weights_support, raw_support)
+        rendered = _normalize_render_foreground(synthesized, mask_chw)
+    return rendered.detach().float().cpu().permute(1, 2, 0).numpy()
+
+
+def _install_staged_directory(
+    staging_dir: Path,
+    output_dir: Path,
+    *,
+    replace_output: bool,
+) -> None:
+    """Install a complete render stage while preserving any prior stage."""
+    if not staging_dir.is_dir():
+        raise FileNotFoundError(f"render staging directory is missing: {staging_dir}")
+    if output_dir.exists() and not replace_output:
+        raise FileExistsError(
+            f"render output already exists: {output_dir}; pass --replace-output"
+        )
+
+    backup_dir = output_dir.with_name(
+        f"{output_dir.name}.previous-{os.getpid()}"
+    )
+    if backup_dir.exists():
+        raise FileExistsError(
+            f"refusing to overwrite an earlier render backup: {backup_dir}"
+        )
+
+    had_previous = output_dir.exists()
+    if had_previous:
+        os.replace(output_dir, backup_dir)
+    try:
+        os.replace(staging_dir, output_dir)
+    except Exception as install_error:
+        if had_previous:
+            try:
+                os.replace(backup_dir, output_dir)
+            except Exception as restore_error:
+                raise RuntimeError(
+                    "failed to install the new render stage and could not restore "
+                    f"the prior stage; it remains at {backup_dir}"
+                ) from restore_error
+        raise install_error
+    if had_previous:
+        shutil.rmtree(backup_dir)
+
+
 def render_saved_material(
     *,
     camera_dir: str | Path,
@@ -826,8 +1120,12 @@ def render_saved_material(
     expected_output_dir = camera_dir / ".rendering_stage"
     if output_dir != expected_output_dir:
         raise ValueError(
-            "saved OLAT head renders must use the private staging directory "
+            "saved SD sheet renders must use the private staging directory "
             f"{expected_output_dir}; got {output_dir}"
+        )
+    if output_dir.exists() and not replace_output:
+        raise FileExistsError(
+            f"render output already exists: {output_dir}; pass --replace-output"
         )
     if light_chunk is not None and light_chunk <= 0:
         raise ValueError("light_chunk must be positive when explicitly set")
@@ -837,16 +1135,16 @@ def render_saved_material(
         raise ValueError(
             "choose exactly one of condition_indices or lighting_preset"
         )
-    if lighting_preset is not None and lighting_preset != SD_OLAT_HEADS_PRESET:
+    if lighting_preset is not None and lighting_preset != SD_RENDERINGS_PRESET:
         raise ValueError(f"unsupported lighting preset {lighting_preset!r}")
-    if lighting_preset == SD_OLAT_HEADS_PRESET:
+    if lighting_preset == SD_RENDERINGS_PRESET:
         if hdri_root is None or sd_c04_lights_path is None:
             raise ValueError(
-                "sd-olat-heads requires hdri_root and sd_c04_lights_path"
+                "sd-renderings requires hdri_root and sd_c04_lights_path"
             )
         if validation_condition_index is None:
             raise ValueError(
-                "sd-olat-heads requires a recorded validation condition index"
+                "sd-renderings requires a recorded validation condition index"
             )
     gpu = require_slurm_cuda(torch)
     lighting = load_recorded_lighting(camera_dir)
@@ -865,8 +1163,8 @@ def render_saved_material(
     )
     device = torch.device("cuda")
     preset: PreparedPreset | None = None
-    if lighting_preset == SD_OLAT_HEADS_PRESET:
-        preset = prepare_sd_olat_heads_preset(
+    if lighting_preset == SD_RENDERINGS_PRESET:
+        preset = prepare_sd_renderings_preset(
             torch=torch,
             replay=replay,
             lighting=lighting,
@@ -903,24 +1201,32 @@ def render_saved_material(
     foreground = torch.as_tensor(
         np.ascontiguousarray(replay.foreground), device=device
     )
+    parallel_targets = torch.as_tensor(
+        np.ascontiguousarray(replay.parallel_targets), device=device
+    )
+    greyball_parameters = _historical_probe_parameters(torch, model, "greyball")
+    chromeball_parameters = _historical_probe_parameters(torch, model, "chromeball")
 
     output_dir.parent.mkdir(parents=True, exist_ok=True)
-    staging_dir = output_dir.parent / f".{output_dir.name}.tmp-{os.getpid()}"
+    staging_dir = output_dir.with_name(f"{output_dir.name}.tmp-{os.getpid()}")
     if staging_dir.exists():
         shutil.rmtree(staging_dir)
-    if output_dir.exists():
-        if not replace_output:
-            raise FileExistsError(
-                f"render output already exists: {output_dir}; pass --replace-output"
-            )
-        shutil.rmtree(output_dir)
     conditions_dir = staging_dir / "conditions"
     validation_dir = staging_dir / "validation"
-    conditions_dir.mkdir(parents=True, exist_ok=False)
 
     ordered_records: list[dict[str, Any]] = []
+    safe_condition_ids: set[str] = set()
     validation: dict[str, Any] | None = None
     try:
+        conditions_dir.mkdir(parents=True, exist_ok=False)
+        material_maps = _write_material_maps(
+            model=model,
+            staging_dir=staging_dir,
+            output_dir=output_dir,
+            camera_dir=camera_dir,
+            height=replay.height,
+            width=replay.width,
+        )
         if validation_condition_index is not None:
             validation_dir.mkdir(parents=True, exist_ok=False)
             rendered = _render_condition(
@@ -976,7 +1282,23 @@ def render_saved_material(
                 f"condition={condition.condition_id}",
                 flush=True,
             )
-            rendered = _render_condition(
+            safe_condition_id = _safe_stem(condition.condition_id)
+            if safe_condition_id in safe_condition_ids:
+                raise ValueError(
+                    "condition ids collide after path sanitization: "
+                    f"{condition.condition_id!r} -> {safe_condition_id!r}"
+                )
+            safe_condition_ids.add(safe_condition_id)
+            condition_dir = conditions_dir / safe_condition_id
+            condition_dir.mkdir(parents=False, exist_ok=False)
+            gt = _render_measured_gt(
+                torch=torch,
+                parallel_targets=parallel_targets,
+                foreground=foreground,
+                weights=condition.weights,
+                support_indices=condition.support_indices,
+            )
+            pred = _render_condition(
                 torch=torch,
                 model=model,
                 views=views,
@@ -986,15 +1308,55 @@ def render_saved_material(
                 support_indices=condition.support_indices,
                 light_chunk=light_chunk,
             )
-            render_path = conditions_dir / f"{condition.condition_id}.png"
-            write_image(render_path, rendered)
+            greyball = _render_condition(
+                torch=torch,
+                model=model,
+                views=views,
+                lights=lights,
+                foreground=foreground,
+                weights=condition.weights,
+                support_indices=condition.support_indices,
+                light_chunk=light_chunk,
+                parameters=greyball_parameters,
+            )
+            chromeball = _render_condition(
+                torch=torch,
+                model=model,
+                views=views,
+                lights=lights,
+                foreground=foreground,
+                weights=condition.weights,
+                support_indices=condition.support_indices,
+                light_chunk=light_chunk,
+                parameters=chromeball_parameters,
+            )
+            rendered_panels = {
+                "gt": gt,
+                "pred": pred,
+                "greyball": greyball,
+                "chromeball": chromeball,
+            }
+            panels: dict[str, dict[str, Any]] = {}
+            for panel_name in SD_SHEET_PANEL_ORDER:
+                panel_path = condition_dir / f"{panel_name}.png"
+                write_image(panel_path, rendered_panels[panel_name])
+                panels[panel_name] = {
+                    "render_path": _relative_path(
+                        output_dir
+                        / "conditions"
+                        / safe_condition_id
+                        / panel_path.name,
+                        camera_dir,
+                    ),
+                    "render_sha256": _file_sha256(panel_path),
+                }
             record = dict(condition.record)
             record.update(
-                render_path=_relative_path(
-                    output_dir / "conditions" / render_path.name,
-                    camera_dir,
+                label_number=1 + 4 * int(
+                    condition.record.get("preset_index", position - 1)
                 ),
-                render_sha256=_file_sha256(render_path),
+                safe_condition_id=safe_condition_id,
+                panels=panels,
             )
             ordered_records.append(record)
 
@@ -1007,8 +1369,12 @@ def render_saved_material(
                 "path": _relative_path(replay.model_path, camera_dir),
                 "sha256": replay.hash_checks["material_state"]["actual_sha256"],
             },
+            "material_maps": material_maps,
             "selected_absolute_indices": selected_absolute_indices,
             "conditions": ordered_records,
+            "sheet_contract": build_sheet_contract(
+                replay.hash_checks["raw_parallel_targets"]
+            ),
             "validation": validation,
             "input_hash_checks": replay.hash_checks,
             "renderer": {
@@ -1018,8 +1384,9 @@ def render_saved_material(
                     "ICT OLAT basis with explicit unit light_weights"
                 ),
                 "tone_map": (
-                    "Imaginaire model linear whole-image p99.5 tone map, then "
-                    "output clamp to [0,1]"
+                    "pred/probes: Imaginaire linear whole-image p99.5; GT: "
+                    "nonnegative measured-parallel weighted sum, acquisition "
+                    "foreground, whole-image p99.5; all clamp to [0,1]"
                 ),
                 "light_chunk": light_chunk,
                 "exact_original_summation_order": light_chunk is None,
@@ -1030,10 +1397,14 @@ def render_saved_material(
         }
         manifest_path = staging_dir / "render_manifest.json"
         manifest_path.write_text(
-            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            json.dumps(manifest, indent=2) + "\n",
             encoding="utf-8",
         )
-        os.replace(staging_dir, output_dir)
+        _install_staged_directory(
+            staging_dir,
+            output_dir,
+            replace_output=replace_output,
+        )
         return manifest
     except Exception:
         shutil.rmtree(staging_dir, ignore_errors=True)
@@ -1080,6 +1451,7 @@ def _render_condition(
     weights: np.ndarray,
     support_indices: np.ndarray,
     light_chunk: int | None,
+    parameters: Mapping[str, Any] | None = None,
 ) -> np.ndarray:
     support = np.asarray(support_indices, dtype=np.int64)
     if np.asarray(weights).shape != (len(lights), 3):
@@ -1092,15 +1464,18 @@ def _render_condition(
         np.ascontiguousarray(weights), device=lights.device
     ).index_select(0, support_tensor)
     unit_weights = torch.ones(len(support), device=lights.device)
+    render_arguments = {
+        "V": views,
+        "L_dir": lights.index_select(0, support_tensor),
+        "L_rgb": rgb,
+        "light_weights": unit_weights,
+        "light_chunk": light_chunk,
+        "mask": foreground,
+    }
+    if parameters is not None:
+        render_arguments["P_detach"] = parameters
     with torch.inference_mode():
-        prediction, _, _ = model(
-            V=views,
-            L_dir=lights.index_select(0, support_tensor),
-            L_rgb=rgb,
-            light_weights=unit_weights,
-            light_chunk=light_chunk,
-            mask=foreground,
-        )
+        prediction, _, _ = model(**render_arguments)
     rendered = prediction.detach().float().cpu().permute(1, 2, 0).numpy()
     return np.clip(rendered, 0.0, 1.0) * foreground.detach().cpu().numpy()
 
@@ -1222,7 +1597,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     lighting.add_argument(
         "--lighting-preset",
-        choices=(SD_OLAT_HEADS_PRESET,),
+        choices=(SD_RENDERINGS_PRESET,),
     )
     parser.add_argument("--hdri-root", type=Path)
     parser.add_argument("--sd-c04-lights", type=Path)
@@ -1256,7 +1631,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             args.condition_indices, count=len(lighting.conditions)
         )
     c04_lights = args.sd_c04_lights
-    if args.lighting_preset == SD_OLAT_HEADS_PRESET and c04_lights is None:
+    if args.lighting_preset == SD_RENDERINGS_PRESET and c04_lights is None:
         c04_lights = (
             args.imaginaire_root
             / "OLATPipeClean"

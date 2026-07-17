@@ -115,6 +115,111 @@ def test_reconstruct_light_ids_rejects_missing_stack_rows():
         render_saved_material.reconstruct_light_ids(acquisition, 2)
 
 
+def test_reconstruct_frame_ids_uses_native_stack_provenance_order():
+    acquisition = {
+        "light_split": {
+            "fit_stack_indices": [2, 0],
+            "fit_frame_ids": [102, 100],
+            "heldout_stack_indices": [1],
+            "heldout_frame_ids": [101],
+            "excluded_stack_indices": [3],
+            "excluded_frame_ids": [103],
+        }
+    }
+
+    frame_ids = render_saved_material.reconstruct_frame_ids(acquisition, 4)
+
+    np.testing.assert_array_equal(frame_ids, [100, 101, 102, 103])
+
+
+def test_load_parallel_targets_preserves_frame_order_and_acquisition_hash(
+    monkeypatch, tmp_path,
+):
+    frame_ids = np.asarray([12, 4, 9], dtype=np.int64)
+    for frame_id in frame_ids:
+        (tmp_path / f"{int(frame_id)}.png").touch()
+    sample = SimpleNamespace(
+        light_path=lambda polarization, frame_id: tmp_path / f"{frame_id}.png"
+    )
+
+    def fake_read(path, *, channels):
+        value = int(Path(path).stem)
+        image = np.full((2, 1, 3), value, dtype=np.float32)
+        if value == 4:
+            image[0, 0, 0] = np.nan
+            image[0, 0, 1] = -2.0
+            image[0, 0, 2] = np.inf
+            image[1, 0, 0] = -np.inf
+        return image
+
+    monkeypatch.setattr(render_saved_material, "read_image", fake_read)
+
+    targets = render_saved_material.load_parallel_targets(
+        sample, frame_ids, height=2, width=1
+    )
+
+    assert targets.dtype == np.float32
+    np.testing.assert_array_equal(targets[:, 1, 0, 0], [12.0, 0.0, 9.0])
+    np.testing.assert_array_equal(targets[1, 0, 0], [0.0, 0.0, 0.0])
+    np.testing.assert_array_equal(targets[1, 1, 0], [0.0, 4.0, 4.0])
+    assert render_saved_material._array_sha256(targets) == (
+        render_saved_material._array_sha256(np.ascontiguousarray(targets))
+    )
+
+
+def test_load_parallel_targets_reports_missing_recorded_frame():
+    sample = SimpleNamespace(light_path=lambda _polarization, _frame_id: None)
+
+    with pytest.raises(FileNotFoundError, match="missing parallel OLAT frame 77"):
+        render_saved_material.load_parallel_targets(
+            sample, [77], height=2, width=1
+        )
+
+
+def test_install_staged_directory_replaces_only_after_complete_stage(tmp_path):
+    output_dir = tmp_path / ".rendering_stage"
+    staging_dir = tmp_path / ".rendering_stage.tmp-123"
+    output_dir.mkdir()
+    staging_dir.mkdir()
+    (output_dir / "marker").write_text("old", encoding="utf-8")
+    (staging_dir / "marker").write_text("new", encoding="utf-8")
+
+    render_saved_material._install_staged_directory(
+        staging_dir, output_dir, replace_output=True
+    )
+
+    assert (output_dir / "marker").read_text(encoding="utf-8") == "new"
+    assert not staging_dir.exists()
+    assert not list(tmp_path.glob(".rendering_stage.previous-*"))
+
+
+def test_install_staged_directory_restores_previous_on_swap_failure(
+    tmp_path, monkeypatch
+):
+    output_dir = tmp_path / ".rendering_stage"
+    staging_dir = tmp_path / ".rendering_stage.tmp-123"
+    output_dir.mkdir()
+    staging_dir.mkdir()
+    (output_dir / "marker").write_text("old", encoding="utf-8")
+    (staging_dir / "marker").write_text("new", encoding="utf-8")
+    real_replace = render_saved_material.os.replace
+
+    def fail_new_stage(source, destination):
+        if Path(source) == staging_dir:
+            raise OSError("synthetic stage swap failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(render_saved_material.os, "replace", fail_new_stage)
+    with pytest.raises(OSError, match="synthetic stage swap failure"):
+        render_saved_material._install_staged_directory(
+            staging_dir, output_dir, replace_output=True
+        )
+
+    assert (output_dir / "marker").read_text(encoding="utf-8") == "old"
+    assert (staging_dir / "marker").read_text(encoding="utf-8") == "new"
+    assert not list(tmp_path.glob(".rendering_stage.previous-*"))
+
+
 def test_require_slurm_cuda_rejects_local_session(monkeypatch):
     monkeypatch.delenv("SLURM_JOB_ID", raising=False)
     fake_torch = SimpleNamespace(cuda=SimpleNamespace())
@@ -169,7 +274,7 @@ def test_sample_sd_environment_matches_truncating_nearest_pixel_contract():
     torch.testing.assert_close(samples[3], environment[0, 1])
 
 
-def test_prepare_sd_heads_preset_is_calibration_then_exact_rank_order(monkeypatch):
+def test_prepare_sd_renderings_preset_is_calibration_then_exact_rank_order(monkeypatch):
     torch = pytest.importorskip("torch")
     root = Path("/synthetic/hdr")
     paths = [root / name for name in render_saved_material.SD_OLAT_EXPECTED_TOP32]
@@ -217,6 +322,8 @@ def test_prepare_sd_heads_preset_is_calibration_then_exact_rank_order(monkeypatc
         height=2,
         width=4,
         light_ids=np.arange(4, dtype=np.int64),
+        frame_ids=np.arange(4, dtype=np.int64),
+        parallel_targets=np.zeros((4, 3, 2, 4), dtype=np.float32),
         light_directions=np.asarray(
             [
                 [1.0, 0.0, 0.0],
@@ -240,7 +347,7 @@ def test_prepare_sd_heads_preset_is_calibration_then_exact_rank_order(monkeypatc
         evaluation_support_indices=np.arange(4, dtype=np.int64),
     )
 
-    preset = render_saved_material.prepare_sd_olat_heads_preset(
+    preset = render_saved_material.prepare_sd_renderings_preset(
         torch=torch,
         replay=replay,
         lighting=lighting,
@@ -264,8 +371,133 @@ def test_prepare_sd_heads_preset_is_calibration_then_exact_rank_order(monkeypatc
         range(1, 33)
     )
     assert all(entry.weights.shape == (4, 3) for entry in preset.conditions)
-    assert preset.provenance["schema"] == render_saved_material.SD_OLAT_HEADS_SCHEMA
+    assert preset.provenance["schema"] == render_saved_material.SD_RENDERINGS_SCHEMA
     assert preset.provenance["orientation"]["horizontal_shift_fraction"] == 0.5
+
+
+def test_historical_probe_parameters_match_exact_sd_constraints():
+    torch = pytest.importorskip("torch")
+    normal = torch.randn(2, 3, 3)
+    base = torch.rand(2, 3, 3)
+    scalar_names = (
+        "metallic",
+        "subsurface",
+        "specular",
+        "roughness",
+        "specularTint",
+        "anisotropic",
+        "sheen",
+        "sheenTint",
+        "clearcoat",
+        "clearcoatGloss",
+    )
+    maps = {"normal": normal, "baseColor": base}
+    maps.update({name: torch.rand(2, 3) for name in scalar_names})
+    model = SimpleNamespace(_param_maps=lambda: maps)
+
+    grey = render_saved_material._historical_probe_parameters(
+        torch, model, "greyball"
+    )
+    chrome = render_saved_material._historical_probe_parameters(
+        torch, model, "chromeball"
+    )
+
+    assert grey["normal"] is normal
+    assert chrome["normal"] is normal
+    torch.testing.assert_close(grey["baseColor"], torch.ones_like(base))
+    torch.testing.assert_close(chrome["baseColor"], torch.zeros_like(base))
+    expected_grey = {"roughness": 1.0}
+    expected_chrome = {"metallic": 0.8, "specular": 1.0, "roughness": 0.2}
+    for name in scalar_names:
+        torch.testing.assert_close(
+            grey[name], torch.full_like(maps[name], expected_grey.get(name, 0.0))
+        )
+        torch.testing.assert_close(
+            chrome[name],
+            torch.full_like(maps[name], expected_chrome.get(name, 0.0)),
+        )
+
+
+def test_measured_gt_is_supported_weighted_sum_mask_then_global_p995():
+    torch = pytest.importorskip("torch")
+    targets = torch.tensor(
+        [
+            [[[1.0, 4.0]], [[2.0, 5.0]], [[3.0, 6.0]]],
+            [[[2.0, 8.0]], [[4.0, 10.0]], [[6.0, 12.0]]],
+        ],
+        dtype=torch.float32,
+    )
+    foreground = torch.tensor([[[1.0], [0.5]]], dtype=torch.float32)
+    weights = np.asarray([[99.0, 99.0, 99.0], [1.0, 0.5, 0.25]], dtype=np.float32)
+
+    actual = render_saved_material._render_measured_gt(
+        torch=torch,
+        parallel_targets=targets,
+        foreground=foreground,
+        weights=weights,
+        support_indices=np.asarray([1], dtype=np.int64),
+    )
+
+    raw = targets[1] * torch.tensor([1.0, 0.5, 0.25]).reshape(3, 1, 1)
+    mask = foreground.permute(2, 0, 1)
+    expected = render_saved_material._normalize_render_foreground(raw, mask)
+    expected = expected.permute(1, 2, 0)
+    np.testing.assert_allclose(actual, expected.numpy(), rtol=0.0, atol=1e-7)
+
+
+def test_material_map_stage_has_exact_order_native_rgb_and_paths(tmp_path):
+    torch = pytest.importorskip("torch")
+    display = {
+        name: torch.full((2, 3, 3), index, dtype=torch.uint8)
+        for index, name in enumerate(render_saved_material.SD_SHEET_MAP_ORDER)
+    }
+    model = SimpleNamespace(to_display_maps=lambda gamma: display)
+    camera_dir = tmp_path / "object" / "cam07"
+    staging_dir = camera_dir / ".rendering_stage.tmp"
+    output_dir = camera_dir / ".rendering_stage"
+
+    records = render_saved_material._write_material_maps(
+        model=model,
+        staging_dir=staging_dir,
+        output_dir=output_dir,
+        camera_dir=camera_dir,
+        height=2,
+        width=3,
+    )
+
+    assert [record["name"] for record in records] == list(
+        render_saved_material.SD_SHEET_MAP_ORDER
+    )
+    assert records[0]["render_path"] == (
+        ".rendering_stage/material_maps/normal.png"
+    )
+    for record in records:
+        path = staging_dir / "material_maps" / f"{record['name']}.png"
+        assert path.is_file()
+        assert record["render_sha256"] == render_saved_material._file_sha256(path)
+        assert render_saved_material.read_image(path).shape == (2, 3, 3)
+
+
+def test_sheet_contract_is_exact_historical_12_by_13_layout():
+    raw_check = {
+        "expected_sha256": "a" * 64,
+        "actual_sha256": "a" * 64,
+        "passed": True,
+    }
+
+    contract = render_saved_material.build_sheet_contract(raw_check)
+
+    assert contract["reference_sha256"] == render_saved_material.SD_SHEET_REFERENCE_SHA256
+    assert contract["historical_commit"] == render_saved_material.SD_SHEET_HISTORICAL_COMMIT
+    assert (contract["columns"], contract["rows"], contract["tile_size"]) == (
+        12,
+        13,
+        768,
+    )
+    assert contract["map_order"] == list(render_saved_material.SD_SHEET_MAP_ORDER)
+    assert contract["panel_order"] == ["gt", "pred", "greyball", "chromeball"]
+    assert contract["labels"]["templates"]["pred"] == "pred #{label_number}"
+    assert contract["raw_parallel_targets"] == raw_check
 
 
 def test_cli_lighting_source_is_mutually_exclusive():
@@ -285,15 +517,15 @@ def test_cli_lighting_source_is_mutually_exclusive():
         "/camera/.rendering_stage",
     ]
 
-    preset = parser.parse_args([*common, "--lighting-preset", "sd-olat-heads"])
-    assert preset.lighting_preset == "sd-olat-heads"
+    preset = parser.parse_args([*common, "--lighting-preset", "sd-renderings"])
+    assert preset.lighting_preset == "sd-renderings"
     assert preset.condition_indices is None
     with pytest.raises(SystemExit):
         parser.parse_args(
             [
                 *common,
                 "--lighting-preset",
-                "sd-olat-heads",
+                "sd-renderings",
                 "--condition-indices",
                 "1:4",
             ]
