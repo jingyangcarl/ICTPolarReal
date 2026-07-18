@@ -658,7 +658,7 @@ def _load_replay_inputs_artifact(
     ):
         raise ValueError("replay inputs artifact byte count differs")
     metadata = record.get("arrays")
-    if not isinstance(metadata, Mapping) or list(metadata) != list(
+    if not isinstance(metadata, Mapping) or set(metadata) != set(
         REPLAY_INPUT_ARRAY_NAMES
     ):
         raise ValueError("replay inputs artifact metadata differs from contract")

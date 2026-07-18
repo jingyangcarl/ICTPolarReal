@@ -370,6 +370,7 @@ def test_replay_inputs_artifact_replays_every_persisted_tensor(tmp_path):
         "file_sha256": render_saved_material._file_sha256(path),
         "bytes": path.stat().st_size,
     }
+    record["arrays"] = dict(reversed(list(record["arrays"].items())))
 
     loaded, loaded_path = render_saved_material._load_replay_inputs_artifact(
         tmp_path,
