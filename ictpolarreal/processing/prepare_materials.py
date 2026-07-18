@@ -19,6 +19,20 @@ def main() -> None:
     )
     parser.add_argument("--data-root", required=True)
     parser.add_argument("--out-root", required=True)
+    parser.add_argument(
+        "--object",
+        action="append",
+        dest="objects",
+        default=[],
+        help="Process only this object name; repeat to select multiple objects.",
+    )
+    parser.add_argument(
+        "--camera",
+        action="append",
+        dest="cameras",
+        default=[],
+        help="Process only this camera name; repeat to select multiple cameras.",
+    )
     parser.add_argument("--max-lights", type=int, default=None)
     parser.add_argument("--light-start", type=int, default=0)
     parser.add_argument(
@@ -122,7 +136,15 @@ def main() -> None:
 
     out_root = Path(args.out_root)
     out_root.mkdir(parents=True, exist_ok=True)
-    samples = list(iter_camera_samples(args.data_root))
+    samples = _filter_samples(
+        list(iter_camera_samples(args.data_root)),
+        object_names=args.objects,
+        camera_names=args.cameras,
+    )
+    if not samples:
+        parser.error(
+            "no camera samples matched --object/--camera under --data-root"
+        )
     profiles: tuple[str, ...] = ()
     if args.material_acquisition == "end2end":
         if args.end2end_steps <= 0:
@@ -162,6 +184,8 @@ def main() -> None:
             "backend": args.backend,
             "device": args.device,
             "frame_layout": args.frame_layout,
+            "objects": list(args.objects),
+            "cameras": list(args.cameras),
             "max_lights": args.max_lights,
             "light_start": args.light_start,
             "imaginaire_root": str(Path(args.imaginaire_root).expanduser().resolve()),
@@ -261,6 +285,25 @@ def main() -> None:
     print(f"[process] decomposed cameras: {processed}")
     print(f"[process] paired OLAT images used: {light_count}")
     print(f"[process] material maps: {out_root}")
+
+
+def _filter_samples(
+    samples,
+    *,
+    object_names: list[str],
+    camera_names: list[str],
+):
+    """Preserve dataset order while applying optional exact-name filters."""
+    requested_objects = {name.strip() for name in object_names if name.strip()}
+    requested_cameras = {name.strip() for name in camera_names if name.strip()}
+    return [
+        sample
+        for sample in samples
+        if (
+            not requested_objects or sample.object_name in requested_objects
+        )
+        and (not requested_cameras or sample.camera in requested_cameras)
+    ]
 
 
 def _write_run_manifest(out_root: Path, payload: dict[str, object]) -> None:
