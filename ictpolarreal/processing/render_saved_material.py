@@ -48,6 +48,9 @@ from ictpolarreal.utils.io import read_image, write_image
 RENDER_MANIFEST_SCHEMA = "ictpolarreal.saved-disney-render.v4"
 EXPECTED_CONDITIONS_SCHEMA = "ictpolarreal.hdri-conditions.v1"
 EXPECTED_MODEL_SCHEMA = "ictpolarreal.disney-state-artifact.v1"
+RAW_PARALLEL_TARGETS_ARTIFACT_SCHEMA = (
+    "ictpolarreal.raw-parallel-targets-artifact.v1"
+)
 PRESENTATION_MASK_SCHEMA = "ictpolarreal.saved-render-presentation-mask.v2"
 PRESENTATION_MASK_RULE = "soft_clean_dataset_mask_applied_once_without_n_dot_v_culling"
 PRESENTATION_NORMAL_RULE = NORMAL_ORIENTATION_RULE
@@ -554,6 +557,64 @@ def _load_polarized_capture_in_acquisition_order(
     )
 
 
+def _load_raw_parallel_targets_artifact(
+    camera_dir: Path,
+    record: Mapping[str, Any],
+    *,
+    n_lights: int,
+    height: int,
+    width: int,
+) -> tuple[np.ndarray, Path]:
+    """Load the exact tensor persisted by acquisition, without PIZ re-decoding."""
+    if record.get("schema") != RAW_PARALLEL_TARGETS_ARTIFACT_SCHEMA:
+        raise ValueError("unsupported raw parallel targets artifact schema")
+    if record.get("format") != "numpy_npz_compressed":
+        raise ValueError("raw parallel targets artifact has the wrong format")
+    if record.get("key") != "raw_parallel_targets":
+        raise ValueError("raw parallel targets artifact has the wrong array key")
+    if record.get("dtype") != "float32":
+        raise ValueError("raw parallel targets artifact has the wrong dtype")
+    expected_shape = (n_lights, height, width, 3)
+    if record.get("shape") != list(expected_shape):
+        raise ValueError(
+            "raw parallel targets artifact has the wrong recorded shape: "
+            f"{record.get('shape')!r}"
+        )
+    relative = record.get("path")
+    if not isinstance(relative, str) or not relative:
+        raise ValueError("raw parallel targets artifact path is missing")
+    path_value = Path(relative)
+    if path_value.is_absolute():
+        raise ValueError("raw parallel targets artifact path must be camera-relative")
+    path = (camera_dir / path_value).resolve()
+    try:
+        path.relative_to(camera_dir.resolve())
+    except ValueError as exc:
+        raise ValueError("raw parallel targets artifact escapes the camera result") from exc
+    if not path.is_file():
+        raise FileNotFoundError(f"missing raw parallel targets artifact: {path}")
+    expected_bytes = record.get("bytes")
+    if (
+        isinstance(expected_bytes, bool)
+        or not isinstance(expected_bytes, int)
+        or expected_bytes <= 0
+        or path.stat().st_size != expected_bytes
+    ):
+        raise ValueError("raw parallel targets artifact byte count differs")
+    with np.load(path, allow_pickle=False) as archive:
+        if archive.files != ["raw_parallel_targets"]:
+            raise ValueError("raw parallel targets artifact arrays differ from contract")
+        array = np.asarray(archive["raw_parallel_targets"])
+    if array.dtype != np.float32 or array.shape != expected_shape:
+        raise ValueError(
+            "raw parallel targets artifact decoded with the wrong dtype or shape: "
+            f"{array.dtype} {array.shape}"
+        )
+    if not np.isfinite(array).all():
+        raise ValueError("raw parallel targets artifact contains non-finite values")
+    return np.ascontiguousarray(array), path
+
+
 def _presentation_alpha(mask: np.ndarray, height: int, width: int) -> np.ndarray:
     """Preserve the clean dataset mask's soft edge for report rendering."""
     image = np.asarray(mask, dtype=np.float32)
@@ -672,9 +733,43 @@ def prepare_replay_inputs(
     sample = CameraSample(object_name, camera, data_root / object_name / camera)
     if not sample.camera_dir.is_dir():
         raise FileNotFoundError(f"camera sample does not exist: {sample.camera_dir}")
-    capture = _load_polarized_capture_in_acquisition_order(
-        sample, frame_ids, height=height, width=width
-    )
+    input_hashes = acquisition.get("input_hashes", {})
+    artifact_record = acquisition.get("raw_parallel_targets_artifact")
+    capture = None
+    if artifact_record is None:
+        capture = _load_polarized_capture_in_acquisition_order(
+            sample, frame_ids, height=height, width=width
+        )
+        parallel_targets_hwc = np.nan_to_num(
+            capture.parallel_stack, copy=False, nan=0.0, posinf=0.0, neginf=0.0
+        )
+        parallel_targets_hwc = np.maximum(
+            parallel_targets_hwc, 0.0
+        ).astype(np.float32, copy=False)
+    elif isinstance(artifact_record, Mapping):
+        parallel_targets_hwc, artifact_path = (
+            _load_raw_parallel_targets_artifact(
+                camera_dir,
+                artifact_record,
+                n_lights=n_lights,
+                height=height,
+                width=width,
+            )
+        )
+        _record_hash_check(
+            checks,
+            "raw_parallel_targets_artifact",
+            _file_sha256(artifact_path),
+            artifact_record.get("file_sha256"),
+        )
+        _record_hash_check(
+            checks,
+            "raw_parallel_targets_artifact_array",
+            _array_sha256(parallel_targets_hwc),
+            artifact_record.get("array_sha256"),
+        )
+    else:
+        raise ValueError("raw parallel targets artifact record must be an object")
     light_directions = load_light_directions(
         data_root, light_ids, light_root=light_root
     )
@@ -705,13 +800,6 @@ def prepare_replay_inputs(
         load_end2end_view_directions(data_root, sample, (height, width))
     )
 
-    parallel_targets_hwc = np.nan_to_num(
-        capture.parallel_stack, copy=False, nan=0.0, posinf=0.0, neginf=0.0
-    )
-    parallel_targets_hwc = np.maximum(
-        parallel_targets_hwc, 0.0
-    ).astype(np.float32, copy=False)
-    input_hashes = acquisition.get("input_hashes", {})
     _record_hash_check(
         checks,
         "raw_parallel_targets",

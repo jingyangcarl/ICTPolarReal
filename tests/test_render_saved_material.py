@@ -298,6 +298,51 @@ def test_replay_target_loader_requires_both_polarizations(tmp_path):
         )
 
 
+def test_raw_parallel_targets_artifact_replays_exact_persisted_tensor(tmp_path):
+    targets = np.linspace(0.0, 1.0, 2 * 3 * 4 * 3, dtype=np.float32).reshape(
+        2, 3, 4, 3
+    )
+    path = tmp_path / "evaluation" / "assets" / "raw_parallel_targets.npz"
+    path.parent.mkdir(parents=True)
+    with path.open("wb") as stream:
+        np.savez_compressed(stream, raw_parallel_targets=targets)
+    record = {
+        "schema": render_saved_material.RAW_PARALLEL_TARGETS_ARTIFACT_SCHEMA,
+        "path": "evaluation/assets/raw_parallel_targets.npz",
+        "format": "numpy_npz_compressed",
+        "key": "raw_parallel_targets",
+        "dtype": "float32",
+        "shape": [2, 3, 4, 3],
+        "array_sha256": render_saved_material._array_sha256(targets),
+        "file_sha256": render_saved_material._file_sha256(path),
+        "bytes": path.stat().st_size,
+    }
+
+    loaded, loaded_path = (
+        render_saved_material._load_raw_parallel_targets_artifact(
+            tmp_path,
+            record,
+            n_lights=2,
+            height=3,
+            width=4,
+        )
+    )
+
+    assert loaded_path == path
+    assert loaded.flags.c_contiguous
+    np.testing.assert_array_equal(loaded, targets)
+
+    escaping = dict(record, path="../raw_parallel_targets.npz")
+    with pytest.raises(ValueError, match="escapes the camera result"):
+        render_saved_material._load_raw_parallel_targets_artifact(
+            tmp_path,
+            escaping,
+            n_lights=2,
+            height=3,
+            width=4,
+        )
+
+
 def test_presentation_alpha_preserves_clean_soft_mask_values():
     mask = np.asarray(
         [[[0.0], [0.25]], [[0.75], [1.0]]], dtype=np.float32

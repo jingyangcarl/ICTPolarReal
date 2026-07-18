@@ -100,6 +100,10 @@ FREQUENCY_CONSENSUS_MAX_CHUNK_SAMPLES = 1 << 22
 FREQUENCY_CONSENSUS_LOGIT_EPSILON = 1e-6
 FREQUENCY_CONSENSUS_EVALUATION_MEAN_MSE_TOLERANCE = 1e-8
 FREQUENCY_FROZEN_ARTIFACT_NAME = "frequency_consensus_frozen.npz"
+RAW_PARALLEL_TARGETS_ARTIFACT_NAME = "raw_parallel_targets.npz"
+RAW_PARALLEL_TARGETS_ARTIFACT_SCHEMA = (
+    "ictpolarreal.raw-parallel-targets-artifact.v1"
+)
 FREQUENCY_ADAPTIVE_STRONG_MEDIAN3_WEIGHT = 0.50
 FREQUENCY_ADAPTIVE_STRONG_MEDIAN7_WEIGHT = 0.50
 FREQUENCY_ADAPTIVE_HALO_V1_BLEND = 0.84
@@ -116,6 +120,43 @@ FREQUENCY_REGULARIZER_STATE_SCHEMA = (
 )
 REPORT_PROFILES = ("olat", "hdri", "mix")
 ERROR_HEATMAP_MAX = 0.25
+
+
+def _write_raw_parallel_targets_artifact(
+    path: Path,
+    targets: np.ndarray,
+    *,
+    camera_dir: Path,
+) -> dict[str, Any]:
+    """Persist the exact decoded acquisition tensor for deterministic replay."""
+    array = np.ascontiguousarray(np.asarray(targets, dtype=np.float32))
+    if array.ndim != 4 or array.shape[-1] != 3:
+        raise ValueError(
+            "raw parallel targets must have shape (lights, height, width, 3); "
+            f"got {array.shape}"
+        )
+    if not np.isfinite(array).all():
+        raise ValueError("raw parallel targets must be finite before persistence")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.unlink(missing_ok=True)
+    try:
+        with temporary.open("wb") as stream:
+            np.savez_compressed(stream, raw_parallel_targets=array)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return {
+        "schema": RAW_PARALLEL_TARGETS_ARTIFACT_SCHEMA,
+        "path": _relative_path(path, camera_dir),
+        "format": "numpy_npz_compressed",
+        "key": "raw_parallel_targets",
+        "dtype": "float32",
+        "shape": [int(value) for value in array.shape],
+        "array_sha256": _array_sha256(array),
+        "file_sha256": _file_sha256(path),
+        "bytes": int(path.stat().st_size),
+    }
 
 
 def _array_sha256(array: np.ndarray) -> str:
@@ -483,6 +524,21 @@ def acquire_disney_material(
         "view_directions_sha256": _array_sha256(view_dirs),
         "raw_parallel_targets_sha256": _array_sha256(raw_target_stack),
     }
+    camera_dir = Path(out_dir)
+    camera_dir.mkdir(parents=True, exist_ok=True)
+    material_root = camera_dir / "material"
+    evaluation_root = camera_dir / "evaluation"
+    lighting_dir = evaluation_root / "assets"
+    raw_parallel_targets_artifact = _write_raw_parallel_targets_artifact(
+        lighting_dir / RAW_PARALLEL_TARGETS_ARTIFACT_NAME,
+        raw_target_stack,
+        camera_dir=camera_dir,
+    )
+    if (
+        raw_parallel_targets_artifact["array_sha256"]
+        != input_hashes["raw_parallel_targets_sha256"]
+    ):
+        raise RuntimeError("persisted raw parallel targets differ from acquisition")
     target_chw = torch.from_numpy(
         np.ascontiguousarray(target_stack.transpose(0, 3, 1, 2))
     )
@@ -490,12 +546,6 @@ def acquire_disney_material(
         np.ascontiguousarray(raw_target_stack.transpose(0, 3, 1, 2))
     )
     del target_stack, raw_target_stack
-
-    camera_dir = Path(out_dir)
-    camera_dir.mkdir(parents=True, exist_ok=True)
-    material_root = camera_dir / "material"
-    evaluation_root = camera_dir / "evaluation"
-    lighting_dir = evaluation_root / "assets"
     print(
         f"[end2end] preparing {hdri_count} fit and {eval_hdris} held-out HDRIs "
         f"with {hdri_rotations} rotations",
@@ -601,6 +651,7 @@ def acquire_disney_material(
             hdri_rotations=hdri_rotations,
             eval_lights=eval_lights,
             input_hashes=input_hashes,
+            raw_parallel_targets_artifact=raw_parallel_targets_artifact,
             surface_validity=surface_validity,
             provenance=provenance,
             adapter_provenance=adapter_provenance,
@@ -617,6 +668,7 @@ def acquire_disney_material(
         "lighting": {
             "conditions": "evaluation/assets/conditions.json",
             "weights": "evaluation/assets/weights.npz",
+            "raw_parallel_targets": raw_parallel_targets_artifact,
             "fit_hdri_conditions": len(environments.train),
             "fit_natural_hdri_identities": int(hdri_count),
             "fit_calibration_conditions": int(4 * hdri_rotations),
@@ -693,6 +745,7 @@ def _fit_disney_profile(
     hdri_rotations: int,
     eval_lights: int,
     input_hashes: dict[str, str],
+    raw_parallel_targets_artifact: dict[str, Any],
     surface_validity: dict[str, Any],
     provenance: dict[str, Any],
     adapter_provenance: dict[str, Any],
@@ -1556,6 +1609,7 @@ def _fit_disney_profile(
             },
         },
         "input_hashes": input_hashes,
+        "raw_parallel_targets_artifact": raw_parallel_targets_artifact,
         "hdri_condition_weights_sha256": environment_hash,
         "scalar_initialization": scalar_initialization,
         "surface_validity": surface_validity,

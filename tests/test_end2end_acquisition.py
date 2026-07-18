@@ -1157,6 +1157,43 @@ def test_impulse_frozen_artifact_preserves_exact_masks_targets_and_provenance(
     assert model._param_maps()["roughness"][4, 4].item() == pytest.approx(1.0)
 
 
+def test_raw_parallel_targets_artifact_preserves_exact_acquisition_tensor(tmp_path):
+    targets = np.linspace(0.0, 1.0, 2 * 3 * 4 * 3, dtype=np.float32).reshape(
+        2, 3, 4, 3
+    )
+    path = tmp_path / "evaluation" / "assets" / "raw_parallel_targets.npz"
+
+    artifact = end2end_acquisition._write_raw_parallel_targets_artifact(
+        path,
+        targets,
+        camera_dir=tmp_path,
+    )
+
+    assert artifact == {
+        "schema": "ictpolarreal.raw-parallel-targets-artifact.v1",
+        "path": "evaluation/assets/raw_parallel_targets.npz",
+        "format": "numpy_npz_compressed",
+        "key": "raw_parallel_targets",
+        "dtype": "float32",
+        "shape": [2, 3, 4, 3],
+        "array_sha256": end2end_acquisition._array_sha256(targets),
+        "file_sha256": end2end_acquisition._file_sha256(path),
+        "bytes": path.stat().st_size,
+    }
+    with np.load(path, allow_pickle=False) as archive:
+        assert archive.files == ["raw_parallel_targets"]
+        np.testing.assert_array_equal(archive["raw_parallel_targets"], targets)
+    assert not (path.parent / f".{path.name}.tmp").exists()
+
+    targets[0, 0, 0, 0] = np.nan
+    with pytest.raises(ValueError, match="must be finite"):
+        end2end_acquisition._write_raw_parallel_targets_artifact(
+            path,
+            targets,
+            camera_dir=tmp_path,
+        )
+
+
 def test_fit_without_frozen_bundle_unlinks_stale_impulse_artifact(tmp_path):
     stale = tmp_path / end2end_acquisition.IMPULSE_FROZEN_ARTIFACT_NAME
     stale.write_bytes(b"stale-enabled-run")
