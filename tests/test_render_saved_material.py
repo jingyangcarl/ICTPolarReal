@@ -343,6 +343,70 @@ def test_raw_parallel_targets_artifact_replays_exact_persisted_tensor(tmp_path):
         )
 
 
+def test_replay_inputs_artifact_replays_every_persisted_tensor(tmp_path):
+    arrays = {
+        "raw_parallel_targets": np.zeros((2, 3, 4, 3), dtype=np.float32),
+        "capture_foreground": np.ones((3, 4, 1), dtype=np.float32),
+        "source_normal": np.full((3, 4, 3), 0.25, dtype=np.float32),
+        "normal": np.full((3, 4, 3), 0.5, dtype=np.float32),
+        "view_directions": np.full((3, 4, 3), 0.75, dtype=np.float32),
+    }
+    path = tmp_path / "evaluation" / "assets" / "replay_inputs.npz"
+    path.parent.mkdir(parents=True)
+    with path.open("wb") as stream:
+        np.savez_compressed(stream, **arrays)
+    record = {
+        "schema": render_saved_material.REPLAY_INPUTS_ARTIFACT_SCHEMA,
+        "path": "evaluation/assets/replay_inputs.npz",
+        "format": "numpy_npz_compressed",
+        "arrays": {
+            name: {
+                "dtype": "float32",
+                "shape": list(array.shape),
+                "array_sha256": render_saved_material._array_sha256(array),
+            }
+            for name, array in arrays.items()
+        },
+        "file_sha256": render_saved_material._file_sha256(path),
+        "bytes": path.stat().st_size,
+    }
+
+    loaded, loaded_path = render_saved_material._load_replay_inputs_artifact(
+        tmp_path,
+        record,
+        n_lights=2,
+        height=3,
+        width=4,
+    )
+
+    assert loaded_path == path
+    assert list(loaded) == list(render_saved_material.REPLAY_INPUT_ARRAY_NAMES)
+    for name, array in arrays.items():
+        assert loaded[name].flags.c_contiguous
+        np.testing.assert_array_equal(loaded[name], array)
+
+    tampered = json.loads(json.dumps(record))
+    tampered["arrays"]["normal"]["array_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="replay input normal hash differs"):
+        render_saved_material._load_replay_inputs_artifact(
+            tmp_path,
+            tampered,
+            n_lights=2,
+            height=3,
+            width=4,
+        )
+
+    escaping = dict(record, path="../replay_inputs.npz")
+    with pytest.raises(ValueError, match="escapes the camera result"):
+        render_saved_material._load_replay_inputs_artifact(
+            tmp_path,
+            escaping,
+            n_lights=2,
+            height=3,
+            width=4,
+        )
+
+
 def test_presentation_alpha_preserves_clean_soft_mask_values():
     mask = np.asarray(
         [[[0.0], [0.25]], [[0.75], [1.0]]], dtype=np.float32

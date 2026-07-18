@@ -51,6 +51,14 @@ EXPECTED_MODEL_SCHEMA = "ictpolarreal.disney-state-artifact.v1"
 RAW_PARALLEL_TARGETS_ARTIFACT_SCHEMA = (
     "ictpolarreal.raw-parallel-targets-artifact.v1"
 )
+REPLAY_INPUTS_ARTIFACT_SCHEMA = "ictpolarreal.replay-inputs-artifact.v1"
+REPLAY_INPUT_ARRAY_NAMES = (
+    "raw_parallel_targets",
+    "capture_foreground",
+    "source_normal",
+    "normal",
+    "view_directions",
+)
 PRESENTATION_MASK_SCHEMA = "ictpolarreal.saved-render-presentation-mask.v2"
 PRESENTATION_MASK_RULE = "soft_clean_dataset_mask_applied_once_without_n_dot_v_culling"
 PRESENTATION_NORMAL_RULE = NORMAL_ORIENTATION_RULE
@@ -615,6 +623,83 @@ def _load_raw_parallel_targets_artifact(
     return np.ascontiguousarray(array), path
 
 
+def _load_replay_inputs_artifact(
+    camera_dir: Path,
+    record: Mapping[str, Any],
+    *,
+    n_lights: int,
+    height: int,
+    width: int,
+) -> tuple[dict[str, np.ndarray], Path]:
+    """Load acquisition-decoded tensors without reopening unstable PIZ EXRs."""
+    if record.get("schema") != REPLAY_INPUTS_ARTIFACT_SCHEMA:
+        raise ValueError("unsupported replay inputs artifact schema")
+    if record.get("format") != "numpy_npz_compressed":
+        raise ValueError("replay inputs artifact has the wrong format")
+    relative = record.get("path")
+    if not isinstance(relative, str) or not relative:
+        raise ValueError("replay inputs artifact path is missing")
+    path_value = Path(relative)
+    if path_value.is_absolute():
+        raise ValueError("replay inputs artifact path must be camera-relative")
+    path = (camera_dir / path_value).resolve()
+    try:
+        path.relative_to(camera_dir.resolve())
+    except ValueError as exc:
+        raise ValueError("replay inputs artifact escapes the camera result") from exc
+    if not path.is_file():
+        raise FileNotFoundError(f"missing replay inputs artifact: {path}")
+    expected_bytes = record.get("bytes")
+    if (
+        isinstance(expected_bytes, bool)
+        or not isinstance(expected_bytes, int)
+        or expected_bytes <= 0
+        or path.stat().st_size != expected_bytes
+    ):
+        raise ValueError("replay inputs artifact byte count differs")
+    metadata = record.get("arrays")
+    if not isinstance(metadata, Mapping) or list(metadata) != list(
+        REPLAY_INPUT_ARRAY_NAMES
+    ):
+        raise ValueError("replay inputs artifact metadata differs from contract")
+    expected_shapes = {
+        "raw_parallel_targets": (n_lights, height, width, 3),
+        "capture_foreground": (height, width, 1),
+        "source_normal": (height, width, 3),
+        "normal": (height, width, 3),
+        "view_directions": (height, width, 3),
+    }
+    arrays: dict[str, np.ndarray] = {}
+    with np.load(path, allow_pickle=False) as archive:
+        if archive.files != list(REPLAY_INPUT_ARRAY_NAMES):
+            raise ValueError("replay inputs artifact arrays differ from contract")
+        for name in REPLAY_INPUT_ARRAY_NAMES:
+            array_record = metadata[name]
+            if not isinstance(array_record, Mapping):
+                raise ValueError(f"replay input {name} metadata is invalid")
+            expected_shape = expected_shapes[name]
+            if (
+                array_record.get("dtype") != "float32"
+                or array_record.get("shape") != list(expected_shape)
+            ):
+                raise ValueError(
+                    f"replay input {name} metadata has the wrong dtype or shape"
+                )
+            array = np.asarray(archive[name])
+            if array.dtype != np.float32 or array.shape != expected_shape:
+                raise ValueError(
+                    f"replay input {name} decoded with the wrong dtype or shape: "
+                    f"{array.dtype} {array.shape}"
+                )
+            if not np.isfinite(array).all():
+                raise ValueError(f"replay input {name} contains non-finite values")
+            array = np.ascontiguousarray(array)
+            if _array_sha256(array) != array_record.get("array_sha256"):
+                raise ValueError(f"replay input {name} hash differs")
+            arrays[name] = array
+    return arrays, path
+
+
 def _presentation_alpha(mask: np.ndarray, height: int, width: int) -> np.ndarray:
     """Preserve the clean dataset mask's soft edge for report rendering."""
     image = np.asarray(mask, dtype=np.float32)
@@ -734,9 +819,35 @@ def prepare_replay_inputs(
     if not sample.camera_dir.is_dir():
         raise FileNotFoundError(f"camera sample does not exist: {sample.camera_dir}")
     input_hashes = acquisition.get("input_hashes", {})
+    replay_artifact_record = acquisition.get("replay_inputs_artifact")
     artifact_record = acquisition.get("raw_parallel_targets_artifact")
     capture = None
-    if artifact_record is None:
+    exact_replay: dict[str, np.ndarray] | None = None
+    if isinstance(replay_artifact_record, Mapping):
+        exact_replay, replay_artifact_path = _load_replay_inputs_artifact(
+            camera_dir,
+            replay_artifact_record,
+            n_lights=n_lights,
+            height=height,
+            width=width,
+        )
+        _record_hash_check(
+            checks,
+            "replay_inputs_artifact",
+            _file_sha256(replay_artifact_path),
+            replay_artifact_record.get("file_sha256"),
+        )
+        for name in REPLAY_INPUT_ARRAY_NAMES:
+            _record_hash_check(
+                checks,
+                f"replay_inputs_artifact_{name}",
+                _array_sha256(exact_replay[name]),
+                replay_artifact_record["arrays"][name].get("array_sha256"),
+            )
+        parallel_targets_hwc = exact_replay["raw_parallel_targets"]
+    elif replay_artifact_record is not None:
+        raise ValueError("replay inputs artifact record must be an object")
+    elif artifact_record is None:
         capture = _load_polarized_capture_in_acquisition_order(
             sample, frame_ids, height=height, width=width
         )
@@ -782,23 +893,54 @@ def prepare_replay_inputs(
     mask_path = sample.image_path("mask")
     albedo_path = sample.image_path("albedo")
     normal_path = sample.image_path("normal")
-    if mask_path is None or normal_path is None:
-        raise FileNotFoundError(
-            "exact saved-material replay requires the acquisition mask and normal"
-        )
+    if mask_path is None:
+        raise FileNotFoundError("saved-material replay requires the acquisition mask")
+    if exact_replay is None and normal_path is None:
+        raise FileNotFoundError("legacy saved-material replay requires the normal")
     mask_image = read_image(mask_path, channels=1)
-    # Production loads the legacy per-pixel view field and dataset albedo before
-    # decoding the photometric normal.  Keep those allocations alive until the
-    # PIZ normal has been read, even though saved-material rendering uses the
-    # constant end-to-end view field and the checkpointed baseColor.
-    legacy_view_directions = load_view_directions(
-        data_root, sample, (height, width)
-    )
-    source_albedo = read_image(albedo_path) if albedo_path is not None else None
-    source_normal = _normalize_vectors(read_image(normal_path))
-    view_directions = _normalize_vectors(
-        load_end2end_view_directions(data_root, sample, (height, width))
-    )
+    presentation_alpha = _presentation_alpha(mask_image, height, width)
+    decoded_capture_foreground = _foreground_mask(mask_image, height, width)
+    if exact_replay is not None:
+        capture_foreground = exact_replay["capture_foreground"]
+        source_normal = exact_replay["source_normal"]
+        normal = exact_replay["normal"]
+        view_directions = exact_replay["view_directions"]
+        _record_hash_check(
+            checks,
+            "presentation_capture_foreground",
+            _array_sha256(decoded_capture_foreground),
+            input_hashes.get("capture_foreground_sha256"),
+        )
+        reconstructed_normal, _normal_orientation = _orient_normals_to_view(
+            source_normal,
+            view_directions,
+            foreground=capture_foreground,
+        )
+        _record_hash_check(
+            checks,
+            "reconstructed_normal",
+            _array_sha256(reconstructed_normal),
+            _array_sha256(normal),
+        )
+    else:
+        capture_foreground = decoded_capture_foreground
+        # Legacy artifacts must reproduce the acquisition process's allocation
+        # order while reopening PIZ EXRs.  New replay artifacts bypass this
+        # decoder-dependent path entirely.
+        legacy_view_directions = load_view_directions(
+            data_root, sample, (height, width)
+        )
+        source_albedo = read_image(albedo_path) if albedo_path is not None else None
+        source_normal = _normalize_vectors(read_image(normal_path))
+        view_directions = _normalize_vectors(
+            load_end2end_view_directions(data_root, sample, (height, width))
+        )
+        normal, _normal_orientation = _orient_normals_to_view(
+            source_normal,
+            view_directions,
+            foreground=capture_foreground,
+        )
+        del legacy_view_directions, source_albedo
 
     _record_hash_check(
         checks,
@@ -809,19 +951,12 @@ def prepare_replay_inputs(
     parallel_targets = np.ascontiguousarray(
         parallel_targets_hwc.transpose(0, 3, 1, 2)
     )
-    presentation_alpha = _presentation_alpha(mask_image, height, width)
-    capture_foreground = _foreground_mask(mask_image, height, width)
-    del capture, legacy_view_directions, source_albedo
+    del capture
     if source_normal.shape != (height, width, 3):
         raise ValueError(
             f"acquisition normal has shape {source_normal.shape}, expected "
             f"{(height, width, 3)}"
         )
-    normal, _normal_orientation = _orient_normals_to_view(
-        source_normal,
-        view_directions,
-        foreground=capture_foreground,
-    )
     foreground = capture_foreground.copy()
     for name, array in (
         ("capture_foreground", capture_foreground),

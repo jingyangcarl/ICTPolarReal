@@ -1194,6 +1194,64 @@ def test_raw_parallel_targets_artifact_preserves_exact_acquisition_tensor(tmp_pa
         )
 
 
+def test_replay_inputs_artifact_preserves_all_decoder_dependent_arrays(tmp_path):
+    raw = np.linspace(0.0, 1.0, 2 * 3 * 4 * 3, dtype=np.float32).reshape(
+        2, 3, 4, 3
+    )
+    foreground = np.ones((3, 4, 1), dtype=np.float32)
+    source_normal = np.full((3, 4, 3), 0.25, dtype=np.float32)
+    normal = np.full((3, 4, 3), 0.5, dtype=np.float32)
+    views = np.full((3, 4, 3), 0.75, dtype=np.float32)
+    path = tmp_path / "evaluation" / "assets" / "replay_inputs.npz"
+
+    artifact = end2end_acquisition._write_replay_inputs_artifact(
+        path,
+        camera_dir=tmp_path,
+        raw_parallel_targets=raw,
+        capture_foreground=foreground,
+        source_normal=source_normal,
+        normal=normal,
+        view_directions=views,
+    )
+
+    assert artifact["schema"] == "ictpolarreal.replay-inputs-artifact.v1"
+    assert artifact["path"] == "evaluation/assets/replay_inputs.npz"
+    assert artifact["file_sha256"] == end2end_acquisition._file_sha256(path)
+    assert artifact["bytes"] == path.stat().st_size
+    assert list(artifact["arrays"]) == list(
+        end2end_acquisition.REPLAY_INPUT_ARRAY_NAMES
+    )
+    expected = {
+        "raw_parallel_targets": raw,
+        "capture_foreground": foreground,
+        "source_normal": source_normal,
+        "normal": normal,
+        "view_directions": views,
+    }
+    with np.load(path, allow_pickle=False) as archive:
+        assert archive.files == list(end2end_acquisition.REPLAY_INPUT_ARRAY_NAMES)
+        for name, array in expected.items():
+            np.testing.assert_array_equal(archive[name], array)
+            assert artifact["arrays"][name] == {
+                "dtype": "float32",
+                "shape": list(array.shape),
+                "array_sha256": end2end_acquisition._array_sha256(array),
+            }
+
+    invalid = source_normal.copy()
+    invalid[0, 0, 0] = np.nan
+    with pytest.raises(ValueError, match="source_normal must be finite"):
+        end2end_acquisition._write_replay_inputs_artifact(
+            path,
+            camera_dir=tmp_path,
+            raw_parallel_targets=raw,
+            capture_foreground=foreground,
+            source_normal=invalid,
+            normal=normal,
+            view_directions=views,
+        )
+
+
 def test_fit_without_frozen_bundle_unlinks_stale_impulse_artifact(tmp_path):
     stale = tmp_path / end2end_acquisition.IMPULSE_FROZEN_ARTIFACT_NAME
     stale.write_bytes(b"stale-enabled-run")

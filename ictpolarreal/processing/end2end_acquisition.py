@@ -104,6 +104,15 @@ RAW_PARALLEL_TARGETS_ARTIFACT_NAME = "raw_parallel_targets.npz"
 RAW_PARALLEL_TARGETS_ARTIFACT_SCHEMA = (
     "ictpolarreal.raw-parallel-targets-artifact.v1"
 )
+REPLAY_INPUTS_ARTIFACT_NAME = "replay_inputs.npz"
+REPLAY_INPUTS_ARTIFACT_SCHEMA = "ictpolarreal.replay-inputs-artifact.v1"
+REPLAY_INPUT_ARRAY_NAMES = (
+    "raw_parallel_targets",
+    "capture_foreground",
+    "source_normal",
+    "normal",
+    "view_directions",
+)
 FREQUENCY_ADAPTIVE_STRONG_MEDIAN3_WEIGHT = 0.50
 FREQUENCY_ADAPTIVE_STRONG_MEDIAN7_WEIGHT = 0.50
 FREQUENCY_ADAPTIVE_HALO_V1_BLEND = 0.84
@@ -154,6 +163,74 @@ def _write_raw_parallel_targets_artifact(
         "dtype": "float32",
         "shape": [int(value) for value in array.shape],
         "array_sha256": _array_sha256(array),
+        "file_sha256": _file_sha256(path),
+        "bytes": int(path.stat().st_size),
+    }
+
+
+def _write_replay_inputs_artifact(
+    path: Path,
+    *,
+    camera_dir: Path,
+    raw_parallel_targets: np.ndarray,
+    capture_foreground: np.ndarray,
+    source_normal: np.ndarray,
+    normal: np.ndarray,
+    view_directions: np.ndarray,
+) -> dict[str, Any]:
+    """Persist every decoded array needed to replay a saved acquisition."""
+    values = {
+        "raw_parallel_targets": raw_parallel_targets,
+        "capture_foreground": capture_foreground,
+        "source_normal": source_normal,
+        "normal": normal,
+        "view_directions": view_directions,
+    }
+    arrays: dict[str, np.ndarray] = {}
+    metadata: dict[str, dict[str, Any]] = {}
+    for name in REPLAY_INPUT_ARRAY_NAMES:
+        array = np.ascontiguousarray(np.asarray(values[name], dtype=np.float32))
+        if not np.isfinite(array).all():
+            raise ValueError(f"replay input {name} must be finite before persistence")
+        arrays[name] = array
+        metadata[name] = {
+            "dtype": "float32",
+            "shape": [int(value) for value in array.shape],
+            "array_sha256": _array_sha256(array),
+        }
+    raw = arrays["raw_parallel_targets"]
+    if raw.ndim != 4 or raw.shape[-1] != 3:
+        raise ValueError(
+            "raw parallel targets must have shape (lights, height, width, 3); "
+            f"got {raw.shape}"
+        )
+    height, width = raw.shape[1:3]
+    expected_shapes = {
+        "capture_foreground": (height, width, 1),
+        "source_normal": (height, width, 3),
+        "normal": (height, width, 3),
+        "view_directions": (height, width, 3),
+    }
+    for name, expected in expected_shapes.items():
+        if arrays[name].shape != expected:
+            raise ValueError(
+                f"replay input {name} has shape {arrays[name].shape}, expected "
+                f"{expected}"
+            )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.unlink(missing_ok=True)
+    try:
+        with temporary.open("wb") as stream:
+            np.savez_compressed(stream, **arrays)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return {
+        "schema": REPLAY_INPUTS_ARTIFACT_SCHEMA,
+        "path": _relative_path(path, camera_dir),
+        "format": "numpy_npz_compressed",
+        "arrays": metadata,
         "file_sha256": _file_sha256(path),
         "bytes": int(path.stat().st_size),
     }
@@ -529,16 +606,20 @@ def acquire_disney_material(
     material_root = camera_dir / "material"
     evaluation_root = camera_dir / "evaluation"
     lighting_dir = evaluation_root / "assets"
-    raw_parallel_targets_artifact = _write_raw_parallel_targets_artifact(
-        lighting_dir / RAW_PARALLEL_TARGETS_ARTIFACT_NAME,
-        raw_target_stack,
+    replay_inputs_artifact = _write_replay_inputs_artifact(
+        lighting_dir / REPLAY_INPUTS_ARTIFACT_NAME,
         camera_dir=camera_dir,
+        raw_parallel_targets=raw_target_stack,
+        capture_foreground=capture_foreground,
+        source_normal=source_normal,
+        normal=normal,
+        view_directions=view_dirs,
     )
     if (
-        raw_parallel_targets_artifact["array_sha256"]
+        replay_inputs_artifact["arrays"]["raw_parallel_targets"]["array_sha256"]
         != input_hashes["raw_parallel_targets_sha256"]
     ):
-        raise RuntimeError("persisted raw parallel targets differ from acquisition")
+        raise RuntimeError("persisted replay targets differ from acquisition")
     target_chw = torch.from_numpy(
         np.ascontiguousarray(target_stack.transpose(0, 3, 1, 2))
     )
@@ -651,7 +732,7 @@ def acquire_disney_material(
             hdri_rotations=hdri_rotations,
             eval_lights=eval_lights,
             input_hashes=input_hashes,
-            raw_parallel_targets_artifact=raw_parallel_targets_artifact,
+            replay_inputs_artifact=replay_inputs_artifact,
             surface_validity=surface_validity,
             provenance=provenance,
             adapter_provenance=adapter_provenance,
@@ -668,7 +749,7 @@ def acquire_disney_material(
         "lighting": {
             "conditions": "evaluation/assets/conditions.json",
             "weights": "evaluation/assets/weights.npz",
-            "raw_parallel_targets": raw_parallel_targets_artifact,
+            "replay_inputs": replay_inputs_artifact,
             "fit_hdri_conditions": len(environments.train),
             "fit_natural_hdri_identities": int(hdri_count),
             "fit_calibration_conditions": int(4 * hdri_rotations),
@@ -745,7 +826,7 @@ def _fit_disney_profile(
     hdri_rotations: int,
     eval_lights: int,
     input_hashes: dict[str, str],
-    raw_parallel_targets_artifact: dict[str, Any],
+    replay_inputs_artifact: dict[str, Any],
     surface_validity: dict[str, Any],
     provenance: dict[str, Any],
     adapter_provenance: dict[str, Any],
@@ -1609,7 +1690,7 @@ def _fit_disney_profile(
             },
         },
         "input_hashes": input_hashes,
-        "raw_parallel_targets_artifact": raw_parallel_targets_artifact,
+        "replay_inputs_artifact": replay_inputs_artifact,
         "hdri_condition_weights_sha256": environment_hash,
         "scalar_initialization": scalar_initialization,
         "surface_validity": surface_validity,
